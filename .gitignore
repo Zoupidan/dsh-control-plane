@@ -1,0 +1,96 @@
+# Node / TypeScript 常规
+
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# 构建产物
+dist/
+build/
+out/
+*.tsbuildinfo
+.turbo/
+.cache/
+
+# 测试与覆盖率
+coverage/
+.nyc_output/
+.vitest/
+
+# 环境变量与本地配置（★ 绝不提交任何凭据）
+.env
+.env.*
+*.local
+*.local.*
+
+# dsh 运行期数据（审计日志、SQLite、token、工作区）—— 全部本地私有
+dsh-home/
+workspaces/
+audit/
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+tokens/
+*.token
+*.jsonl
+
+# 本机 profile（个人配置、私有开关、登录态相关的一切）
+profile/
+profiles/
+*.profile/
+local-profile*/
+# 受控端本机的运行数据（含 automations 记忆），属用户数据，不得进仓库
+.workbuddy/
+.dsh/
+.dsh-*/
+
+# 本地一次性产物（基线比对输出等）—— 不进仓库
+.baseline-out.txt
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# 日志
+logs/
+*.log
+
+# 临时
+# tmp/ 装的是一次性脚本与探测产物（对齐脚本、库快照、smoke 记录等）。
+# 它们刻意**不进仓库**：每份都绑定某一次具体取证，重跑即失效。
+# 注意 tools/verify/ 是**已交付的验收脚本**，不属于 tmp/，必须进仓库。
+tmp/
+temp/
+
+# 编辑器/工具留下的字节级备份：不得进仓库
+*.orig
+*.rej
+
+# 一次性取证 Incident / RC 记录（本地排障，不进仓库）
+00-recon/INCIDENT*
+RC-*
+
+# open-source release excludes: internal research docs and live-fire probes (kept locally, never published)
+/00-recon/
+/01-prd/
+/02-design/
+/03-adr/
+/05-construction/
+/_legacy/
+/contracts/
+/CODEMAP.md
+/HANDOFF.md
+/04-docs/_archive/
+/04-docs/GLOSSARY.md
+/04-docs/MODULE-WORKFLOW.md
+/packages/plugin-workbuddy/scripts/
+

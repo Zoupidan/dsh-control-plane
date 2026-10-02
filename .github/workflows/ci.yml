@@ -1,0 +1,164 @@
+name: CI
+
+# ============================================================================
+# dsh-control-plane · 持续集成
+#
+# 本文件引用的每一个 npm 脚本都取自 package.json 的 scripts（逐个核对过，无编造）：
+#   ci:redlines / ci:redlines:self-test / test:client / test:host / link:dsh-deps
+#
+# ★★★ 关于 test:host 的那个坑 —— 请先读完再改这个文件 ★★★
+#
+# `npm run test:host` 的第一步是 `node tools/dev/link-dsh-deps.mjs`。该脚本把各插件包的
+# `packages/*/node_modules/@deepseek-ai` 做成指向**本机 dsh 安装体**（Windows 上是
+# `<APPDATA>\<dist>\dependencies\dsh\node_modules\@deepseek-ai`）的目录 junction。
+# GitHub runner 上**没有那个安装体**，于是：
+#
+#   1. link-dsh-deps.mjs 走 tools/dev/link-dsh-deps.mjs:100-106 的分支：
+#      打印"未找到本机 dsh 安装体"然后 **exit 0**（默认模式不报错）。
+#   2. 接着 packages/*/test/*.test.js 的每个用例都带 `{ skip: SKIP }`（依赖不可用即整组 skip）。
+#   3. `node --test` 在"全部用例被 skip"时**退出码仍是 0**。
+#
+# ⇒ 直接在 CI 里写 `npm run test:host`，会得到一个**全绿但一条测试都没跑**的假绿。
+#    这正是本文件要避免的东西。
+#
+# 本文件的处置（两条路选了"标注 + 隔离"，不是"偷偷跳过"）：
+#   · host 套件单独放在 `host-tests` job，**push/PR 不跑**，只在 workflow_dispatch 手动触发；
+#     在 PR 里它显示为 skipped，**可见**，而不是混在绿灯里冒充通过。
+#   · 手动触发时**先跑 `link-dsh-deps.mjs --check`**（--check 模式下环境不可用是 exit 1，
+#     见同文件 :105 / :174-176）。没有 DSH_DEPS_SCOPE 就**响亮地红**，不会空转出绿灯。
+#   · PR 路径上另有一条 step 会往 run summary 写 ⚠ 明示"host 套件本次未执行"。
+#
+# 为什么没有改成 `npm install @deepseek-ai/*`：
+#   这些包确实公开发布在 npm 上（registry 上 @deepseek-ai/dsh-tools 的 publishConfig.access
+#   已是 public），但那会引入一组**会漂移的 rc 版本**，而本仓库的口径是"跑真实安装体里的那份"。
+#   两者不是同一批代码，测试结论不可比，且一旦漂移 CI 会以与本机不同的方式红/绿。
+#   在有受控窗口实测之前，宁可让这一段显式缺席，也不要一个看起来在跑的假象。
+#
+# 平台：全部 windows-latest。
+#   本仓库的读数（4 条红线、test:host、test:client）全部来自 Windows；link-dsh-deps 的
+#   探测路径依赖 APPDATA、junction 也是 Windows 概念，工具自身的 self-test 也只在 Windows 上
+#   跑过。跨平台另开一套只会引入与本机不一致的读数，对"发布前把话说准"没有收益。
+# ============================================================================
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      dsh_deps_scope:
+        description: >-
+          host-tests job 专用：本机 dsh 安装体里 node_modules/@deepseek-ai 的绝对路径
+          （例如 C:\Users\<you>\AppData\Roaming\<dist>\dependencies\dsh\node_modules\@deepseek-ai）。
+          留空 ⇒ 该 job 会在 --check 这一步红掉（这是预期行为，不是坏了）。
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------------------------------
+  # 红线门禁：**唯一的必过关卡**。零外部依赖（纯 node 脚本扫本仓库），
+  # 任何机器上都能真跑出结论，所以放在第一个、也最重。
+  # --------------------------------------------------------------------------
+  redlines:
+    name: 红线（ci:redlines + self-test）
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # engines.node = ">=22.5.0"（package.json:7-9）⇒ 取 22.x 上沿，与本机 v22.23.2 同代。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 跑红线自检（证明规则表真的会红，不是恒真）
+        run: npm run ci:redlines:self-test
+
+      - name: 跑四条红线（lint:c3 / check:c2 / check:knobs / check:credential-echo）
+        run: npm run ci:redlines
+
+  # --------------------------------------------------------------------------
+  # client 套件：已核对 packages/*/test/client.test.js 的 import 面，
+  # **不**引 @deepseek-ai/*（用白名单 stub 代替 require），故无需 dsh 安装体。
+  # --------------------------------------------------------------------------
+  client-tests:
+    name: client 套件（test:client）
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: npm run test:client
+        run: npm run test:client
+
+  # --------------------------------------------------------------------------
+  # host 套件：需要真实 dsh 安装体 ⇒ push/PR 下**不跑**（显示为 skipped，可见）。
+  # 手动触发时先 --check，缺 scope 就红，绝不空转成绿灯。
+  # --------------------------------------------------------------------------
+  host-tests:
+    name: host 套件（test:host · 需先装 dsh · 仅手动触发）
+    runs-on: windows-latest
+    timeout-minutes: 45
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # --check 模式：scope 不可用 ⇒ exit 1（link-dsh-deps.mjs:105）。
+      # 有 scope 则只报告不写盘，随后由 test:host 自带的 link 步骤建立 junction。
+      - name: 校验 dsh 依赖（缺 scope 即红，这是设计而非故障）
+        env:
+          DSH_DEPS_SCOPE: ${{ inputs.dsh_deps_scope }}
+        run: node tools/dev/link-dsh-deps.mjs --check
+
+      - name: npm run test:host
+        run: npm run test:host
+
+  # --------------------------------------------------------------------------
+  # 在 PR/push 的 run summary 上留一条**显式缺口**，
+  # 免得只看到两个绿灯就以为"全测过了"。
+  # --------------------------------------------------------------------------
+  coverage-notice:
+    name: 声明 host 套件本次未执行
+    runs-on: windows-latest
+    timeout-minutes: 5
+    if: github.event_name != 'workflow_dispatch'
+    steps:
+      - name: 写入 run summary
+        shell: pwsh
+        # 用单引号 here-string（@'...'@）：不插值、不做反斜杠转义。
+        # 正文里到处是 Markdown 反引号，若用 @"..."@，`test:host` 的 `t 会被当成 TAB 转义。
+        run: |
+          $summary = @'
+          ## ⚠ 本次 CI 未执行 host 套件（test:host）
+
+          | job | 本次 |
+          |---|---|
+          | 红线 ci:redlines + self-test | ✅ 已跑 |
+          | client test:client | ✅ 已跑 |
+          | **host test:host** | **⏭ 未跑** |
+
+          **原因**：`test:host` 依赖 `tools/dev/link-dsh-deps.mjs` 把各插件包的
+          `node_modules/@deepseek-ai` 指向**本机 dsh 安装体**的 junction。GitHub runner 上
+          没有该安装体，脚本默认模式 `exit 0`、所有用例 `skip`，`node --test` 仍返回 0 ——
+          直接跑会得到**一条测试都没执行的假绿**。
+
+          **怎么补跑**：手动触发本 workflow（Actions → 本 workflow → Run workflow），
+          在 `dsh_deps_scope` 里填本机 dsh 安装体的 `@deepseek-ai` 绝对路径。
+          该 job 会先跑 `link-dsh-deps.mjs --check`，缺 scope 时直接红。
+          '@
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary

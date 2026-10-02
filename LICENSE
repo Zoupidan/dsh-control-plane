@@ -1,0 +1,47 @@
+MIT License
+
+Copyright (c) 2026 dsh-control-plane contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+## 附注（不属于许可证条款，仅为说明）
+
+> 署名行 `Copyright (c) 2026 dsh-control-plane contributors` 是社区项目的常规写法。
+> 项目所有者若希望署实体名（个人 / 公司 / 组织），改这一行与年份即可。
+> 若**更换许可证**，请同时更新 `package.json` 的 `"license"` 字段 ——
+> 两处不一致会让 npm 与 GitHub 渲染出互相矛盾的许可证信息。
+
+1. 本项目处于 `0.1.0` 早期阶段，**尚未发布正式版本**，也不对稳定性或可用性作出承诺。
+   已知缺口写在 README 的「已知限制」一节 —— 请在依赖本项目前先读那一节。
+
+2. 本仓库的文档引用了第三方软件（WorkBuddy、Qoder 等）的名称、安装路径与观测到的接口形态，
+   仅用于互操作性研究与协议适配，不主张对这些软件的任何权利，
+   也不构成对其许可条款的变更。
+
+3. 本项目明确禁止（违反者其改动按漏洞处理，见 [SECURITY.md](./SECURITY.md)）：
+   - 读取、存储或回显受控端的账号凭据；
+   - 往用户自己的数据存储里写入任何一行；
+   - 直接调用厂商的非公开云端 API 作为控制路径；
+   - 使用 GUI 自动化（模拟点击）作为控制路径；
+   - 反向代理 / 重托管受控端的模型路由。
+
+4. 本项目以**用户本机已登录的身份**调用受控端桌面端。这条边界带来的具体义务
+   （请求与响应两侧都不得留下凭据）写在 [SECURITY.md](./SECURITY.md)。

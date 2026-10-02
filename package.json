@@ -1,0 +1,53 @@
+{
+  "name": "dsh-control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DshAgentHub · 本机 agent 控制平面（control plane）—— 把本机 WorkBuddy 桌面端纳管成 DshAgentHub 里看得见、可调度、可观测的执行方（同机通道，不跨网）",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "lint:c3": "node tools/lint/no-gui-automation.mjs",
+    "lint:c3:docs": "node tools/lint/no-gui-automation.mjs --include-docs",
+    "lint:c3:self-test": "node tools/lint/no-gui-automation.mjs --self-test",
+    "check:c2": "node tools/ci/check-no-process-exec.mjs && node tools/ci/check-no-exec-probe.mjs",
+    "check:c2:exec": "node tools/ci/check-no-process-exec.mjs",
+    "check:c2:probe": "node tools/ci/check-no-exec-probe.mjs",
+    "check:knobs": "node tools/ci/check-consumed-knobs.mjs",
+    "check:credential-echo": "node tools/ci/check-no-credential-echo.mjs",
+    "check:knobs:self-test": "node tools/ci/check-consumed-knobs.mjs --self-test",
+    "ci:redlines": "npm run lint:c3 && npm run check:c2 && npm run check:knobs && npm run check:credential-echo",
+    "ci:redlines:self-test": "npm run lint:c3:self-test && node tools/ci/check-no-process-exec.mjs --self-test && node tools/ci/check-no-exec-probe.mjs --self-test && npm run check:knobs:self-test && node tools/ci/check-no-credential-echo.mjs --self-test",
+    "link:dsh-deps": "node tools/dev/link-dsh-deps.mjs",
+    "test:host": "node tools/dev/link-dsh-deps.mjs && node --import ./tools/dev/test-home-guard.mjs --test packages/plugin-workbuddy/test/host.test.js packages/plugin-workbuddy/test/verdict.test.js packages/plugin-workbuddy/test/reason-codes.test.js packages/plugin-workbuddy/test/session-intent.test.js packages/plugin-workbuddy/test/multi-turn-reuse.test.js packages/plugin-workbuddy/test/hardening.test.js packages/plugin-workbuddy/test/credit-anchor.test.js packages/plugin-workbuddy/test/gateway-sidecar.test.js packages/plugin-workbuddy/test/gateway-identity.test.js packages/plugin-workbuddy/test/gateway-pid-liveness.test.js packages/plugin-workbuddy/test/gateway-portmap.test.js packages/plugin-workbuddy/test/gateway-token.test.js packages/plugin-workbuddy/test/gateway-acp.test.js packages/plugin-workbuddy/test/gateway-receipt.test.js packages/plugin-workbuddy/test/gateway-credits.test.js packages/plugin-workbuddy/test/gateway-bound-session.test.js packages/plugin-workbuddy/test/gateway-instance-ensure.test.js packages/plugin-workbuddy/test/ensure-wait.test.js packages/plugin-workbuddy/test/gateway-wiring.test.js packages/plugin-workbuddy/test/gateway-reason-mapping.test.js packages/plugin-workbuddy/test/gateway-recovery.test.js packages/plugin-workbuddy/test/subagent-provider.test.js packages/plugin-workbuddy/test/subagent-receipt.test.js packages/plugin-workbuddy/test/subagent-execute.test.js packages/plugin-workbuddy/test/model-filter.test.js packages/plugin-workbuddy/test/automation-home-guard.test.js packages/plugin-workbuddy/test/automation-early-retire.test.js packages/plugin-workbuddy/test/catalog-source.test.js packages/plugin-workbuddy/test/catalog-gate.test.js packages/plugin-workbuddy/test/settings-contract.test.js packages/plugin-workbuddy/test/wbipc-endpoint-reason.test.js packages/plugin-workbuddy/test/dispatch-own-recycle.test.js",
+    "test:client": "node --import ./tools/dev/test-home-guard.mjs --test packages/plugin-workbuddy/test/client.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  },
+  "comments": {
+    "install": "本仓库当前为 v3 施工阶段（T01–T03 已交付）。按用户决策 D3：不执行 npm install / 不构建；devDependencies 仅作声明，实际安装留到可测试窗口（且必须先闭环 V24 数据根争用）。",
+    "runtime": "Node 22（本机实测 v22.22.2）。活动区为 ESM JS + JSDoc 类型（packages/plugin-workbuddy）；v1 时代的 node:sqlite 方案已随 src/ 冻结至 _legacy/，v3 会话映射落 ctx.settings。",
+    "redlines": "四条 CI 红线（R3-7）：lint:c3 = C3 禁模拟点击；check:c2:exec = C2 进程出口审计（唯一出口 ctx.subprocess）；check:c2:probe = H-NO-EXEC-PROBE（探测路径零执行）；check:knobs = WB-7 设置面自证（声明的旗标要么真下发、要么写明惰性）。旧 check-c2-outbound.mjs（动态出站审计）已随 v2 退役移入 _legacy/，待续档按需重写启用。",
+    "ui": "UI = dsh 设置页插件卡片（lib/client.js 单文件 bundle，无构建器；朴素 createElement + 注入 CSS），无自研前端。",
+    "publish": "仓库地址已统一为 https://github.com/Zoupidan/dsh-control-plane（repository / homepage / bugs 三字段据此填写；品牌显示名 DshAgentHub 保留，包/仓库技术名 dsh-control-plane 不变）。注意 private:true 仍在（防止误 publish）；GitHub 仓库不发布到 npm 的话可不动它。"
+  },
+  "keywords": [
+    "agent",
+    "control-plane",
+    "dsh-plugin",
+    "ipc",
+    "local-first"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Zoupidan/dsh-control-plane.git"
+  },
+  "homepage": "https://github.com/Zoupidan/dsh-control-plane",
+  "bugs": {
+    "url": "https://github.com/Zoupidan/dsh-control-plane/issues"
+  }
+}

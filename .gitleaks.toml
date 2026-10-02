@@ -1,0 +1,28 @@
+# gitleaks 配置 —— 让"仓库里没有真实密钥"这件事**可复现地验证**，而不是靠人眼扫一遍。
+#
+# ★ 为什么需要这个文件 ★
+# 本仓库的脱敏测试**必须**用"长得像真密钥"的输入才能生效：
+#   `sk-abcdefghijklmnopqrstuvwxyz012345` / `S3CRET-GATEWAY-PASSWORD-…` / `mj_iXNmXM`
+# 断言的是"这些值不许原样出现在回执 / 作业输出 / 证据里"。把它们换成不像密钥的串，
+# 脱敏规则就测不到了 —— 于是会有人**删掉测试来让扫描器闭嘴**，那正好是反的。
+# 所以：夹具保留，扫描器显式放行，并在下面逐条写明为什么。
+#
+# 用法：gitleaks detect --config .gitleaks.toml
+# 这些值全部是**测试夹具**，没有任何一个是真实凭据。
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "脱敏测试夹具：断言'这些值必须被打码'，因此必须长得像真密钥"
+paths = [
+  '''packages/plugin-workbuddy/test/verdict\.test\.js''',
+  '''packages/plugin-workbuddy/test/host\.test\.js''',
+  '''packages/plugin-workbuddy/test/gateway-acp\.test\.js''',
+]
+regexes = [
+  '''sk-abcdefghijklmnopqrstuvwxyz012345''',
+  '''sk-live-abcdefgh''',
+  '''S3CRET-GATEWAY-PASSWORD-43-CHARACTERS-XXXXXX''',
+  '''Bearer abcdefghijklmnop''',
+]

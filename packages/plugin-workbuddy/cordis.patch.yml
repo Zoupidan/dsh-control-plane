@@ -1,0 +1,210 @@
+# dsh-plugin-workbuddy — 把 WorkBuddy CLI 暴露为模型可见的 dsh 工具。
+#
+# 【patch 语义铁律】（实测：dsh-base/cordis.patch.yml 头注释）
+#   "A patch replaces the targeted row's whole `config` rather than merging into it"
+#   "the last write winning per row"（行级后写覆盖）
+#   ⇒ 本文件【只 insert 自己的行】，不覆写任何既有行。
+#
+# 【E-10 修正】`remove` 不是合法 patch 动词；条件开关用 `disabled: true`
+#   或 `!!js <expr>`（实测：dsh-base/cordis.patch.yml:248 使用了
+#   `disabled: !!js process.platform === 'win32'`）。
+#
+# 【U4 说明】本文件里的 `disabled` 是【加载期】开关，用于「整个插件不进宿主」。
+#   「一程序一开关」的【运行期】开关由 host 端 ctx.tools.register 的
+#   effect-scoped 注销实现（§4.4），不靠本文件的表达式。
+#   ★ 2026-09-30 曾从**委派面**撤掉这条运行期闸门（"在场即注册"），当天已回滚：
+#     live profile 的本行是 `enabled: true`，闸门在演示环境里本来就开着，撤掉零收益；
+#     而默认值若仍是 `false` 却不参与判据，就成了"说谎的配置项"。详见
+#     `src/host/subagent/index.js` 文件头的铁律 U4 块。
+
+- insert:
+    # 行 id 必须与 lib/index.js 的 name 常量一致。
+    # ★ 0.1.7 变更（B3）：settings 的 namespace 不再由插件自选，而是取 loader 行 id
+    #   （dsh-settings/lib/index.js:432,443 `ns: entry.options.id`）。故此处 id 必须
+    #   等于 shared/constants.js 的 NS，否则 `settings.update()` 抛
+    #   `No configurable plugin entry`。
+    - id: dsh-plugin-workbuddy
+      name: 'dsh-plugin-workbuddy'
+      config:
+        # ── 配置基线（用户改写在 ~/.dsh/settings.yaml 的同名 namespace 下）──
+        # ★★ 授权总闸（铁律 U4）：`enabled !== true` ⇒ 工具面与委派面一处都不注册。
+        #   本行取值必须与 schema 默认值逐字一致（test/host.test.js 的三处同步断言会查这一行），
+        #   改一边就要同时改另外两边。
+        enabled: false          # ★ 授权总闸：委派面 `host/subagent/index.js` 的 `reconcile` 硬读它
+        model: ''               # ★ U1；空串 = 未指定（§4.3）
+        effort: ''              # ★ U2；空串 = 未指定（§4.3）
+        # ★ D-1/O-6 闭合（真机取证 2026-09-19）：`launch.permissionModeFlag` 只是**旋钮名**，
+        #   这一行才是**取值**。二者层级不同（名字在 launch 表里、取值在顶层，与 model/effort 同构）。
+        #   非交互 `-p` 无审批通道：不传此值时 CLI 以 `default` 启动，写/执行类工具被拒
+        #   （两次真实下发因此失败：`permission_denials:2`、文件写不出来）。
+        #   '' = 未指定 ⇒ 不下发该 flag（U9：安全默认值由人显式给，插件不替你选 bypassPermissions）。
+        #   合法取值（**服务端下发的下拉表**，与 `sessionMode` 同域，见 schema.js 同名字段注释）：
+        #   default / acceptEdits / plan / auto / dontAsk / bypassPermissions / fullAccess / delegate。
+        #   旧注释里的 6 值 CLI 表（缺 fullAccess/delegate）已作废：那是 spawn 路由的旗标名，
+        #   不是服务端的权限域，照它渲染会让用户选不到"完全权限"。
+        #   另一条等效路线（无需重启 dsh）：在 `~/.codebuddy/settings.json` 写
+        #   `{"permissions":{"allow":["Read","Grep","Glob","Write","Edit","Bash","PowerShell"]}}`——实测放行写命令。
+        permissionMode: ''
+        cwdRoot: ''             # 子进程工作目录根；空串 = 用默认（§7.3）
+        # ★ T04（§5.1）：会话映射落盘位（key → {cliSessionId, cwd, lastUsedAt, …}），由插件自行写入。
+        #   schema 用 dict(any) ⇒ 手改坏记录不会让整份 namespace 校验失败。
+        sessions: {}
+        # ── 目标实例保障（★ 2026-09-30 新增）────────────────────────────────────────
+        # 下发链路的第 0 站回答「目标实例是否存在，是否要启动」。默认 true **有据**：
+        #   这是主理人点名要插件自己回答的那一问，默认 false 等于把这句话退回给用户。
+        # 边界（src/host/gateway/ensure.js 头注）：只在**没有可用 sidecar 且桌面端确实没在跑**
+        #   时拉起，且**从不重启已开的桌面端**——多开一个实例会和已开的那一个抢凭据运行时。
+        autoStartDesktop: true
+        # 等目标实例出现的窗口（毫秒）。30s 的依据：桌面端激活 prewarm sidecar 实测 1–3s，
+        #   30s 覆盖"慢盘/杀软冷扫"；再大就是让用户对着一个本轮注定失败的作业干等。
+        instanceTimeoutMs: 30000
+        # ── 传输面（★ 2026-10-02 切回 automation 为默认）──────────────
+        # automation = 插件往桌面端自己的计划任务表（`~/.workbuddy/workbuddy.db` 的
+        #   `automations`）写一条**一次性**任务，由**桌面端自己的调度器**开一个新会话并把
+        #   提示词发下去。工作目录 / 模型 / 权限都随这一行下发，**不需要预先绑定任何会话**。
+        #   点火参数：`schedule_type='once'`、`next_run_at=now`、`valid_until=+25min`
+        #   （`timeoutMs(15min)+grace(10min)`），建会话成功立刻 `retireRow` 软删，
+        #   任何终态都退役，启动期扫遗留活行全软删（止损就靠删行）。
+        #   ⇒ 这是当前唯一主路（`startAutomationRun` 唯一写入点）。
+        # gateway = 本机 ACP 网关已**下线**：不再走 `dispatch.run`，不再建网关会话。
+        #   配置里残留 `transport:'gateway'` 一律按 automation 跑，不走网关。
+        # spawn   = 老路：自己 spawn 一个 CLI。真机上**必然 auth_failed 且不扣积分** ——
+        #           账号会话只在桌面端拉起的 sidecar 里，`lite-wb` 只是同一条 CLI 的瘦身包。
+        transport: 'automation'
+        # 网关的 localhost 口令。留空 = 自动从桌面端 sidecar 进程的环境里读
+        # （**仅 Windows**，走 PEB，src/host/gateway/token.js）。手填只作兜底。
+        # 它不是 WorkBuddy 账号凭据：作用域仅限本机该 sidecar 的一次会话，从不落盘、不进 argv。
+        gatewayToken: ''
+        # ★ 续用的对话 id。留空 = 既不续用、也不新建 ⇒ **插件一步都走不出去**
+        #   （dispatch 在 connect 之前就 early-return，连 sidecar 都不碰）。
+        #   2026-09-28 真机实测（pid 26080 / 127.0.0.1:53349）曾定下三条拒绝自建的理由：
+        #   ① `session/new` 的 `cwd` **不生效**（回执无工作区字段）；② 每个新 ACP connection
+        #      的**第 1 次** `session/new` 返回 GUI 当前那条、第 2 次起才真新建（4 次复现）；
+        #   ③ `session/new` **会切走 GUI 活跃会话**。
+        #   ★★ 2026-09-28 更正：① 仍成立（四种独立方式，含一个不存在的盘 Z: 也"成功" ⇒
+        #      参数根本不参与寻址），但它不再是拒绝自建的理由——工作区改由 prompt 锚点解决
+        #      （见下方 `workspace`）。②③ 改由 `session/load` 绕开：跨连接载入**不改
+        #      sessionId、不切 active**，还顺带回模型清单与权限表。
+        #   ⇒ 本项回到本来的意思：**要续用哪条对话**。
+        #   填法：桌面端**新建**一条对话 → 选好工作区 → 保持打开 → 把它的 id 填到这里。
+        boundSessionId: ''
+        # ── 会话面（★ 2026-09-28 新增）───────────────────────────────────────────
+        # 任务权限（ACP 会话权限模式）。**真源是服务端下发的下拉表，不是本地常量**：
+        #   `session/load`/`session/new` 期间服务端经 `config_option_update` 事件给出
+        #   `category: "mode"` 的 8 个选项（2026-09-28 真机读全）：
+        #     default=Always Ask / acceptEdits / plan / auto / dontAsk /
+        #     bypassPermissions / fullAccess=Full Access / delegate
+        #   ⚠ 上面的 `permissionMode` 是 **spawn 路由的 CLI flag**，缺 fullAccess 和 delegate ——
+        #     拿那份当权威，用户就选不到"完全权限"。设置页必须用服务端那张表渲染。
+        #   '' = 沿用该对话当前权限，**不替用户选授权强度**。
+        sessionMode: ''
+        # 任务工作区。⚠ **不是会话属性**：`session/new`/`session/load` 的 `cwd` 被静默丢弃，
+        #   回执也没有任何结构化字段带它。唯一可行路径是随任务文本送进 `session/prompt`
+        #   （src/host/gateway/acp.js `buildPromptBlocks`），已用硬负控验证模型照此目录干活。
+        #   ★ 这是**提示不是约束**——没有服务端机制把模型钉在该目录，UI 不能说成"已限制"。
+        #   '' = 不带，模型用那条对话自己的目录。
+        workspace: ''
+        # ★ 是否自己新建一条对话。默认 false。
+        #   新建**会切走桌面端 GUI 的活跃会话**（真机复现 4 次）⇒ 必须由人显式打开。
+        #   关着时若 `boundSessionId` 也为空，则**一个 ACP 调用都不发**。
+        createNewConversation: false
+        # ── 积分（★ 2026-09-28：手填锚点已退役）──────────────────────────────────
+        # 余额真值直读（wbipc 只读查询，借桌面端登录态）⇒ 不再需要手填。
+        # 下面两项是**上一次成功读到**的缓存，供离线时显示，并让用户能判断新鲜度。
+        creditsRemain: 0     # 上次读到的余额（插件写）
+        creditsAt: 0         # 读取时刻（插件写）
+        creditsConsumed: 0   # 累计扣减（插件写；仅参考，**不是**账单）
+        creditsRuns: 0       # 运行次数（插件写）
+        launch:
+          # ★★★ CLI 旗标表已整体删除（2026-10-02，删净 CLI 线）★★★
+          #   原来这里声明 13 个 CLI 旗标（`--model` / `--effort` / `-p` / `--resume` /
+          #   `--session-id` / `--output-format` / `--input-format` / `--permission-mode` …）。
+          #   CLI 传输删除后没有任何代码读它们。留着比删掉更坏：**schemastery 对未知键静默丢弃**
+          #   ⇒ 用户改了设置没有任何效果、也没有任何报错 —— 一张永远不发出去的表，
+          #   就是一个永远不生效的承诺。
+          #   唯一保留的是 `effortValues`：**它不是旗标**，是"这个平台支持哪几档推理强度"的能力表，
+          #   卡片靠它决定哪些档位可选/置灰。WorkBuddy 6 档，无 `off`（真源：桌面端能力表）。
+          effortValues:
+            minimal: 'minimal'
+            low: 'low'
+            medium: 'medium'
+            high: 'high'
+            xhigh: 'xhigh'
+            max: 'max'
+
+# ── 第二行：把「委派」这件事接上一个真正的子智能体 provider ──────────────────────
+# ★ 为什么是**第二行**而不是并进上面那行 ★
+# 上面那行是**本插件自己的**配置（`dsh-plugin-workbuddy`），下面这行是**另一个插件**
+# （`dsh-tool-subagent`）的配置。两者的 `config:` 由不同的 `Config` schema 声明，
+# 键集合互不相干；并进一行会让其中一个 schema 静默吃掉对方的键。
+#
+# ★ 这几行是「`workbuddy_subagent` 这个委派工具出现在父会话里」在宿主侧的全部配置 ★
+#   ⚠ 2026-10-02 更正：它**不会**让 WorkBuddy 进 dsh 的子智能体列表 —— provider 返回
+#     `localAgent: void 0`，`dsh-subagent/lib/index.js:3130` 因此不建 catalog 行，
+#     dsh 侧没有可点开的子会话。看得见的是**父会话里那一次调用 + 它回传的结果**。
+#   - `provider: workbuddy`      —— 选中 host/subagent/provider.js 注册的那个 provider。
+#     ★ 它同时是**挂载闸**：`dsh-tool-subagent` 只在 `subagent/provider-added` 事件里、
+#       且配置实例的 `config.provider` 与该名字相等时才把工具挂上
+#       （dsh-tool-subagent/lib/index.js:565-575）。名字写错 = 工具永远不出现。
+#   - `toolName: workbuddy_subagent` —— 委派工具的名字。不改的话它叫 `subagent`，
+#     与别的委派工具重名，模型在工具列表里分不清该派给谁。
+#   - `backgroundMode: one-shot` —— ★ 2026-10-02 从 `continuable` 改回 `one-shot` ★
+#     `continuable` 要 provider 兑现 `prepareContinuable`（dsh-subagent/lib/index.js:3149-3152），
+#     而那是**在 dsh 自己的进程里**物化一个真子 Agent（`startContinuable()` →
+#     `host.prepareContinuable` → `activations.materialize(...)`）—— 子 Agent 的每一次生成
+#     都还得走 dsh 的 agent loop，也就还得有一个 `workbuddy` 路由的 LLM。
+#     那条路已被判定为**反代**并删除（见 provider.js 文件头），所以这里必须回到 one-shot：
+#     本 provider 全部能力位为 `false`，`prepareContinuable` 不存在，
+#     声明 `continuable` 会在 `start()` 里直接撞 `UNSUPPORTED_CAPABILITY`。
+#     代价如实记：**one-shot 没有"同一子会话继续下任务"**，dsh 侧也不再有可点开的子会话。
+#     「一个任务 = 一个 WorkBuddy 对话」改由 `sessionKey` 亲和性实现（同一父会话 + 同一任务名
+#     ⇒ 同一条 WorkBuddy 对话），不再依赖 continuable。
+#   - `agentOptions` 刻意**整块不写** —— 它只在 dsh 自己起子 Agent 时才会被读；
+#     本 provider 不走那条路（`inheritsParentContext: false`，`localAgent: void 0`），
+#     写了就是"接受但忽略"，正是 dsh 说的最坏形态。少了它，这一行也不会失效。
+#   - `maxDepth: provider-managed` —— 显式声明"深度由 provider 自己管"。depthLimit 不在
+#     WorkBuddy 的能力位里（工具运行在**它自己的进程**），让 dsh 用默认上限去要求一个
+#     provider-managed 的后端兑现，等于逼它撒谎。
+#
+# ★★★ `name` 必须带 scope，写成裸名这一行会**静默失效** ★★★
+# 2026-09-30 实机：`dsh --profile cp-wb-hl "<任意任务>"` 打印
+#   dsh: warning: 1 entry did not activate
+#   dsh-tool-subagent (dsh-tool-subagent): failed to import
+# 而 `dsh --profile cp-wb-hl --dump-config` 里这一行的 config **看起来完全正确**
+# —— 三个键一个不缺。★ `--dump-config` 不解析 import，只有真正 boot 才会暴露 ★
+# dsh-base / dsh-web-app 里所有同族条目一律写作 '@deepseek-ai/dsh-tool-subagent'。
+- insert:
+    # ── 智能团队（Agent Teams）：持久化 + 团队域 + 工具 + UI（2026-10-02）──────────
+    # ★ 主理人裁决：子智能体与智能团队**二选一，选智能团队**。所以这里挂 Team。
+    #   Team 成员由 Lead 用 `spawn_teammate` 按**名字**创建，界面上的成员名就是那个名字 ——
+    #   这正是"一眼看得出调用的是 WorkBuddy"的落点。旧 subagent 路没有这个概念：
+    #   provider 返回 `localAgent: void 0`，不留子会话、不留 catalog 行，界面上根本没有它。
+    #
+    # ★ 为什么不把 `freshProvider` 设成 `workbuddy`（那能让所有成员直接跑在 WorkBuddy 上）★
+    #   那等于把 WorkBuddy 当成 dsh 子 Agent 的**模型路由** —— 就是本项目明令禁止、且已删除的
+    #   **反向代理**（插件不再注册任何 LLM 适配器，见 `apply.js` 头注）。不越这条线。
+    #   走另一条同样可见、且合法的路：
+    #     Lead 创建一个**名为 WorkBuddy** 的成员，角色写明"通过 WorkBuddy 执行"，
+    #     该成员调用本插件的 `workbuddy_run` 下发。成员是真的 dsh agent（不是代理壳），
+    #     名字在界面上直接可见，工作真的落在 WorkBuddy 里。
+    #
+    #   依赖组合取自 Team README 的最小可用配置。
+    - id: dsh-session-persistence-jsonl-team
+      name: '@deepseek-ai/dsh-session-persistence-jsonl'
+    - id: agent-team
+      name: '@deepseek-ai/dsh-experimental-agent-team'
+    - id: tool-agent-team
+      name: '@deepseek-ai/dsh-experimental-tool-agent-team'
+      # ★ `freshProvider` / `forkProvider` 保持 dsh 自带的 `spawn` / `fork`。
+      #   `spawn_teammate(name, description, task)` **没有"后端"参数** —— 成员一律是 dsh 起的 agent。
+    - id: ui-agent-team
+      name: '@deepseek-ai/dsh-experimental-client-ui-agent-team'
+
+- insert:
+    - id: dsh-tool-subagent
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: workbuddy
+        toolName: workbuddy_subagent
+        backgroundMode: one-shot
+        maxDepth: provider-managed

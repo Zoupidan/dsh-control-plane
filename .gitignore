@@ -94,3 +94,6 @@ RC-*
 /04-docs/MODULE-WORKFLOW.md
 /packages/plugin-workbuddy/scripts/
 
+
+# 多智能体协作交接现场（本地过程资产，不进开源仓库）
+.agents/

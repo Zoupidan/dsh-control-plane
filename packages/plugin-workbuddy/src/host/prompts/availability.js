@@ -169,13 +169,38 @@ function overrideHint(runtime) {
  * <p>上限写在**系统提示**里而不是代码里：它是使用约定（"最多反驳两轮"），不是必须由插件
  *   强制的不变量。真要强制，断点是 `workbuddy_run` 的次数计数，而那需要状态跨作业存活，
  *   代价与收益不成比例 —— 所以这里**只声明不强制**，并且如实标注这一点。
+ *
+ * <p>★ 2026-10-03 会话复用（Track A 追发）分两说 ★
+ * 规则 (1) 的旧文案逐字说"每轮仍开全新对话、无记性、必须复述全部上下文"。追发总闸
+ * `enableMultiTurnFollowUp` 开着时那句话不再是全称事实（追发轮续在同一条对话上，自带前情），
+ * 照旧说就是在教模型每轮做无用功。故按开关分支：关 ⇒ 既有措辞**逐字保留**（契约）；
+ * 开 ⇒ 换成追发口径，并写明回退轮（`fallback=<code>`）的例外。
+ * 防御与 `overrideHint` 同款：runtime/currentConfig 缺失或读抛 ⇒ 视为关闭（宁可少说，不可撒谎）。
+ *
+ * @param {object} runtime 可用性节的同一 runtime（`currentConfig()` 现取追发总闸）
+ * @returns {string} 前置空格的句子
  */
-function debateHint() {
+function debateHint(runtime) {
+  let followUpOn = false;
+  if (runtime !== null && typeof runtime === 'object' && typeof runtime.currentConfig === 'function') {
+    try {
+      followUpOn = runtime.currentConfig()?.enableMultiTurnFollowUp === true;
+    } catch {
+      followUpOn = false;
+    }
+  }
+  const rule1 = followUpOn
+    ? '(1) Use the same session_key every round so the exchange stays grouped — with multi-turn follow-up on, '
+      + 'each round is appended to that SAME WorkBuddy conversation and carries its own context, so restate the '
+      + 'objection itself, not the whole history; if the receipt reads fallback=<code> or '
+      + 'continuity=fresh-conversation-per-round, that round lost the thread: restate with full context again. '
+    : '(1) Use the same session_key every round so the exchange stays grouped — but each round still opens '
+      + 'a fresh conversation with no memory of its own argument, so restate the objection with enough context '
+      + 'every time. ';
   return ' If the user asked you to challenge a result, or a returned answer looks wrong, you may contest it: '
     + 'send_message the SAME member with your objection, and it argues back on the next run. Two rules. '
-    + '(1) Use the same session_key every round so the exchange stays grouped — but each round still opens '
-    + 'a fresh conversation with no memory of its own argument, so restate the objection with enough context '
-    + 'every time. (2) TWO rebuttal rounds is the **default ceiling, not a '
+    + rule1
+    + '(2) TWO rebuttal rounds is the **default ceiling, not a '
     + 'hard one**: if the user asked for a specific number of rounds, follow the user instead. Either way, '
     + 'stop as soon as you agree or the point is settled — do not spend the whole budget by default. Every '
     + 'round is a real WorkBuddy run and costs real credits.';
@@ -277,8 +302,20 @@ function continuityHint(runtime) {
   //   `automations` 表无对话列，调度器只按行新建，这是当前主路的真实语义。
   const transport = typeof cfg?.transport === 'string' && cfg.transport !== '' ? cfg.transport : 'automation';
   if (transport === 'automation') {
-    return ' On the current transport (automation) every round opens a new WorkBuddy conversation there, so '
+    const base = ' On the current transport (automation) every round opens a new WorkBuddy conversation there, so '
       + 'a session_key only groups runs and carries NO memory across rounds. Say so when a follow-up should remember.';
+    // ★ 2026-10-03 会话复用（Track A 追发）：总闸开着 ⇒ "每轮新对话"不再是全称事实。
+    //   追加一句（既有句子逐字保留 —— 只加不改是本节纪律），写清追发进同一条对话的**条件**
+    //   （记性里为该 session_key 记着可续接对话）与**回执判据**（continuity=same-conversation /
+    //   origin=resumed；失败回退轮 reads fallback=<code>）。否则提示词仍在教模型"没有记性"，
+    //   而追发轮明明续在同一条对话上 —— 模型会据此每轮白复述一遍前情。
+    if (cfg?.enableMultiTurnFollowUp === true) {
+      return base + ' Multi-turn follow-up is ON: when a resumable conversation is recorded for the session_key, '
+        + 'the next round is appended to that SAME conversation (the receipt then reads continuity=same-conversation '
+        + 'with origin=resumed); only when that append fails does the round open a new conversation instead '
+        + '(the receipt reads fallback=<code>).';
+    }
+    return base;
   }
   // ★ gateway 路已下线（本机 ACP 不再被生产引用）：配置里残留该值时如实说已下线，
   //   不再描述它的会话语义（"绑定一条对话"已是过去式，说成现在式就是撒谎）。
@@ -417,7 +454,7 @@ export function availabilityText(runtime) {
       'WorkBuddy delegation is available: use workbuddy_run to delegate a coding task as a background job '
       + '(read progress with job_output, cancel with job_kill), and workbuddy_status to inspect the local '
       + 'WorkBuddy install and the most recent run.'
-      + subagentRouteHint() + debateHint() + continuityHint(runtime) + degraded
+      + subagentRouteHint() + debateHint(runtime) + continuityHint(runtime) + degraded
       + overrideHint(runtime) + lastFailureHint(runtime)
     );
   }

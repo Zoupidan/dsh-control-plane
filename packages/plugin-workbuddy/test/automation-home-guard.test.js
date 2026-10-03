@@ -86,9 +86,14 @@ function fixtureHome() {
   return home;
 }
 
-test('★★ 第 ① 步：这条判据本身能逮住已知故障（往真库的 tmp 拷贝插一行 ⇒ 必须被观察到）', () => {
+test('★★ 第 ① 步：这条判据本身能逮住已知故障（往真库的 tmp 拷贝插一行 ⇒ 必须被观察到）', (t) => {
   const before = realAutomationCount();
-  assert.ok(before !== null, `真库读不到（${REAL_DB}）⇒ 这条守卫在别的机器上会变成空断言，fail-closed 不静默通过`);
+  if (before === null) {
+    // ★ 无真库（本机没装/没初始化过 WorkBuddy）是开源用户的合法环境：显式 SKIP
+    //   （node --test 计入 skipped，可见），不做空断言、也不让 test:host 在这类机器上必红。
+    t.skip(`真库不存在（${REAL_DB}）—— 本机未安装/未初始化 WorkBuddy，守卫无真库可守`);
+    return;
+  }
 
   // ★ 零写真库：在 tmp 拷贝上模拟事故。拷贝失败就地抛（fail-closed，不退回写真库）。
   const copyDir = mkdtempSync(join(tmpdir(), 'wb-guard-copy-'));
@@ -127,7 +132,7 @@ test('★★ 第 ① 步：这条判据本身能逮住已知故障（往真库�
   }
 });
 
-test('★★ 第 ④ 步：★ 套件级护栏生效 ⇒ 即使真点了火也**碰不到**真库', async () => {
+test('★★ 第 ④ 步：★ 套件级护栏生效 ⇒ 即使真点了火也**碰不到**真库', async (t) => {
   // ★ 这条判据的对象是**防线本身**：不是"某个测试记得注入"，而是
   //   "整套测试进程的 WORKBUDDY_HOME 指着临时目录 ⇒ 结构上写不到真库"。
   //   事故已经因此发生过两次（hardening 的 transport、多轮测试漏注入点火），
@@ -139,7 +144,10 @@ test('★★ 第 ④ 步：★ 套件级护栏生效 ⇒ 即使真点了火也**
   );
 
   const before = realAutomationCount();
-  assert.ok(before !== null, `真库读不到（${REAL_DB}）⇒ 本判据无法自证（见第 ① 步），fail-closed 不静默通过`);
+  if (before === null) {
+    t.skip(`真库不存在（${REAL_DB}）—— 本机未安装/未初始化 WorkBuddy，守卫无真库可守`);
+    return;
+  }
 
   // ★ 故意在**没有** fixture、没有注入的前提下真点一次火。
   //   若护栏失效，这一下就会在用户 WorkBuddy 里建出一条真对话。
@@ -153,9 +161,12 @@ test('★★ 第 ④ 步：★ 套件级护栏生效 ⇒ 即使真点了火也**
   assert.equal(realAutomationCount(), before, '★★ 真库行数必须一字不变 —— 这一条才是护栏的真正判据');
 });
 
-test('★★ 第 ③ 步：★ 失败的点火也必须退役（幽灵任务洞的回归）', async () => {
+test('★★ 第 ③ 步：★ 失败的点火也必须退役（幽灵任务洞的回归）', async (t) => {
   const before = realAutomationCount();
-  assert.ok(before !== null, `真库读不到（${REAL_DB}）⇒ 本判据无法自证（见第 ① 步），fail-closed 不静默通过`);
+  if (before === null) {
+    t.skip(`真库不存在（${REAL_DB}）—— 本机未安装/未初始化 WorkBuddy，守卫无真库可守`);
+    return;
+  }
 
   const home = fixtureHome();
   const previous = process.env.WORKBUDDY_HOME;
@@ -186,9 +197,12 @@ test('★★ 第 ③ 步：★ 失败的点火也必须退役（幽灵任务洞�
   }
 });
 
-test('★★ 第 ② 步：`WORKBUDDY_HOME` 能把点火导到夹具，真库一字不动', async () => {
+test('★★ 第 ② 步：`WORKBUDDY_HOME` 能把点火导到夹具，真库一字不动', async (t) => {
   const before = realAutomationCount();
-  assert.ok(before !== null, `真库读不到（${REAL_DB}）⇒ 本判据无法自证（见第 ① 步），fail-closed 不静默通过`);
+  if (before === null) {
+    t.skip(`真库不存在（${REAL_DB}）—— 本机未安装/未初始化 WorkBuddy，守卫无真库可守`);
+    return;
+  }
 
   const home = fixtureHome();
   const previous = process.env.WORKBUDDY_HOME;

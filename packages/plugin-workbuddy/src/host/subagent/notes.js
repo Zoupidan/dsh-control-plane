@@ -147,9 +147,10 @@ export function receiptNote(report) {
   const receipt = report?.receipt ?? null;
   const phases = Array.isArray(report?.phases) ? report.phases.filter((p) => typeof p === 'string' && p !== '') : [];
   // ★ `continuity` 那一支也要过这道闸（自动化路必然带 `phases`，所以实践上不受影响；
-  //   这里把它算进去是为了**形状变了也不会沉默**）。
+  //   这里把它算进去是为了**形状变了也不会沉默**）。回退轮的 `fallbackReason` 同理：
+  //   一个只带"追发失败回退了"这一件事的回执，同样不该被这道闸吞成空串。
   if (receipt === null && phases.length === 0 && str(report?.continuity) === '' && str(report?.usedModelId) === ''
-    && str(report?.sessionMemory) === ''
+    && str(report?.sessionMemory) === '' && str(report?.fallbackReason) === ''
     && !(report !== null && typeof report === 'object' && 'requestedModelId' in report)) return '';
 
   const bits = [];
@@ -158,7 +159,15 @@ export function receiptNote(report) {
   //   只报 id 不报来源，读者无法判断"权限提升成不成立"（dispatch.js:573-576 的真机结论：
   //   `set_mode` 只在**自建**会话上真生效，在已有会话上只有回传）。
   if (sessionId !== '') bits.push(`session=${sessionId}`);
-  if (report?.sessionOrigin === 'new' || report?.sessionOrigin === 'loaded') {
+  // ★ `origin` 词表三个值，各有出处：
+  //   `new`     —— 点火轮：桌面端调度器按 automations 行新建（dispatch.js:573-576 的真机结论：set_mode
+  //                只在自建会话上真生效，所以"是不是自建"必须可见）；
+  //   `loaded`  —— ACP `session/load` 绑定的既有会话（gateway 时代；保留作历史兼容）；
+  //   `resumed` —— ★ 2026-10-03 起合法（Track A 追发接入子智能体面）：本轮被追加进**既有**的
+  //                WorkBuddy 对话（`execute.js` 的追发分支）。此前它被当负控（"认不出不得回显"），
+  //                随词表扩容翻转为正控 —— 认得出的值必须回显，否则追发轮在正文里读不出
+  //                "接在哪条对话上"。其余认不出的值仍然一律不回显（那条纪律本身不变）。
+  if (report?.sessionOrigin === 'new' || report?.sessionOrigin === 'loaded' || report?.sessionOrigin === 'resumed') {
     bits.push(`origin=${report.sessionOrigin}`);
   }
   // ★ 会话亲和**没有**成立，或成立的方式与用户想的不同 —— 三种都要说清，不能一律叫"新对话"。
@@ -173,9 +182,22 @@ export function receiptNote(report) {
   };
   const cont = str(report?.continuity);
   if (cont !== '' && CONT_TEXT[cont] !== undefined) bits.push(`continuity=${CONT_TEXT[cont]}`);
+  // ★ 追发位（★ 2026-10-03 新增，Track A 追发成功时出现；与 run.js lastRun 的 followUp 同源同值）：
+  //   `follow-up=<channel> in <ms>` —— 这一轮没点火、是追加进既有对话的，耗时多少毫秒。
+  //   主控模型据此能分辨"等了 9 秒的真追发"与"又开了一条新对话"。
+  const fu = report?.followUp;
+  if (fu !== null && typeof fu === 'object' && str(fu.channel) !== '' && Number.isFinite(fu.elapsedMs)) {
+    bits.push(`follow-up=${str(fu.channel)} in ${Math.max(0, Math.round(fu.elapsedMs))}ms`);
+  }
   // 记不住对话 id = 下一轮会静默开新对话。这件事必须抢在用户自己发现之前说出来。
   const mem = str(report?.sessionMemory);
   if (mem !== '') bits.push(`session-memory=${mem} (the conversation id could NOT be remembered, so the next round will start a new one)`);
+  // ★ 回退位（★ 2026-10-03 新增）：追发失败 ⇒ 该轮照旧点火成了新对话。指纹码必须可见 ——
+  //   否则"为什么这轮没接上前情"只剩一个没有归因的 `fresh-conversation-per-round`。
+  const fallback = str(report?.fallbackReason);
+  if (fallback !== '') {
+    bits.push(`fallback=${fallback} (the follow-up attempt failed with this code, so this round was ignited as a NEW conversation instead)`);
+  }
   // ★★★ 模型：**请求了什么** 与 **实际跑了什么** 必须同时在场 ★★★
   //   实测（2026-10-01 12:48）：没人指定模型 ⇒ 写进去 `model_id=NULL` ⇒ 桌面端落它自己的默认
   //   （快速 / fast-model），会话上 `model` 记成 null。用户只看到"快速"，

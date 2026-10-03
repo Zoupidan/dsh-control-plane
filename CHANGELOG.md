@@ -2,6 +2,45 @@
 
 本项目版本号遵循 [SemVer](https://semver.org/)，格式参照 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.2.1] - 2026-10-04
+
+### 本次更新的目的
+
+两件事，方向一致——**让点火这一轮更快、并且如实说出自己跑在什么环境上**：
+
+1. **计划任务改 CDP 直接点火**：点火轮绕过桌面端计划任务的调度排队，直接建对话并下发，实测砍掉约 14 秒调度开销；开关默认关闭，未开启时与 0.2.0 逐字节一致。
+2. **会话模型 / 思考强度只读识别**：向已有会话续发的那一轮，回执如实带回这条对话当前用的是哪个模型、哪一档思考强度。语义钉死为**只识别、不复位、不改动**——你在桌面端手动改过的设定，插件读到什么就报什么，绝不回写。
+
+### 新增（Added）
+
+- **直接点火（CDP ignition）**：新增设置项 `enableDirectIgnition`（默认 **false**）。开启后 `workbuddy_run` 与智能体团队链（subagent）的**点火轮**经 WorkBuddy 桌面端调试通道（CDP）直接 `create` 对话并 `runPrompt` 下发，跳过计划任务队列。回执 `transport:'direct'`、`phases:['direct-ignite']`，成功即 `sessions.adopt` 记性（下一轮同会话追发能命中）。
+  - **派发前 / 派发后两段语义**：探测、建会话、设配阶段失败（`dispatched:false`）⇒ 照旧**回退计划任务队列**，回执带 `fallback` / `fallbackReason`，任务不丢；`runPrompt` 已发出之后的任何失败（超时、`state` 非 completed）**一律不回退**——回退会把同一条 prompt 再跑一遍（双份积分 + 两条对话），如实记 `failed` 并带上 `conversationId`。
+  - **只设请求过的项**：模型走 `create` 入参，思考强度 / 权限模式走 `configSetThoughtLevel` / `configSetPermissionMode`；未请求则零 setter 调用，绝不复位你在桌面端的既有设定。
+  - **状态面看得见**：`workbuddy_status` 新增 `cdp:{available, port, reason}` 与 `ignition:{mode, reason}`；模型据此判断该不该问你。可用性提示写明：依赖 CDP、配置方法、**三个必须询问你的触发点**，并禁止插件静默回退、禁止谎称走 direct、禁止代设环境变量或代杀/代重启 WorkBuddy。
+- **会话模型 / 思考强度只读识别**：追发轮在派发**前**通过桌面端调试通道读一次会话快照，回执新增 `follow_up.conversationModel` 与 `follow_up.conversationEffort`（`string | null`）。读到什么报什么；读不到如实 `null`，**不编造、更不会为了"读不到"就去改会话设定**。`workbuddy_status` 的 `lastRun.followUp` 与智能体团队回执同名同义透传。
+- **识别读取与派发预算分离**：识别走独立的 2 秒小预算——桌面端卡顿时最多拖 2 秒即放弃并照常追发。识别失败**绝不**把这一轮判死，也绝不蚕食追发的确认窗口。
+
+### 变更（Changed）
+
+- `workbuddy_status` 顶层键集 +2（`cdp` / `ignition`）；**`workbuddy_run` 回执键集一个字未动**（既有字段语义与键集由测试逐字锁死）。
+- 追发回执 `follow_up` 与 `lastRun.followUp` 新增 `conversationModel` / `conversationEffort` 两键，schema 中声明为 `string | null`。
+- 主控模型的可用性提示（availability）随开关状态说明：直接点火与追发依赖桌面端调试口；追发轮**不发送**任何模型/强度设定，沿用该对话现有设定，回执只读如实回报。
+- 智能体团队链（subagent）回执尾注新增 `transport=direct` 语义，`BIT_KEYS` 白名单未改（不新增字表项）。
+
+### 验证（真机实测，WorkBuddy 5.6.2 + 调试口 9222）
+
+- **延迟拆解**：direct 点火 **12542ms** / 同会话追发 **13585ms** / 第二次 direct **9545ms**；扣除桌面端记录的模型轮次后，我们的链路开销 **5893 / 851 / 893ms** ⇒ 稳态 ≈0.9s，对基线 `42100ms（27000 模型 + 15100 调度）` **砍掉约 14 秒**调度。首条 5.9s 是新建对话在桌面端的前置排队，同路径第二条只剩 0.9s。
+- **回退路径**：把 `followupCdpPort` 指向错口（19999）⇒ **3ms** 返回 `{stage:'detect', dispatched:false, code:'ERR_WORKBUDDY_CDP_UNAVAILABLE'}`，**连对话都没建**（可回退、零垃圾）；"回退后任务照跑 + `fallback` 两键"由单测断言。
+- **完全权限补测**：`permissionMode:'fullAccess'` 点火后回读 `fullAccess`，+3s 复核、**同会话复用第二条之后仍为 `fullAccess`**；两轮 Bash 探针 token 命中（真执行，非仅回传）。已存在的旧对话补设同样 `"" → fullAccess` 并稳定。
+- **只读识别三连发**：点火（带模型 + 思考强度）→ 同会话追发 → 桌面端**手动改模型** → 第三轮追发。回执如实显示改后模型，追发前后会话设定**逐字未变**（零复位、零回写）。
+- **门禁**：`test:host` **595** 例、`test:client` **82** 例、CI 红线 5 项全绿、`check:knobs` PASS；发布前凭据/隐私扫描对**被跟踪文件**逐条复核，高危 0。
+
+### 兼容性
+
+- 不改默认行为：`enableDirectIgnition` 与 `enableMultiTurnFollowUp` 默认均为 **false**，两个都未开启时与 0.2.0 逐字节一致（既有测试零改动通过）。
+- 对既有消费者**只增不减**：新增键缺省/读不到时为 `null`，不改变任何既有字段语义。
+- **依赖披露**：直接点火与追发都依赖 WorkBuddy 桌面端带 `WORKBUDDY_REMOTE_DEBUGGING_PORT`（默认 9222）启动，需一次性设置用户环境变量后**完全退出并重启 WorkBuddy**。插件只告知、只询问，不代设、不代杀、不代重启，也不静默回退。**不引入任何网关或反向代理变种**——链路始终是本机 CDP 直连。
+
 ## [0.2.0] - 2026-10-03
 
 ### 本次更新的目的

@@ -236,6 +236,33 @@ class FakeCdpServer {
       });
       return;
     }
+    // ★ direct ignition（2026-10-04 探针 `tmp/probe-direct-create.mjs` 真机形状）：
+    //   create 回 `{info:{...}, configManager:{...}}`；设配 / 删除成功回 **undefined**。
+    //   ★ 三条都必须排在 typeof 分支之前：这些表达式里同样含 "typeof window.__wbInvoke" 子串。
+    if (expr.includes('"wb:conversations:create"')) {
+      const cid = expr.match(/"conversationId"\s*:\s*"([^"]+)"/);
+      const ttl = expr.match(/"title"\s*:\s*"([^"]+)"/);
+      const mdl = expr.match(/"model"\s*:\s*"([^"]+)"/);
+      reply({
+        info: {
+          id: cid !== null ? cid[1] : 'dsh-ignite-fake',
+          title: ttl !== null ? ttl[1] : '',
+          state: 'idle',
+          transport: 'local',
+          origin: 'desktop',
+          kind: 'task',
+          isBackgroundAutomation: true,
+        },
+        configManager: { mode: 'craft', model: mdl !== null ? mdl[1] : '', thoughtLevel: null, permissionMode: '' },
+      });
+      return;
+    }
+    if (expr.includes('wb:conversations:configSetThoughtLevel')
+      || expr.includes('wb:conversations:configSetPermissionMode')
+      || expr.includes('"wb:conversations:delete"')) {
+      reply(undefined);
+      return;
+    }
     if (expr.includes('typeof window.__wbInvoke')) {
       this.sendFrame(JSON.stringify({ id: msg.id, result: { result: { type: 'string', value: 'function' } } }));
       return;
@@ -334,15 +361,18 @@ function makeSessions() {
 }
 
 /**
- * 接线被测环境（`multi-turn-reuse.test.js` 同形 + followUp seam）。
+ * 接线被测环境（`multi-turn-reuse.test.js` 同形 + followUp seam + directIgnite seam）。
  * `followUpOutcome`：null = 默认成功回执；对象 = 原样返回；函数 = 动态决定。
+ * `directOn` = 配置总闸 `enableDirectIgnition`（默认 false —— 关闭时不得构造/调用 direct 面）。
+ * `directOutcome`：同上；缺省 = direct 成功回执（dispatcher 真实信封形状）。
  */
-function harness({ flag = false, followUpOutcome = null } = {}) {
+function harness({ flag = false, followUpOutcome = null, directOn = false, directOutcome = null } = {}) {
   const runtime = makeRuntime();
   const jobs = makeJobs();
   const sessions = makeSessions();
   const automationCalls = [];
   const followUpCalls = [];
+  const directIgniteCalls = [];
   let fireCount = 0;
 
   const fakeAutomation = (req) => {
@@ -397,15 +427,45 @@ function harness({ flag = false, followUpOutcome = null } = {}) {
     enabled: true, model: '', effort: '', cwdRoot: 'C:/repo',
     transport: 'automation', boundSessionId: '',
     enableMultiTurnFollowUp: flag, followupCdpPort: 9222, followupTimeoutMs: 15000,
+    // ★ direct ignition 总闸（默认 false）：关闭时 run.js 一次都不许构造/调用 direct 面。
+    enableDirectIgnition: directOn,
   });
+
+  /** direct ignition 默认成功回执（dispatcher.ignite 真实信封形状）。 */
+  const fakeDirectIgnite = async (req) => {
+    directIgniteCalls.push(req);
+    if (typeof directOutcome === 'function') return directOutcome(req);
+    if (directOutcome !== null) return directOutcome;
+    return {
+      ok: true,
+      stage: 'dispatch',
+      dispatched: true,
+      created: true,
+      conversationId: 'dsh-ignite-fake-1',
+      title: 'DIRECT-TITLE',
+      elapsedMs: 42,
+      // 派发前读回的现配（真机探针见过 kimi-k3-1/high 同形）。
+      model: 'kimi-k3-1',
+      effort: 'high',
+      receipt: {
+        raw: { state: 'completed', content: [{ type: 'text', text: 'DIRECT-REPLY' }] },
+        output: 'DIRECT-REPLY',
+        state: 'completed',
+        requestId: '01a2',
+        clientRequestId: 'dsh-cdp-y',
+        responseModel: { id: 'glm-5.3-flash' },
+        artifacts: [],
+      },
+    };
+  };
 
   const tool = makeRunTool(
     runtime, sessions, CFG, { jobs, subprocess: {} }, null, null,
-    { automationRun: fakeAutomation, followUp: fakeFollowUp },
+    { automationRun: fakeAutomation, followUp: fakeFollowUp, directIgnite: fakeDirectIgnite },
   );
 
   return {
-    runtime, jobs, sessions, automationCalls, followUpCalls,
+    runtime, jobs, sessions, automationCalls, followUpCalls, directIgniteCalls,
     call: (args) => tool.execute(args, { signal: new AbortController().signal }),
   };
 }
@@ -842,4 +902,391 @@ test('W6 ★ 识别面缺键（读失败/旧 seam 回执）⇒ follow_up 两键�
   const last = h.runtime.notes[1];
   assert.equal(last?.followUp?.conversationModel, null, 'lastRun 与回执同源同值');
   assert.equal(last?.followUp?.conversationEffort, null);
+});
+
+/* ═══════════════ direct ignition（2026-10-04：计划任务 → CDP 直建）═══════════════ */
+
+/** 从 evaluate 表达式里取通道名（取不到 ⇒ '(bridge-only)'）。 */
+const channelOf = (expr) => {
+  const m = expr.match(/"(wb:conversations:[A-Za-z]+)"/);
+  return m !== null ? m[1] : '(bridge-only)';
+};
+/** 真机形状的对话快照（探针 `tmp/probe-direct-create.mjs` 实测形状）。 */
+const snapshot = (id, model = '', thoughtLevel = null) => ({
+  info: { id, title: 'probe', state: 'idle', transport: 'local', origin: 'desktop', kind: 'task', isBackgroundAutomation: true },
+  configManager: { mode: 'craft', model, thoughtLevel, permissionMode: '' },
+});
+
+test('G1 ★★★ ignite 成功：create → 设配(仅请求的) → 只读回 → runPrompt，四段通道顺序固定', async () => {
+  const srv = new FakeCdpServer();
+  const port = await srv.start();
+  try {
+    const d = createFollowUpDispatcher({ cdpPort: port, timeoutMs: 15_000 });
+    const r = await d.ignite({
+      prompt: packageContentBlocks('do it'),
+      cwd: 'C:/repo',
+      title: 'DSH-DIRECT',
+      modelId: 'kimi-k3-1',
+      effort: 'high',
+      permissionMode: 'fullAccess',
+      timeoutMs: 15_000,
+      cdpPort: port,
+    });
+    assert.equal(r.ok, true, `ignite 应成功：${JSON.stringify(r)}`);
+    assert.equal(r.stage, 'dispatch');
+    assert.equal(r.dispatched, true);
+    assert.equal(r.created, true);
+    assert.match(r.conversationId, /^dsh-ignite-/, '★ 自配 id ⇒ 半途失败也能定位并回收');
+    assert.equal(r.title, 'DSH-DIRECT');
+    assert.equal(r.model, 'kimi-k3-1', '★ 派发前读回的现配（读到什么写什么）');
+    assert.equal(r.effort, 'high');
+    assert.equal(r.receipt.state, 'completed');
+    assert.ok(
+      r.receipt.output.startsWith('FAKE-REPLY for ') && r.receipt.output.includes(r.conversationId),
+      `回执输出应回带目标对话 id：${r.receipt.output}`,
+    );
+    const chans = srv.evaluations.map((e) => channelOf(e.expression));
+    assert.deepEqual(chans, [
+      'wb:conversations:create',
+      'wb:conversations:configSetThoughtLevel',
+      'wb:conversations:configSetPermissionMode',
+      'wb:conversations:get',
+      'wb:conversations:runPrompt',
+    ], `★ 通道顺序：${JSON.stringify(chans)}`);
+    // create 必须真带 id/目录/标题/模型/自动化位（真机探针证明这些字段被吃下）。
+    const createExpr = srv.evaluations[0].expression;
+    assert.ok(createExpr.includes('"transport":"local"'));
+    assert.ok(createExpr.includes('"isBackgroundAutomation":true'));
+    assert.ok(createExpr.includes(`"conversationId":"${r.conversationId}"`));
+    assert.ok(createExpr.includes('"title":"DSH-DIRECT"'));
+    assert.ok(createExpr.includes('"model":"kimi-k3-1"'));
+  } finally { await srv.stop(); }
+});
+
+test('G2 ★ effort/permission 均未请求 ⇒ 点火轮**零 setter**（点火时设定：只设请求了的）', async () => {
+  const srv = new FakeCdpServer();
+  const port = await srv.start();
+  try {
+    const d = createFollowUpDispatcher({ cdpPort: port, timeoutMs: 15_000 });
+    const r = await d.ignite({ prompt: packageContentBlocks('x'), effort: null, permissionMode: null, timeoutMs: 15_000, cdpPort: port });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const chans = srv.evaluations.map((e) => channelOf(e.expression));
+    assert.deepEqual(chans, [
+      'wb:conversations:create',
+      'wb:conversations:get',
+      'wb:conversations:runPrompt',
+    ], `★ 未请求 ⇒ 不许出现 set* 通道：${JSON.stringify(chans)}`);
+    const setters = srv.evaluations.filter((e) => /configSet[A-Z]/.test(e.expression));
+    assert.equal(setters.length, 0, '★ 没请求强度/权限就不许发 setter（绝不复位、绝不回写）');
+    const createExpr = srv.evaluations[0].expression;
+    assert.equal(createExpr.includes('"model"'), false, 'modelId 空 ⇒ 不传给桌面端（沿用其默认）');
+  } finally { await srv.stop(); }
+});
+
+test('G3 ★ create 被桌面端明确拒绝 ⇒ stage=create、dispatched=false（可回退），且**从未派发**', async () => {
+  const srv = new FakeCdpServer({
+    onEvaluate: (expr, reply) => {
+      if (expr.includes('"wb:conversations:create"')) {
+        reply({ errorCode: 'CONVERSATION_ID_INVALID', message: 'conversationId must be a non-empty stable identifier' });
+        return;
+      }
+      reply({ state: 'unreachable' });
+    },
+  });
+  const port = await srv.start();
+  try {
+    const d = createFollowUpDispatcher({ cdpPort: port, timeoutMs: 15_000 });
+    const r = await d.ignite({ prompt: packageContentBlocks('x'), timeoutMs: 15_000, cdpPort: port });
+    assert.equal(r.ok, false);
+    assert.equal(r.stage, 'create');
+    assert.equal(r.dispatched, false, '★ 派发前失败 ⇒ 允许回退计划任务');
+    assert.equal(r.created, false, '桌面端拒了 ⇒ 没建出来');
+    assert.equal(r.conversationId, null);
+    assert.equal(r.code, FOLLOWUP_CODES.FOLLOWUP_FAILED, `指纹折进既有七指纹：${r.code}`);
+    assert.equal(srv.evaluations.some((e) => e.expression.includes('runPrompt')), false, '★ 绝不能已经派发');
+  } finally { await srv.stop(); }
+});
+
+test('G4 ★ 桥哨兵（create 与 get 都没跑成）⇒ 幂等复核后回收自建会话，cleanup=removed', async () => {
+  const srv = new FakeCdpServer({
+    onEvaluate: (expr, reply) => {
+      if (expr.includes('"wb:conversations:create"') || expr.includes('"wb:conversations:get"')) {
+        reply({ __error: true, message: 'window.__wbInvoke is not defined' });
+        return;
+      }
+      reply(undefined);   // delete 成功（真机即 undefined）
+    },
+  });
+  const port = await srv.start();
+  try {
+    const d = createFollowUpDispatcher({ cdpPort: port, timeoutMs: 15_000 });
+    const r = await d.ignite({ prompt: packageContentBlocks('x'), timeoutMs: 15_000, cdpPort: port });
+    assert.equal(r.ok, false);
+    assert.equal(r.stage, 'create');
+    assert.equal(r.dispatched, false);
+    assert.equal(r.cleanup, 'removed', '★ 半途失败不许留垃圾对话');
+    assert.match(r.conversationId, /^dsh-ignite-/);
+    assert.equal(srv.evaluations.some((e) => e.expression.includes('runPrompt')), false);
+  } finally { await srv.stop(); }
+});
+
+test('G5 ★ 设配被拒 ⇒ stage=config、dispatched=false、**自建会话被回收**、从未派发', async () => {
+  const srv = new FakeCdpServer({
+    onEvaluate: (expr, reply) => {
+      if (expr.includes('"wb:conversations:create"')) { reply(snapshot('dsh-ignite-g5')); return; }
+      if (expr.includes('wb:conversations:configSetThoughtLevel')) {
+        reply({ errorCode: 'INVALID_ARGUMENT', message: 'unsupported thought level' });
+        return;
+      }
+      if (expr.includes('"wb:conversations:get"')) { reply(snapshot('dsh-ignite-g5')); return; }
+      reply(undefined);
+    },
+  });
+  const port = await srv.start();
+  try {
+    const d = createFollowUpDispatcher({ cdpPort: port, timeoutMs: 15_000 });
+    const r = await d.ignite({
+      prompt: packageContentBlocks('x'), effort: 'nope', permissionMode: 'fullAccess', timeoutMs: 15_000, cdpPort: port,
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.stage, 'config');
+    assert.equal(r.dispatched, false, '★ 设配失败仍是派发前 ⇒ 允许回退');
+    assert.equal(r.cleanup, 'removed', '★ 回收刚建的会话（它没派发过 prompt，删掉零风险）');
+    assert.match(r.code, /^ERR_/, `须折进既有指纹，实际：${r.code}`);
+    const chans = srv.evaluations.map((e) => channelOf(e.expression));
+    assert.equal(chans.includes('wb:conversations:runPrompt'), false, '★ 绝不能已经派发');
+  } finally { await srv.stop(); }
+});
+
+test('G6 ★★★ 派发后 state 非 completed ⇒ dispatched=TRUE（R-NEW-2：**禁止回退**，防二次执行）', async () => {
+  const srv = new FakeCdpServer({
+    onEvaluate: (expr, reply) => {
+      if (expr.includes('"wb:conversations:create"')) { reply(snapshot('dsh-ignite-g6')); return; }
+      if (expr.includes('"wb:conversations:get"')) { reply(snapshot('dsh-ignite-g6')); return; }
+      if (expr.includes('wb:conversations:configSet')) { reply(undefined); return; }
+      if (expr.includes('runPrompt')) { reply({ state: 'failed', error: 'model worker crashed' }); return; }
+      reply(undefined);
+    },
+  });
+  const port = await srv.start();
+  try {
+    const d = createFollowUpDispatcher({ cdpPort: port, timeoutMs: 15_000 });
+    const r = await d.ignite({ prompt: packageContentBlocks('x'), effort: 'high', timeoutMs: 15_000, cdpPort: port });
+    assert.equal(r.ok, false);
+    assert.equal(r.stage, 'dispatch');
+    assert.equal(r.dispatched, true, '★★ prompt 已进对话 ⇒ 回退就是把它再跑一遍（双份积分）');
+    assert.equal(r.created, true);
+    assert.equal(r.cleanup, 'kept', '★ 可能还在跑 ⇒ 绝不删');
+    assert.equal(srv.evaluations.some((e) => e.expression.includes('delete')), false, '★ 派发后失败不许清理');
+  } finally { await srv.stop(); }
+});
+
+test('G7 ★ runPrompt 执行前拒绝（CONVERSATION_NOT_FOUND）⇒ dispatched=FALSE（**才**允许回退）', async () => {
+  const srv = new FakeCdpServer({
+    onEvaluate: (expr, reply) => {
+      if (expr.includes('"wb:conversations:create"')) { reply(snapshot('dsh-ignite-g7')); return; }
+      if (expr.includes('"wb:conversations:get"')) { reply(snapshot('dsh-ignite-g7')); return; }
+      if (expr.includes('wb:conversations:configSet')) { reply(undefined); return; }
+      if (expr.includes('runPrompt')) {
+        reply({ __wbError: true, code: 'CONVERSATION_NOT_FOUND', message: 'conversation not found' });
+        return;
+      }
+      reply(undefined);   // delete
+    },
+  });
+  const port = await srv.start();
+  try {
+    const d = createFollowUpDispatcher({ cdpPort: port, timeoutMs: 15_000 });
+    const r = await d.ignite({ prompt: packageContentBlocks('x'), effort: 'high', timeoutMs: 15_000, cdpPort: port });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, FOLLOWUP_CODES.CONVERSATION_NOT_FOUND);
+    assert.equal(r.dispatched, false, '★ 执行前拒绝 ⇒ 桌面端没跑 prompt ⇒ 可回退');
+    assert.equal(r.stage, 'dispatch');
+    assert.equal(r.cleanup, 'removed', '★ 允许回退时会话必是空的 ⇒ 回收，不留垃圾');
+    assert.equal(srv.evaluations.some((e) => e.expression.includes('runPrompt')), true, '前置：确实走到派发');
+  } finally { await srv.stop(); }
+});
+
+test('G8 ★★★ evaluate 超时 ⇒ dispatched=TRUE（保守判已派发：宁可不回退，不许双跑）', async () => {
+  const srv = new FakeCdpServer({
+    onEvaluate: (expr, reply) => {
+      if (expr.includes('"wb:conversations:create"')) { reply(snapshot('dsh-ignite-g8')); return; }
+      if (expr.includes('"wb:conversations:get"')) { reply(snapshot('dsh-ignite-g8')); return; }
+      if (expr.includes('wb:conversations:configSet')) { reply(undefined); return; }
+      // runPrompt：刻意不回帧 ⇒ 等到总 deadline
+    },
+  });
+  const port = await srv.start();
+  try {
+    const d = createFollowUpDispatcher({ cdpPort: port, timeoutMs: 900 });
+    const r = await d.ignite({ prompt: packageContentBlocks('x'), timeoutMs: 900, cdpPort: port });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, FOLLOWUP_CODES.DISPATCH_TIMEOUT, `实际：${r.code}`);
+    assert.equal(r.dispatched, true, '★ 超时最可能已执行 ⇒ 禁回退');
+    assert.equal(r.cleanup, 'kept');
+    assert.match(r.conversationId, /^dsh-ignite-[0-9a-f-]{36}$/, '★ 自配 id ⇒ 超时也能报出是哪条对话');
+  } finally { await srv.stop(); }
+});
+
+test('G9 ★★★ 语义红线双面钉死：followUp 表达式恒零 setter，setter 只允许出现在 ignite 表达式', async () => {
+  const srv = new FakeCdpServer();
+  const port = await srv.start();
+  try {
+    const d = createFollowUpDispatcher({ cdpPort: port, timeoutMs: 15_000 });
+    const follow = await d.followUp({
+      conversationId: 'conv-keep',
+      prompt: packageContentBlocks('next'),
+      timeoutMs: 15_000,
+      cdpPort: port,
+    });
+    assert.equal(follow.ok, true, JSON.stringify(follow));
+    const before = srv.evaluations.length;
+    const ignite = await d.ignite({
+      prompt: packageContentBlocks('first'), effort: 'high', permissionMode: 'fullAccess',
+      timeoutMs: 15_000, cdpPort: port,
+    });
+    assert.equal(ignite.ok, true, JSON.stringify(ignite));
+
+    const followExprs = srv.evaluations.slice(0, before).map((e) => e.expression).join('\n');
+    const igniteExprs = srv.evaluations.slice(before).map((e) => e.expression).join('\n');
+    assert.equal(/set[A-Z]/.test(followExprs), false, '★ 追发轮恒零 setter（D1 语义红线，读取面只读）');
+    assert.equal(followExprs.includes('wb:conversations:get'), true, '前置：追发走只读识别面');
+    assert.equal(/configSet[A-Z]/.test(igniteExprs), true, '★ setter 只在点火轮出现（点火时设定）');
+  } finally { await srv.stop(); }
+});
+
+/* ───────────────────────── run.js 接线（direct 三分支） ───────────────────────── */
+
+test('R0 ★★★ 总闸关闭 ⇒ directIgnite **零构造零调用**，行为与未接线版逐字节一致', async () => {
+  const h = harness({ directOn: false });
+  const r = await h.call({ prompt: 'go', session_key: 'K' });
+  await h.jobs.handles[0].done;
+  assert.equal(h.directIgniteCalls.length, 0, '★ 开关关 ⇒ direct 面一次都不许碰');
+  assert.equal(h.automationCalls.length, 1, '★ 照旧点火（零回归）');
+  assert.deepEqual(
+    Object.keys(r).sort(),
+    ['argv_preview', 'job_id', 'not_sent', 'resumed', 'resumed_session_id', 'session_key'],
+    '★ 回执键集 = 既有 6 键（hardening 契约，direct 关闭时不许多任何键）',
+  );
+  assert.equal(h.runtime.notes[0]?.transport, 'automation');
+  assert.equal(Object.prototype.hasOwnProperty.call(r, 'fallback'), false);
+});
+
+test('R1 ★★★ direct 成功 ⇒ 零 INSERT、transport=direct、phases=[direct-ignite]、**adopt 记性**', async () => {
+  const h = harness({ directOn: true });
+  const r = await h.call({ prompt: 'go', session_key: 'K' });
+  assert.equal(h.directIgniteCalls.length, 1, '★ 恰一次直接点火');
+  const req = h.directIgniteCalls[0];
+  assert.deepEqual(req.prompt, [{ type: 'text', text: 'go' }], '★ prompt 必须打包成 ContentBlock[]');
+  assert.equal(req.cwd, 'C:/repo');
+  assert.equal(req.title, 'go', '点火名 = prompt 前 80 字');
+  assert.equal(req.timeoutMs, 900_000, '★ 点火预算 = 计划任务 15min 口径（不新增超时 knob）');
+  assert.equal(req.cdpPort, 9222, '★ 复用 followupCdpPort（不新增端口 knob）');
+  assert.equal(h.automationCalls.length, 0, '★★ direct 成功 ⇒ 计划任务零 INSERT');
+
+  const done = await h.jobs.handles[0].done;
+  assert.equal(done.status, 'completed');
+  assert.equal(done.detail, 'DIRECT-REPLY');
+  const last = h.runtime.notes[0];
+  assert.equal(last?.transport, 'direct', '★ lastRun 如实记 direct');
+  assert.equal(last?.sessionOrigin, 'new');
+  assert.equal(last?.sessionId, 'dsh-ignite-fake-1', '★ 四方闭合的 sessionId 角');
+  assert.equal(last?.automationId, null, '★ 直建不写 automations 表 ⇒ 如实 null');
+  assert.equal(last?.retired, false);
+  assert.deepEqual(last?.phases, ['direct-ignite']);
+  assert.equal(last?.resumed, false, '★ direct = 新对话，不是续接');
+  assert.equal(last?.model, 'kimi-k3-1', '★ 回显派发前读回的现配（effective）');
+  assert.equal(last?.effort?.effective, 'high', '★ 同上（强度也是读回值）');
+  assert.equal(last?.effort?.confirmed, false, '未请求强度 ⇒ confirmed 不许谎称 true');
+  // ★ 记性：不 adopt 下轮 resume:true 就命中不了。
+  assert.equal(h.sessions.resumable('K')?.cliSessionId, 'dsh-ignite-fake-1', '★★ 必须 adopt 记性');
+  // ★ 回执键集仍 = 既有 6 键（direct 不给回执加新键；可见性走 lastRun）。
+  assert.deepEqual(
+    Object.keys(r).sort(),
+    ['argv_preview', 'job_id', 'not_sent', 'resumed', 'resumed_session_id', 'session_key'],
+  );
+  assert.equal(r.resumed, false);
+  assert.equal(Object.prototype.hasOwnProperty.call(r, 'fallback'), false);
+});
+
+test('R2 ★★★ direct 派发前失败 ⇒ 回退计划任务（任务不丢）+ 回执两键如实 + transport 仍是 automation', async () => {
+  const h = harness({
+    directOn: true,
+    directOutcome: {
+      ok: false,
+      code: FOLLOWUP_CODES.CDP_UNAVAILABLE,
+      detail: 'WorkBuddy 未带 WORKBUDDY_REMOTE_DEBUGGING_PORT 启动',
+      stage: 'detect',
+      dispatched: false,
+      created: false,
+      conversationId: null,
+      cleanup: 'none',
+    },
+  });
+  const r = await h.call({ prompt: 'go', session_key: 'K' });
+  assert.equal(h.directIgniteCalls.length, 1);
+  assert.equal(h.automationCalls.length, 1, '★ 派发前失败 ⇒ 回退计划任务（绝不能静默丢任务）');
+  assert.equal(r.fallback, true, '★ 回执必须带 fallback 两键（不静默）');
+  assert.equal(r.fallbackReason, 'ERR_WORKBUDDY_CDP_UNAVAILABLE');
+  assert.deepEqual(
+    Object.keys(r).sort(),
+    ['argv_preview', 'fallback', 'fallbackReason', 'job_id', 'not_sent', 'resumed', 'resumed_session_id', 'session_key'],
+    '★ 键集 = 既有 6 键 + 回退两键（hardening 契约）',
+  );
+  const done = await h.jobs.handles[0].done;
+  assert.equal(done.status, 'completed', '回退后任务照跑');
+  const last = h.runtime.notes[0];
+  assert.equal(last?.transport, 'automation', '★★ 回退轮真跑在计划任务上 ⇒ 不谎称 direct');
+  assert.equal(last?.fallback, true);
+  assert.equal(last?.fallbackReason, 'ERR_WORKBUDDY_CDP_UNAVAILABLE');
+  assert.deepEqual(last?.phases, ['db-open', 'running']);
+  // 回退轮的记性由计划任务侧 adopt（conv-1），不是 direct 的 id。
+  assert.equal(h.sessions.resumable('K')?.cliSessionId, 'conv-1');
+});
+
+test('R3 ★★★ direct 派发后失败 ⇒ **零回退**（同一条 prompt 绝不跑第二遍）+ 作业如实失败', async () => {
+  const h = harness({
+    directOn: true,
+    directOutcome: {
+      ok: false,
+      code: FOLLOWUP_CODES.DISPATCH_TIMEOUT,
+      detail: 'runPrompt evaluate timed out',
+      stage: 'dispatch',
+      dispatched: true,
+      created: true,
+      conversationId: 'dsh-ignite-stuck',
+      cleanup: 'kept',
+    },
+  });
+  const r = await h.call({ prompt: 'go', session_key: 'K' });
+  assert.equal(h.directIgniteCalls.length, 1);
+  assert.equal(h.automationCalls.length, 0, '★★★ 派发后失败**绝不回退** —— 回退 = 双份积分 + 两条对话');
+  const done = await h.jobs.handles[0].done;
+  assert.equal(done.status, 'failed');
+  assert.equal(done.detail, 'runPrompt evaluate timed out', '★ 失败诊断如实（不吞）');
+  assert.equal(Object.prototype.hasOwnProperty.call(r, 'fallback'), false, '★ 没回退就不许带 fallback 键');
+  assert.deepEqual(
+    Object.keys(r).sort(),
+    ['argv_preview', 'job_id', 'not_sent', 'resumed', 'resumed_session_id', 'session_key'],
+  );
+  const last = h.runtime.notes[0];
+  assert.equal(last?.transport, 'direct', '★ 如实记 direct（它确实走的是 direct 这条路）');
+  assert.equal(last?.sessionId, 'dsh-ignite-stuck', '★ 报出是哪条对话（可能还在跑）');
+  assert.deepEqual(last?.phases, ['direct-ignite']);
+  // 终态失败 ⇒ forget（与计划任务超时同形：下轮重建）。
+  assert.equal(h.sessions.resumable('K'), null, '★ 失败收口 forget（既有口径）');
+});
+
+test('R4 ★ 追发优先于 direct：追发成功的一轮不再尝试直接点火', async () => {
+  const h = harness({ flag: true, directOn: true });
+  await h.call({ prompt: 'round one', session_key: 'K' });
+  await h.jobs.handles[0].done;
+  assert.equal(h.directIgniteCalls.length, 1, '前置：首轮（无 resume）走 direct');
+  const second = await h.call({ prompt: 'round two', session_key: 'K', resume: true });
+  await h.jobs.handles[1].done;
+  assert.equal(h.followUpCalls.length, 1, '★ 第二轮走追发');
+  assert.equal(h.directIgniteCalls.length, 1, '★★ 追发成功的一轮不许再点火（不重复发 prompt）');
+  assert.equal(h.automationCalls.length, 0);
+  assert.equal(second.resumed, true);
+  assert.equal(h.runtime.notes[1]?.transport, 'followup');
 });

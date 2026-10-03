@@ -287,6 +287,45 @@ function subagentRouteHint() {
  * @param {object} runtime
  * @returns {string} 前置空格的句子；读不到配置时为 `''`
  */
+/**
+ * ★ 2026-10-04 D6：direct ignition / 追发的 **CDP 前置条件披露** + **必须开口问的三个触发**。
+ *
+ * <p>本节纪律（与 `continuityHint` 同款）：**纯函数、只读配置、不探网** —— 实况由
+ * `workbuddy_status` 的 `cdp` / `ignition` 两块承载，这里只把"依赖什么、什么时候必须问、
+ * 什么绝对不许做"写进提示词。两个总闸都关 ⇒ 返回空串（零膨胀：不需要 CDP 的机器一个字都不多说）。
+ *
+ * <p>D6 ④ 的四条禁令逐字在场：**禁止静默回退、禁止谎称走 direct、禁止插件代设环境变量、
+ * 禁止代杀/代重启 WorkBuddy**（插件只告知、只询问）。
+ *
+ * @param {object} runtime
+ * @returns {string}
+ */
+function cdpIgnitionHint(runtime) {
+  if (runtime === null || typeof runtime !== 'object' || typeof runtime.currentConfig !== 'function') return '';
+  let cfg;
+  try { cfg = runtime.currentConfig(); } catch { return ''; }
+  const directOn = cfg?.enableDirectIgnition === true;
+  const followUpOn = cfg?.enableMultiTurnFollowUp === true;
+  if (!directOn && !followUpOn) return '';   // 没有面依赖 CDP ⇒ 不说话
+  const portRaw = Number(cfg?.followupCdpPort);
+  const port = Number.isFinite(portRaw) && portRaw > 0 ? portRaw : 9222;
+  const faces = [directOn ? 'direct ignition' : '', followUpOn ? 'multi-turn follow-up' : '']
+    .filter((s) => s !== '')
+    .join(' and ');
+
+  return ` NOTE: ${faces} depends on the desktop's CDP endpoint: WorkBuddy must be started with the `
+    + `user-level environment variable WORKBUDDY_REMOTE_DEBUGGING_PORT=${port} and then FULLY quit and `
+    + 'relaunched — a running instance cannot gain the port. This plugin only informs and asks: it never '
+    + 'sets env vars, never restarts or kills WorkBuddy, never falls back silently, and never '
+    + 'claims direct mode it did not verify. Call workbuddy_status and read its `cdp` and `ignition` '
+    + 'blocks first, then ASK THE USER (do not assume and do not work around it) whenever any of these '
+    + 'holds: (1) ignition.mode is "direct" but cdp.available is false — WorkBuddy is running without the '
+    + 'port; (2) taking effect requires quitting and relaunching WorkBuddy, which interrupts the user\'s '
+    + 'session; (3) a round fell back from direct ignition to the automation queue (the receipt carries '
+    + 'fallback/fallbackReason) — tell them and ask whether to configure the port; if WorkBuddy is simply '
+    + 'not running, informing them is enough.';
+}
+
 function continuityHint(runtime) {
   if (runtime === null || typeof runtime !== 'object' || typeof runtime.currentConfig !== 'function') return '';
   let cfg;
@@ -457,7 +496,7 @@ export function availabilityText(runtime) {
       'WorkBuddy delegation is available: use workbuddy_run to delegate a coding task as a background job '
       + '(read progress with job_output, cancel with job_kill), and workbuddy_status to inspect the local '
       + 'WorkBuddy install and the most recent run.'
-      + subagentRouteHint() + debateHint(runtime) + continuityHint(runtime) + degraded
+      + subagentRouteHint() + debateHint(runtime) + continuityHint(runtime) + cdpIgnitionHint(runtime) + degraded
       + overrideHint(runtime) + lastFailureHint(runtime)
     );
   }

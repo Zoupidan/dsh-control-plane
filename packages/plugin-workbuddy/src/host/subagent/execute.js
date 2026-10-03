@@ -31,7 +31,7 @@
  */
 
 import { REASON_CODES } from '../launch/reason-codes.js';
-import { startAutomationRun } from '../gateway/automation.js';
+import { AUTOMATION_DEFAULTS, startAutomationRun } from '../gateway/automation.js';
 import { createFollowUpDispatcher, packageContentBlocks } from '../followup/dispatcher.js';
 
 /**
@@ -156,10 +156,17 @@ export function reportFromAutomation(out) {
  *   缺省时惰性构造真 `createFollowUpDispatcher(...).followUp` —— 构造点在开关**与**记性都命中之后，
  *   开关关闭时一次都不会构造。注入件供测试/上层复用，绕开真 CDP。
  * @param {(message: string) => void} [deps.log] 追发调度的日志出口（缺省静默）。
+ * @param {(req: {prompt: Array<{type: string, text?: unknown}>, cwd?: string, title?: string,
+ *           modelId?: string|null, effort?: string|null, permissionMode?: string|null,
+ *           timeoutMs?: number, cdpPort?: number}) => Promise<object>} [deps.directIgnite]
+ *   ★ direct ignition seam（**只为可测而开**，与 `seams.directIgnite` 同风格）：
+ *   缺省时惰性构造真 `createFollowUpDispatcher(...).ignite` —— 构造点在总闸**之后**，
+ *   总闸 `enableDirectIgnition` 关闭时一次都不会构造（零网络、零套接字）。
  * @returns {(req: object) => Promise<object>} 返回统一形状回执的函数。
  */
 export function createTaskExecutor({
   automation = null, setting = () => undefined, onPhase = null, sessions = null, followUp = null, log = null,
+  directIgnite = null,
 } = {}) {
   /** @type {Map<string, Array<{role: 'user'|'assistant', text: string}>>} */
   const transcript = new Map();
@@ -236,6 +243,9 @@ export function createTaskExecutor({
     // 两条纪律（与 run.js 同款）：绝不抛（异常也收敛为回退）；绝不静默（走向写在回执与正文里）。
     let followUpMeta = null;    // 成功：{ channel, elapsedMs, conversationId }
     let fallbackReason = null;  // 失败：RFC §4.2 指纹码（execute 层字段 fallbackReason）
+    // ★ 回退来源：`followup`（既有语义）或 `direct`（2026-10-04 direct ignition 派发前失败）。
+    //   只影响 `withFallback` 那句诊断的话术 —— 两者回执形状逐字相同，但"为什么回退"不许混说。
+    let fallbackOrigin = 'followup';
     const followUpWanted = setting('enableMultiTurnFollowUp') === true;
     const recorded = (followUpWanted && taskKey !== '' && sessions !== null && typeof sessions.resumable === 'function')
       ? sessions.resumable(taskKey)
@@ -347,8 +357,13 @@ export function createTaskExecutor({
           ? {
             error: {
               code: r?.error?.code ?? REASON_CODES.TASK_ERROR,
-              message: `${typeof r?.error?.message === 'string' ? r.error.message : ''} · follow-up fallback `
-                + `${fallbackReason}: the recorded conversation could not be continued, so this round ignited a new one`,
+              // ★ 回退来源分话术（**形状不变，只换句子**）：追发回退沿用原句（测试钉死）；
+              //   direct 回退按真实原因另写 —— 不许借追发那句"会话续不上"（那一轮根本没会话可续）。
+              message: `${typeof r?.error?.message === 'string' ? r.error.message : ''} · ${fallbackOrigin === 'direct'
+                ? `direct-ignition fallback ${fallbackReason}: CDP direct ignition was unavailable or refused `
+                  + `before dispatch, so this round fell back to the automation queue`
+                : `follow-up fallback ${fallbackReason}: the recorded conversation could not be continued, `
+                  + `so this round ignited a new one`}`,
             },
           }
           : {}),
@@ -360,6 +375,159 @@ export function createTaskExecutor({
     const requestedPerm = typeof req.permissionMode === 'string' ? req.permissionMode : '';
     // ★ 推理强度真下发（与 tools/run.js 同一参数形状）：req.effort → reasoningEffort → reasoning_effort。
     const requestedEffort = typeof req.effort === 'string' ? req.effort.trim() : '';
+
+    // ═══ direct ignition（★ 2026-10-04 施工单：计划任务 → CDP 直建；团队链同款，用户拍板 D2）═══
+    // 触发条件（两条同时成立；任一不成立 ⇒ 本块整体跳过，行为与既有路径逐字节一致）：
+    //   ① followUpMeta === null（这一轮没走成追发 —— direct 只属于点火轮）
+    //   ② setting('enableDirectIgnition') === true（总闸默认 false；关闭时**绝不构造** dispatcher）
+    // 三种结局（★ R-NEW-2 回退红线）：
+    //   成功 ⇒ `directMeta` ⇒ **直接返回**（不再点火、零 INSERT），并 adopt 记性（下轮可追发）；
+    //   派发**前**失败 ⇒ `fallbackReason` + `fallbackOrigin='direct'` ⇒ 照旧点火（任务不丢），
+    //         回执两键如实，transport 仍是 'automation'（这一轮真跑在计划任务上）；
+    //   派发**后**失败 ⇒ `directFail` ⇒ **直接以失败返回，禁止回退**（回退会让同一条 prompt
+    //         跑第二遍：双份积分 + 两条对话）。
+    // 纪律沿用：绝不抛（异常收敛为可回退的派发前失败）；绝不静默（走向写在回执与诊断话术里）。
+    let directMeta = null;
+    let directFail = null;
+    if (followUpMeta === null && setting('enableDirectIgnition') === true) {
+      const igniteDirectFn = typeof directIgnite === 'function'
+        ? directIgnite
+        : createFollowUpDispatcher({
+          cdpPort: setting('followupCdpPort'),
+          // 点火预算 = 计划任务的 15min 口径（同一口子超时 ⇒ 同形失败；不新增超时 knob）。
+          timeoutMs: AUTOMATION_DEFAULTS.timeoutMs,
+          log: typeof log === 'function' ? log : () => {},
+        }).ignite;
+      const startedAt = Date.now();
+      let outcome;
+      try {
+        outcome = await igniteDirectFn({
+          // ★ 直建是**新对话**（和点火同形）⇒ 必须重放前情前缀；只有追发才不重放（同一条对话）。
+          prompt: packageContentBlocks(replayPrefix(taskKey) + prompt),
+          cwd: typeof req.cwd === 'string' ? req.cwd : '',
+          title: (typeof req.name === 'string' && req.name !== '') ? req.name : prompt.slice(0, 80),
+          modelId: requestedModel,      // 空串 ⇒ dispatcher 内部归一为 null ⇒ 不传给桌面端
+          effort: requestedEffort,
+          permissionMode: requestedPerm,
+          timeoutMs: AUTOMATION_DEFAULTS.timeoutMs,
+          cdpPort: setting('followupCdpPort'),
+        });
+      } catch (err) {
+        // dispatcher 的契约是**永不抛**；这里兜的是注入件/未来回归 ⇒ 按"派发前失败"收敛（可回退）。
+        outcome = {
+          ok: false, code: 'ERR_FOLLOWUP_FAILED',
+          detail: `direct ignition threw: ${err instanceof Error ? err.message : String(err)}`.slice(0, 400),
+          stage: 'dispatch', dispatched: false,
+        };
+      }
+      if (outcome !== null && typeof outcome === 'object' && outcome.ok === true) {
+        directMeta = {
+          conversationId: outcome.conversationId,
+          output: typeof outcome.receipt?.output === 'string' ? outcome.receipt.output : '',
+          elapsedMs: Number.isFinite(outcome.elapsedMs) ? outcome.elapsedMs : Date.now() - startedAt,
+          model: typeof outcome.model === 'string' ? outcome.model : null,      // 派发前读回
+          effort: typeof outcome.effort === 'string' ? outcome.effort : null,    // 同上
+          title: typeof outcome.title === 'string' && outcome.title !== '' ? outcome.title : null,
+          permissionMode: requestedPerm !== '' ? requestedPerm : null,          // 设过才是它
+        };
+        // ★ 不 adopt 下轮 `resume:true` 命中不了（直建没有 automations 行可查）。
+        if (sessions !== null && typeof sessions === 'object' && typeof sessions.adopt === 'function'
+          && taskKey !== '') {
+          try {
+            sessions.adopt(taskKey, {
+              cliSessionId: outcome.conversationId,
+              cwd: typeof req.cwd === 'string' ? req.cwd : '',
+              own: true,
+            });
+          } catch { /* adopt 失败 = 下轮多建一次，不是本轮的错误 */ }
+        }
+      } else if (outcome !== null && typeof outcome === 'object' && outcome.dispatched === true) {
+        // ★ 派发已发生 ⇒ **禁回退**（R-NEW-2）：回退 = 同一条 prompt 跑第二遍。
+        directFail = {
+          code: typeof outcome.code === 'string' && outcome.code !== '' ? outcome.code : 'ERR_FOLLOWUP_FAILED',
+          detail: typeof outcome.detail === 'string' ? outcome.detail : '',
+          conversationId: typeof outcome.conversationId === 'string' ? outcome.conversationId : null,
+        };
+      } else {
+        // 派发前失败 ⇒ 照旧点火；指纹码如实进回执与诊断（不静默）。
+        fallbackReason = outcome !== null && typeof outcome === 'object'
+          && typeof outcome.code === 'string' && outcome.code !== ''
+          ? outcome.code
+          : 'ERR_FOLLOWUP_FAILED';
+        fallbackOrigin = 'direct';
+      }
+    }
+
+    // ── direct 成功 ⇒ 直接返回（不再点火、零 INSERT）：形状与追发分支对齐，缺的事实如实 null。
+    if (directMeta !== null) {
+      pushTurn(taskKey, 'user', prompt);
+      if (directMeta.output.trim() !== '') pushTurn(taskKey, 'assistant', directMeta.output);
+      return withFallback({
+        ok: true,
+        transport: 'direct',
+        text: directMeta.output,
+        reason: REASON_CODES.OK,
+        phases: ['direct-ignite'],
+        receipt: null,
+        sessionId: directMeta.conversationId,
+        sessionOrigin: 'new',
+        continuity: 'fresh-conversation-per-round',
+        permission: {
+          requested: requestedPerm,
+          effective: directMeta.permissionMode ?? '(unknown)',
+          confirmed: requestedPerm !== '' && requestedPerm === directMeta.permissionMode,
+        },
+        effort: {
+          requested: requestedEffort,
+          effective: directMeta.effort ?? '(unknown)',
+          confirmed: requestedEffort !== '' && requestedEffort === directMeta.effort,
+        },
+        requestedEffort,
+        effectiveEffort: directMeta.effort ?? null,
+        usedModelId: directMeta.model ?? null,
+        requestedModelId: typeof requestedModel === 'string' ? requestedModel : '',
+        usage: null,
+        automationId: null,
+        title: directMeta.title,
+        createdAt: new Date().toISOString(),
+        transcriptPath: null,
+        cwd: typeof req.cwd === 'string' ? req.cwd : null,
+      });
+    }
+
+    // ── direct 派发后失败 ⇒ **直接失败返回，禁止回退**（R-NEW-2：回退 = 同一条 prompt 跑第二遍）。
+    if (directFail !== null) {
+      return withFallback({
+        ok: false,
+        transport: 'direct',
+        text: '',
+        reason: REASON_CODES.TASK_ERROR,
+        error: {
+          code: REASON_CODES.TASK_ERROR,
+          message: `direct ignition was dispatched but produced no receipt (${directFail.code}): `
+            + `${directFail.detail} · NOT retried through the automation queue — dispatch already happened, `
+            + `retrying would run the same prompt a second time (double credits, two conversations)`,
+        },
+        phases: ['direct-ignite'],
+        receipt: null,
+        sessionId: directFail.conversationId,
+        sessionOrigin: directFail.conversationId === null ? null : 'new',
+        continuity: 'fresh-conversation-per-round',
+        permission: { requested: requestedPerm, effective: '(unknown)', confirmed: false },
+        effort: { requested: requestedEffort, effective: '(unknown)', confirmed: false },
+        requestedEffort,
+        effectiveEffort: null,
+        usedModelId: null,
+        requestedModelId: typeof requestedModel === 'string' ? requestedModel : '',
+        usage: null,
+        automationId: null,
+        title: null,
+        createdAt: null,
+        transcriptPath: null,
+        cwd: typeof req.cwd === 'string' ? req.cwd : null,
+      });
+    }
+
     // ★ 即建即撤 + adopt 记账：与 `tools/run.js` 同一写入点、同一参数形状。
     //   `sessionKey` 非空且 `sessions.adopt` 存在时透给点火，点火在 `sessions.id` 一确认
     //   就 `retireRow` + `adopt`；缺席时（极简假宿主）按"没配写口"跳过，不炸整轮。

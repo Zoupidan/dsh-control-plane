@@ -57,13 +57,17 @@ function fakeAutomation(records, reply = 'FALLBACK-OK', conversationId = 'conv-n
 
 /** 假记性（spy）：`resumable` 恒命中 `recorded`，`forget` / `touch` 全程记账。 */
 function makeSessions(recorded = { cliSessionId: 'conv-kept', cwd: 'D:/repo' }) {
-  const calls = { resumable: [], forget: [], touch: [] };
+  const calls = { resumable: [], forget: [], touch: [], adopt: [] };
   return {
     calls,
     resumable: (k) => { calls.resumable.push(k); return recorded; },
     forget: (k, reason) => { calls.forget.push({ k, reason }); return { ok: true }; },
     touch: (k) => { calls.touch.push(k); return { ok: true }; },
-    adopt: (k, r) => ({ ok: true, cliSessionId: r?.cliSessionId ?? '' }),
+    // ★ direct ignition 成功必须 adopt（直建不写 automations 行，记性是下轮追发的唯一入口）。
+    adopt: (k, r) => {
+      calls.adopt.push({ k, cliSessionId: r?.cliSessionId ?? '', own: r?.own === true });
+      return { ok: true, cliSessionId: r?.cliSessionId ?? '' };
+    },
     lookup: () => null,
   };
 }
@@ -331,4 +335,214 @@ test('★ 记性命中但 cliSessionId 为空 ⇒ 不追发（对话 id 是追�
   assert.equal(fireCalls.length, 1);
   // 防御性分支不产生回退键：没有"试过追发"这回事。
   assert.equal('fallback' in r, false);
+});
+
+/* ═══════════════ direct ignition · 团队链（2026-10-04 用户拍板 D2：两条点火都覆盖）═══════════════ */
+
+/** direct 总闸**开**的配置（只配 directIgnite seam 一起用，绝不单开 —— 见文件头红线）。 */
+const CFG_DIRECT = { enableDirectIgnition: true, followupCdpPort: 9222, followupTimeoutMs: 12345 };
+/** schema 默认值同款：总闸关。 */
+const CFG_DIRECT_OFF = { enableDirectIgnition: false, followupCdpPort: 9222, followupTimeoutMs: 12345 };
+
+/** 假直接点火（spy）：默认成功回执（dispatcher.ignite 真实信封形状）。 */
+function makeDirectIgnite(calls, outcome = null) {
+  return async (req) => {
+    calls.push(req);
+    if (outcome !== null) return outcome;
+    return {
+      ok: true,
+      stage: 'dispatch',
+      dispatched: true,
+      created: true,
+      conversationId: 'dsh-ignite-sub-1',
+      title: 'SUB-TASK',
+      elapsedMs: 33,
+      model: 'kimi-k3-1',
+      effort: 'high',
+      receipt: {
+        raw: { state: 'completed' },
+        output: 'REPLY-DIRECT',
+        state: 'completed',
+        requestId: 'rq-di',
+        clientRequestId: 'cr-di',
+        responseModel: null,
+        artifacts: [],
+      },
+    };
+  };
+}
+
+test('★★★ 团队链总闸关闭 ⇒ directIgnite 零构造零调用，回执与未接线版逐字一致', async () => {
+  const fireCalls = [];
+  const diCalls = [];
+  const exec = createTaskExecutor({
+    automation: fakeAutomation(fireCalls),
+    setting: settingOf(CFG_DIRECT_OFF),
+    sessions: makeSessions(null),
+    directIgnite: makeDirectIgnite(diCalls),
+  });
+  const r = await exec({ prompt: 'x', sessionKey: 'K9' });
+  assert.equal(diCalls.length, 0, '★ 总闸关 ⇒ direct 面一次都不许碰');
+  assert.equal(fireCalls.length, 1, '★ 照旧点火（零回归）');
+  assert.equal(r.transport, 'automation');
+  assert.equal('fallback' in r, false);
+  assert.equal(r.ok, true);
+});
+
+test('★★★ 团队链 direct 成功 ⇒ 零点火、transport=direct、adopt 记性、**重放前情前缀**', async () => {
+  const fireCalls = [];
+  const diCalls = [];
+  const sessions = makeSessions(null);
+  const exec = createTaskExecutor({
+    automation: fakeAutomation(fireCalls),
+    setting: settingOf(CFG_DIRECT),
+    sessions,
+    directIgnite: makeDirectIgnite(diCalls),
+  });
+
+  const first = await exec({ prompt: '第一轮任务', cwd: 'D:/repo', sessionKey: 'K10' });
+  assert.equal(fireCalls.length, 0, '★★ 直接点火成功 ⇒ 零 INSERT');
+  assert.equal(diCalls.length, 1);
+  const req = diCalls[0];
+  assert.deepEqual(req.prompt, [{ type: 'text', text: '第一轮任务' }], '★ prompt 打包成 ContentBlock[]');
+  assert.equal(req.cwd, 'D:/repo');
+  assert.equal(req.modelId, null, '★ 没选模型 ⇒ 传 null（dispatcher 归一后不下发 model，沿用桌面默认）');
+  assert.equal(req.timeoutMs, 900_000, '★ 点火预算 = 计划任务 15min 口径');
+  assert.equal(req.cdpPort, 9222, '★ 复用 followupCdpPort');
+
+  assert.equal(first.ok, true);
+  assert.equal(first.transport, 'direct');
+  assert.equal(first.text, 'REPLY-DIRECT');
+  assert.equal(first.reason, REASON_CODES.OK);
+  assert.equal(first.sessionId, 'dsh-ignite-sub-1');
+  assert.equal(first.sessionOrigin, 'new', '★ 新对话 ⇒ origin=new（不谎称 resumed）');
+  assert.equal(first.continuity, 'fresh-conversation-per-round');
+  assert.deepEqual(first.phases, ['direct-ignite']);
+  assert.equal(first.automationId, null, '★ 直建不写 automations 表 ⇒ 如实 null');
+  assert.equal(first.receipt, null, '没有 ACP 消息链就不许编 receipt');
+  assert.equal(first.usedModelId, 'kimi-k3-1', '★ 回显派发前读回的现配');
+  assert.equal(first.effort.effective, 'high');
+  assert.equal(first.effort.requested, '', '未请求强度 ⇒ requested 空，confirmed 不许谎称');
+  assert.equal('fallback' in first, false, '★ 成功不带回退键');
+  // ★ 记性：直建不写 automations 行 ⇒ 记性是下轮追发的唯一入口。
+  assert.deepEqual(
+    sessions.calls.adopt.map((a) => a.cliSessionId),
+    ['dsh-ignite-sub-1'],
+    '★★ 必须 adopt（否则下轮 resume 命中不了）',
+  );
+  assert.equal(sessions.calls.adopt[0].k, 'K10');
+  assert.equal(sessions.calls.adopt[0].own, true);
+
+  // ★ 直建是**新对话** ⇒ 第二轮必须重放前情（与点火同形；追发才不重放）。
+  await exec({ prompt: '第二轮任务', cwd: 'D:/repo', sessionKey: 'K10' });
+  assert.equal(diCalls.length, 2);
+  const second = diCalls[1].prompt[0].text;
+  assert.ok(second.endsWith('第二轮任务'), `本轮 prompt 在尾部：${second}`);
+  assert.ok(
+    second.includes('本次任务此前的对话'),
+    `★★ 直建新对话必须带重放前缀（否则丢了上下文）：${second.slice(0, 160)}`,
+  );
+});
+
+test('★★★ 团队链 direct 派发前失败 ⇒ 照旧点火 + fallback 两键 + transport=automation', async () => {
+  const fireCalls = [];
+  const diCalls = [];
+  const exec = createTaskExecutor({
+    automation: fakeAutomation(fireCalls),
+    setting: settingOf(CFG_DIRECT),
+    sessions: makeSessions(null),
+    directIgnite: makeDirectIgnite(diCalls, {
+      ok: false,
+      code: 'ERR_WORKBUDDY_CDP_UNAVAILABLE',
+      detail: 'WorkBuddy 未带 WORKBUDDY_REMOTE_DEBUGGING_PORT 启动',
+      stage: 'detect',
+      dispatched: false,
+      created: false,
+      conversationId: null,
+      cleanup: 'none',
+    }),
+  });
+  const r = await exec({ prompt: 'x', sessionKey: 'K11' });
+  assert.equal(diCalls.length, 1);
+  assert.equal(fireCalls.length, 1, '★ 派发前失败 ⇒ 回退点火（任务不丢）');
+  assert.equal(r.ok, true, '回退后照跑');
+  assert.equal(r.fallback, true, '★ 回执必须带 fallback 两键（不静默）');
+  assert.equal(r.fallbackReason, 'ERR_WORKBUDDY_CDP_UNAVAILABLE');
+  assert.equal(r.transport, 'automation', '★★ 真跑在点火上 ⇒ 不谎称 direct');
+  assert.equal(r.sessionId, 'conv-new');
+});
+
+test('★★ 回退诊断话术按来源分流：direct 回退说 direct，不套用追发那句"会话续不上"', async () => {
+  const diCalls = [];
+  const failingAutomation = (req) => {
+    void req;
+    return {
+      cancel: () => {},
+      done: Promise.resolve({
+        status: 'failed',
+        detail: 'scheduler boom',
+        exitCode: 1,
+        automation: {
+          reason: REASON_CODES.TASK_ERROR, automationId: null, conversationId: 'conv-x',
+          sessionId: 'conv-x', phases: [], retryable: false, transcriptPath: null,
+        },
+      }),
+      readOutput: () => '',
+    };
+  };
+  const exec = createTaskExecutor({
+    automation: failingAutomation,
+    setting: settingOf(CFG_DIRECT),
+    sessions: makeSessions(null),
+    directIgnite: makeDirectIgnite(diCalls, {
+      ok: false, code: 'ERR_WORKBUDDY_CDP_UNAVAILABLE', detail: 'no debug port',
+      stage: 'detect', dispatched: false, created: false, conversationId: null, cleanup: 'none',
+    }),
+  });
+  const r = await exec({ prompt: 'x', sessionKey: 'K12' });
+  assert.equal(r.ok, false, '前置：回退后的点火也失败（才有 error.message 可装饰）');
+  assert.ok(
+    r.error.message.includes('direct-ignition fallback ERR_WORKBUDDY_CDP_UNAVAILABLE'),
+    `★ 话术须按真实来源：${r.error.message}`,
+  );
+  assert.equal(
+    r.error.message.includes('follow-up fallback'),
+    false,
+    '★ 不许套用追发话术（那一轮根本没有"录下来的对话"可续）',
+  );
+  assert.equal(r.fallback, true);
+  assert.equal(r.fallbackReason, 'ERR_WORKBUDDY_CDP_UNAVAILABLE');
+});
+
+test('★★★ 团队链 direct 派发后失败 ⇒ **零回退**（同一条 prompt 绝不跑第二遍）+ 如实失败', async () => {
+  const fireCalls = [];
+  const diCalls = [];
+  const exec = createTaskExecutor({
+    automation: fakeAutomation(fireCalls),
+    setting: settingOf(CFG_DIRECT),
+    sessions: makeSessions(null),
+    directIgnite: makeDirectIgnite(diCalls, {
+      ok: false,
+      code: 'ERR_DISPATCH_TIMEOUT',
+      detail: 'runPrompt evaluate timed out',
+      stage: 'dispatch',
+      dispatched: true,
+      created: true,
+      conversationId: 'dsh-ignite-stuck',
+      cleanup: 'kept',
+    }),
+  });
+  const r = await exec({ prompt: 'x', sessionKey: 'K13' });
+  assert.equal(diCalls.length, 1);
+  assert.equal(fireCalls.length, 0, '★★★ 派发后失败**绝不回退** —— 回退 = 双份积分 + 两条对话');
+  assert.equal(r.ok, false, '★ 本轮如实失败（不静默成成功）');
+  assert.equal(r.transport, 'direct');
+  assert.equal(r.sessionId, 'dsh-ignite-stuck', '★ 报出是哪条对话（它可能还在跑）');
+  assert.deepEqual(r.phases, ['direct-ignite']);
+  assert.ok(
+    r.error.message.includes('NOT retried'),
+    `★ 失败诊断必须说清"为何不回退"：${r.error.message}`,
+  );
+  assert.ok(r.error.message.includes('ERR_DISPATCH_TIMEOUT'), '★ 指纹码可见');
+  assert.equal('fallback' in r, false, '★ 没回退就不许带 fallback 键（不谎称回退）');
 });

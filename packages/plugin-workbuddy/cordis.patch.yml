@@ -72,6 +72,16 @@
         # 追发确认超时（毫秒，默认 180000）。真机实测（2026-10-03）首转 13.4s（模型 worker
         #   冷启动）、次转 9.1s ⇒ 15s 在冷启动边缘，180s 留足慢机余量；超时即回退点火新会话。
         followupTimeoutMs: 180000
+        # ── direct ignition（★ 2026-10-04 新增：计划任务 → CDP 直建）────────
+        # 点火走 CDP 直建（`create(+model/+title)` → 设配 → `runPrompt` 同步等终态），
+        #   省掉计划任务的调度开销（`INSERT + tick(5s) + 拾取(10~30s) + 完成察觉` ≈ 15s；
+        #   建会话本身真机 123ms）。**默认 false**（opt-in）：它依赖桌面端带
+        #   `WORKBUDDY_REMOTE_DEBUGGING_PORT` 启动（一次性用户环境变量，运行中的实例必须
+        #   完全退出重启才生效），且开关一开就改变了点火的执行面 —— 首跑默认关、自动回退。
+        # 复用 followupCdpPort；超时复用计划任务 15min 口径。
+        # 回退红线：只有**派发前**失败才回退计划任务（回执 fallback/fallbackReason 如实）；
+        #   **已派发**的失败一律不回退 —— 否则同一条 prompt 会被跑第二遍（双份积分）。
+        enableDirectIgnition: false
         # ── 传输面（★ 2026-10-02 切回 automation 为默认）──────────────
         # automation = 插件往桌面端自己的计划任务表（`~/.workbuddy/workbuddy.db` 的
         #   `automations`）写一条**一次性**任务，由**桌面端自己的调度器**开一个新会话并把

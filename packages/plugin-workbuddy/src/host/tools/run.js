@@ -34,9 +34,9 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 
 import { EFFORT_LEVELS, PLUGIN_ID, TOOL_RUN } from '../../shared/constants.js';
 import { OUTPUT_LIMIT_BYTES, REGISTRY_STATES } from '../config/constants.js';
-import { createFollowUpDispatcher, packageContentBlocks } from '../followup/dispatcher.js';
+import { createFollowUpDispatcher, packageContentBlocks, FOLLOWUP_CODES } from '../followup/dispatcher.js';
 import { REASON_CODES } from '../launch/reason-codes.js';
-import { automationHeader, startAutomationRun } from '../gateway/automation.js';
+import { AUTOMATION_DEFAULTS, automationHeader, startAutomationRun } from '../gateway/automation.js';
 import { cheapestModelId, desktopModels } from '../launch/desktop-models.js';
 
 /**
@@ -214,13 +214,16 @@ const MODEL_ARG_DESCRIPTION =
  * @param {object} ctx 宿主 ctx（取 ctx.jobs）
  * @param {object|null} [credits]
  * @param {object|null} [dispatch] 未使用（网关已禁用，保留参数仅为兼容旧调用方，不再走网关任何接口）
- * @param {{ automationRun?: Function, catalog?: { projection: Function }, followUp?: Function }} [seams] **只为可测而开**的覆盖：
+ * @param {{ automationRun?: Function, catalog?: { projection: Function }, followUp?: Function,
+ *           directIgnite?: Function }} [seams] **只为可测而开**的覆盖：
  *   `automationRun` 默认走真 `startAutomationRun`（首轮唯一写入点）；
  *   `catalog` 默认读共享 `desktopModels` 单例
  *   （测试经 `catalog.projection()` 注入假目录，永不触真机 IPC）；
  *   `followUp` 默认 = **惰性构造**的 `createFollowUpDispatcher(...).followUp`（Track A 追发，
  *   M2；总闸 `enableMultiTurnFollowUp` 关闭时**绝不构造**——零网络、零套接字），
- *   测试注入 fake 以断言接线与回退顺序。
+ *   测试注入 fake 以断言接线与回退顺序；
+ *   `directIgnite` 默认 = **惰性构造**的 `createFollowUpDispatcher(...).ignite`（direct ignition，
+ *   2026-10-04；总闸 `enableDirectIgnition` 关闭时**绝不构造**，与 `followUp` 同一条纪律）。
  */
 export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatch = null, seams = {}) => defineTool({
   name: TOOL_RUN,
@@ -565,6 +568,87 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
           : {}),
       }
       : null;
+
+    // ═══ direct ignition（★ 2026-10-04 施工单：计划任务 → CDP 直建）════════════════════
+    // 触发条件（**两条同时成立**；任一不成立 ⇒ 本块整体跳过，行为与既有路径逐字节一致）：
+    //   ① followUpMeta === null（这一轮没走成追发 —— direct 只属于点火轮）
+    //   ② c.enableDirectIgnition === true（总闸，默认 false；关闭时**绝不构造** dispatcher）
+    // 点火要素沿用上面算好的 autoCwd / requestedPerm / requestedEffort，不另立一套。
+    // 三种结局（★ R-NEW-2 回退红线）：
+    //   成功 ⇒ `directMeta`：合成"计划任务**已完成**"造型（无行如实记账，同追发分支口径），
+    //         **并 adopt 记性** —— 直建不写 automations 行，记性是下轮追发的唯一入口。
+    //   派发**前**失败 ⇒ `fallbackReason=<码>`：照旧走 `startAutomationRun`（任务不丢），
+    //         回执如实带 {fallback:true, fallbackReason}；lastRun.transport 仍是 'automation'
+    //         （这一轮真正跑在计划任务上，不谎称 direct）。
+    //   派发**后**失败 ⇒ `directFail`：**禁止回退** —— 回退会把同一条 prompt 再跑一遍
+    //         （双份积分 + 两条对话）。合成"已失败"作业包，收口按既有口径 forget 记性
+    //         （与计划任务超时同形：对话仍在桌面端，只是本轮没拿到回执）。
+    // 纪律沿用：绝不抛（异常收敛为可回退的派发前失败）、绝不静默（走向写在回执与 lastRun）。
+    let directMeta = null;
+    let directFail = null;
+    let resolvedModelId;   // direct 轮算过 ⇒ 计划任务分支复用（未尝试 ⇒ undefined）
+    if (followUpMeta === null && c.enableDirectIgnition === true) {
+      const igniteFn = typeof seams.directIgnite === 'function'
+        ? seams.directIgnite
+        : createFollowUpDispatcher({
+          cdpPort: c.followupCdpPort,
+          // 点火预算 = 计划任务的 15min 口径（同一口子超时 ⇒ 同形失败；不新增超时 knob）。
+          timeoutMs: AUTOMATION_DEFAULTS.timeoutMs,
+          log: (message) => ctx.logger?.warn?.(`[${PLUGIN_ID}] ${message}`),
+        }).ignite;
+      const startedAt = Date.now();
+      let outcome;
+      try {
+        resolvedModelId = await awaitModelId(args, c);
+        outcome = await igniteFn({
+          prompt: packageContentBlocks(args.prompt),
+          cwd: autoCwd,
+          title: args.prompt.slice(0, 80),
+          modelId: resolvedModelId,
+          effort: requestedEffort,
+          permissionMode: requestedPerm,
+          timeoutMs: AUTOMATION_DEFAULTS.timeoutMs,
+          cdpPort: c.followupCdpPort,
+        });
+      } catch (err) {
+        // `ignite` 的契约是**永不抛**；万一注入的实现抛了 ⇒ 按"派发前失败"收敛（可回退，安全）。
+        outcome = {
+          ok: false,
+          code: FOLLOWUP_CODES.FOLLOWUP_FAILED,
+          detail: `direct ignition threw: ${err instanceof Error ? err.message : String(err)}`.slice(0, 400),
+          stage: 'dispatch',
+          dispatched: false,
+        };
+      }
+      if (outcome?.ok === true) {
+        directMeta = {
+          conversationId: outcome.conversationId,
+          output: typeof outcome.receipt?.output === 'string' ? outcome.receipt.output : '',
+          elapsedMs: Number.isFinite(outcome.elapsedMs) ? outcome.elapsedMs : Date.now() - startedAt,
+          model: typeof outcome.model === 'string' ? outcome.model : null,     // 派发前读回
+          effort: typeof outcome.effort === 'string' ? outcome.effort : null,   // 同上
+          title: typeof outcome.title === 'string' && outcome.title !== '' ? outcome.title : null,
+          cwd: autoCwd,
+          permissionMode: typeof requestedPerm === 'string' && requestedPerm !== '' ? requestedPerm : null,
+        };
+        if (hasAdopt) {
+          // ★ 不 adopt 下轮 `resume:true` 就命中不了（直建没有 automations 行可查）。
+          try { sessions.adopt(sessionKey, { cliSessionId: outcome.conversationId, cwd: autoCwd, own: true }); }
+          catch { /* adopt 失败 = 下轮多建一次，不是本轮的错误 */ }
+        }
+      } else if (outcome?.dispatched === true) {
+        // ★ 派发已发生 ⇒ **禁回退**（R-NEW-2）：回退 = 同一条 prompt 跑第二遍。
+        directFail = {
+          code: outcome.code ?? FOLLOWUP_CODES.FOLLOWUP_FAILED,
+          detail: typeof outcome.detail === 'string' ? outcome.detail : '',
+          conversationId: typeof outcome.conversationId === 'string' ? outcome.conversationId : null,
+        };
+      } else {
+        // 派发前失败 ⇒ 回退计划任务；指纹码如实进回执与 lastRun（不静默）。
+        fallbackReason = outcome?.code ?? FOLLOWUP_CODES.FOLLOWUP_FAILED;
+      }
+    }
+
     // ★ M2 三分支：追发成功 ⇒ 作业包**已完成**的追发结果（不点火、零 INSERT，见下方 automation
     //   造型的"无行可退"如实记账）；追发失败/未尝试 ⇒ 完全不变的既有点火路径。
     const a = followUpMeta !== null
@@ -596,16 +680,79 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
         }),
         readOutput: () => followUpMeta.output,
       }
-      : (seams.automationRun ?? startAutomationRun)({
-        prompt: args.prompt,
-        cwd: autoCwd,
-        modelId: await awaitModelId(args, c),
-        permissionMode: requestedPerm,
-        reasoningEffort: requestedEffort,
-        sessionKey,
-        ...(automationSessionStore !== null ? { sessionStore: automationSessionStore } : {}),
-        signal: exec.signal,
-      });
+      // ── direct ignition 成功：合成"计划任务已完成"造型（同上：无行如实记账）──
+      : directMeta !== null
+        ? {
+          cancel: () => { /* direct 无行无进程可撤：prompt 已在那条对话里跑，撤无可撤 */ },
+          done: Promise.resolve({
+            status: 'completed',
+            detail: directMeta.output,
+            exitCode: 0,
+            automation: {
+              reason: null,
+              automationId: null,   // ★ direct 不写 automations 表 ⇒ 行两角如实为无
+              conversationId: directMeta.conversationId,
+              sessionId: directMeta.conversationId,
+              sessionKey: sessionKey === '' ? null : sessionKey,
+              sessionPersist: null,
+              retired: false,
+              transcriptPath: null,
+              reply: directMeta.output !== '' ? directMeta.output : null,
+              // ★ 计费/用量直连路径不读（记账 §7 #5 pending）⇒ null 如实，不猜不编。
+              creditsUsed: null,
+              tokensUsed: null,
+              model: resolvedModelId ?? directMeta.model,    // requested = 本轮实际下发的模型
+              usedModelId: directMeta.model,                 // effective = 派发前读回（读不到 null）
+              permission: directMeta.permissionMode,         // 设过才是它；没设 ⇒ null ⇒ (unknown)
+              sessionCwd: directMeta.cwd,
+              requestedEffort,
+              effectiveEffort: directMeta.effort,            // 派发前读回
+              effort: directMeta.effort,
+              title: directMeta.title,
+              createdAt: null,
+              phases: ['direct-ignite'],
+            },
+          }),
+          readOutput: () => directMeta.output,
+        }
+      // ── direct 派发后失败：**禁止回退**（R-NEW-2），合成"已失败"作业包 ──
+      : directFail !== null
+        ? {
+          cancel: () => { /* 已派发：那条对话正在跑 —— 此处无行可撤，更绝不二次点火 */ },
+          done: Promise.resolve({
+            status: 'failed',
+            detail: directFail.detail,
+            exitCode: 1,
+            automation: {
+              reason: REASON_CODES.TASK_ERROR,
+              automationId: null,
+              conversationId: directFail.conversationId,
+              sessionId: directFail.conversationId,
+              sessionKey: sessionKey === '' ? null : sessionKey,
+              sessionPersist: null,
+              retired: false,
+              transcriptPath: null,
+              reply: null,
+              creditsUsed: null, tokensUsed: null,
+              model: null, usedModelId: null, permission: null, sessionCwd: null,
+              requestedEffort: null, effectiveEffort: null, effort: null,
+              title: null, createdAt: null,
+              phases: ['direct-ignite'],
+            },
+          }),
+          readOutput: () => directFail.detail,
+        }
+        : (seams.automationRun ?? startAutomationRun)({
+          prompt: args.prompt,
+          cwd: autoCwd,
+          // direct 轮已算过 ⇒ 复用（不重复算）；未尝试 direct ⇒ 与既有行为逐字节一致。
+          modelId: resolvedModelId !== undefined ? resolvedModelId : await awaitModelId(args, c),
+          permissionMode: requestedPerm,
+          reasoningEffort: requestedEffort,
+          sessionKey,
+          ...(automationSessionStore !== null ? { sessionStore: automationSessionStore } : {}),
+          signal: exec.signal,
+        });
     const aJobId = ctx.jobs.start({
       kind: 'workbuddy',
       label: args.prompt.slice(0, 60),
@@ -650,7 +797,11 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
             : (typeof au.effort === 'string' ? au.effort : '');
           runtime.noteRun({
             // ★ M2：追发轮的 transport 如实记 'followup'（不是 automation —— 它没建行）。
-            transport: followUpMeta !== null ? 'followup' : 'automation',
+            // ★ 2026-10-04：direct ignition 轮如实记 'direct'（直建成功/直建已派发后失败，
+            //   两者都没建行）；**回退轮仍记 'automation'** —— 它这一轮真跑在计划任务上。
+            transport: followUpMeta !== null
+              ? 'followup'
+              : ((directMeta !== null || directFail !== null) ? 'direct' : 'automation'),
             at: Date.now(),
             exitCode: typeof out.exitCode === 'number' ? out.exitCode : null,
             reasonCode: status === 'completed' ? REASON_CODES.OK : (au.reason ?? REASON_CODES.TASK_ERROR),

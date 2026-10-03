@@ -85,6 +85,24 @@ export const Config = z.object({
   // 次转 9.1s —— 15s 已在冷启动边缘，慢盘/杀软/更长系统提示必然越界，留足 12 倍余量。
   // 超时即回退到点火新会话，绝不让调用方对着转圈的作业干等。
   followupTimeoutMs: z.number().default(180_000).volatile(),
+  // ═══ direct ignition（★ 2026-10-04 新增：计划任务 → CDP 直建）════════════════════
+  // `enableDirectIgnition` = 直接点火**总闸，默认 false**（opt-in，用户拍板 D3）：
+  //   开着时，点火轮先走 `dispatcher.ignite()` —— 同一条 CDP 桥把
+  //   `create(+model/+title)` → `configSetThoughtLevel`/`configSetPermissionMode`（仅当本轮
+  //   请求了对应值）→ `runPrompt` 同步等终态一次走完，**省掉计划任务的调度开销**
+  //   （`INSERT + tick(5s) + 拾取(10~30s) + 完成察觉(0~5s)` ≈ 15s；建会话本身真机 123ms）。
+  //   覆盖 `tools/run.js` 与 `subagent/execute.js` 两条点火（用户拍板 D2）。
+  // ★ 回退语义（R-NEW-2）：只有**派发前**失败才回退计划任务（`fallback`/`fallbackReason` 两键
+  //   如实）；**已派发**的失败一律不回退 —— 回退会把同一条 prompt 再跑一遍（双份积分 + 两条
+  //   对话）。关着时行为与现有计划任务路径逐字节一致（零回归门禁）。
+  // ★ 前置条件（产品侧要求 D6）：桌面端必须带 `WORKBUDDY_REMOTE_DEBUGGING_PORT` 启动（一次性
+  //   用户环境变量即可，**不需要**启动项/自定义快捷方式），且**运行中的实例补不开调试口**——
+  //   需要完全退出重启。插件只告知、只询问，绝不代设环境变量、绝不代杀/代重启 WorkBuddy。
+  //   没带端口 ⇒ `ERR_WORKBUDDY_CDP_UNAVAILABLE` ⇒ 回退计划任务，任务不丢；此时回执带
+  //   `fallback`，主控模型**必须**按 `prompts/availability.js` 的约定告知用户并询问是否配置。
+  // ★ 复用 `followupCdpPort`（不新增端口 knob）；超时复用计划任务 15min 口径
+  //   （`AUTOMATION_DEFAULTS.timeoutMs`，不新增超时 knob）。
+  enableDirectIgnition: z.boolean().default(false).volatile(),
   // ═══ 传输面（★ 2026-10-02 起只有 `automation`）════════════════════
   // `automation` = 往计划任务表写一行 `once`（`startAutomationRun` 唯一写入点），
   // 等桌面端调度器建会话。`schedule_type='once'`、`next_run_at=now`、`valid_until=+25min`，

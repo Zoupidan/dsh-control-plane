@@ -64,8 +64,32 @@
  * 只因值为 `undefined` 时被 JSON 丢弃，早先"info 无 model 字段"的结论只看了 `info`。
  * 读到什么写什么：读取失败/会话不可见 ⇒ 两个键都 `null`（`conversationModel` 恒为字符串
  * ⇒ 它为 null 即"读取失败"这个事实的唯一标识）；**绝不**因为读不到就去改会话设定。
- * 本模块对会话的写操作面恒为空集：只允许 `wb:conversations:get` 这一个通道，
- * `set*` 类（含 `setThoughtLevel`/`setModel`）一次都不许出现在 evaluate 表达式里。
+ * ★ 红线的**作用域 = 追发轮** ★：`followUp()` 的 evaluate 表达式里只允许 `wb:conversations:get`
+ * 这一个通道，`set*` 类（含 `setThoughtLevel`/`setModel`）一次都不许出现（测试 D1 钉死）。
+ * 会话写面只存在于 `ignite()`（direct 点火轮），且只在**建会话当下**设定一次 —— 绝不复位、
+ * 绝不回写任何**已存在**的会话（用户在桌面端手动改过的值永不被插件改回去）。
+ *
+ * <p>★ direct ignition（★ 2026-10-04 施工单：计划任务 → CDP 直建）★
+ * `ignite()` 用同一条桥把"建会话 + 配模型/强度/权限 + 发 prompt + 等终态"一次走完：
+ *   `wb:conversations:create({conversationId, cwd, transport:'local', isBackgroundAutomation:true,
+ *   model, title})`（真机 123ms，**title 与 model 均被吃下**，`state:'idle'`）
+ *   → `configSetThoughtLevel` / `configSetPermissionMode`（**仅当本轮请求了对应值**；4ms / 6ms）
+ *   → `runPrompt` 同步等终态。
+ * 省掉的是计划任务那条路的 `INSERT + 调度器 tick(5s) + 拾取(10~30s) + 完成察觉(0~5s)` ≈ 15s 开销。
+ *
+ * <p>★★ 回退红线（R-NEW-2，2026-10-04 用户拍板）★★
+ * `ok:false` 一律带 `stage` + `dispatched` 两字段：**只有 `dispatched:false`（派发前失败 —— 桌面端
+ * 明确拒绝、prompt 未执行）才允许调用方回退计划任务**；`dispatched:true`（表达式已发出 / evaluate
+ * 超时 / WS 断 / `state !== 'completed'`）**一律禁止回退** —— 回退会把同一条 prompt 再跑一遍
+ * （双份积分 + 两条对话）。例外只有一条：返回值是 `__wbError` 且指纹落在"执行前拒绝"白名单
+ * （见 `PRE_EXECUTION_CODES`）⇒ 未执行 ⇒ 允许回退。失败时 `created` / `conversationId` 如实回报，
+ * 调用方可据此 adopt 记性（那条对话可能还在跑）。
+ *
+ * <p>★ 前置条件（产品侧要求，D6）★ 直接点火与追发**都**依赖桌面端带
+ * `WORKBUDDY_REMOTE_DEBUGGING_PORT` 启动 —— 源码依据 asar `main/index.js:54913`：该环境变量为合法
+ * 数字端口时才 `appendSwitch('remote-debugging-port')`。**正在运行的实例补不开调试口**（Electron 启动
+ * 期读取），必须完全退出重启；这是一次性环境变量配置，**不需要**用启动项/自定义快捷方式启动。
+ * 插件只告知、只询问，**绝不**代设环境变量、绝不代杀/代重启 WorkBuddy（见 `prompts/availability.js`）。
  *
  * 约束：本文件属于 packages/*​/src（CI ② 扫描范围）—— 不得出现裸进程出口字样；
  *       只用 Node >= 22.5 内置模块（node:http + node:crypto + 全局 WebSocket），零第三方依赖。
@@ -90,8 +114,9 @@ const HTTP_PROBE_TIMEOUT_MS = 1_500;
 /** 追发通道：等待本轮跑完再回（拿到完整回执）。★ 真机已验证。 */
 const CHANNEL_RUN_PROMPT = 'wb:conversations:runPrompt';
 /**
- * 只读识别通道（施工单 #2）：取会话快照 `{info, configManager}` —— **本模块唯一允许的
- * 会话通道**，纯读、无副作用；`set*` 类写口一次都不许出现在表达式里（测试钉死）。
+ * 只读识别通道（施工单 #2）：取会话快照 `{info, configManager}` —— **追发轮 `followUp()` 唯一
+ * 允许的会话通道**，纯读、无副作用；`set*` 类写口在追发表达式里一次都不许出现（测试 D1 钉死）。
+ * 点火轮 `ignite()` 走的是另一组通道（`CHANNEL_CREATE` / `CHANNEL_SET_*`），作用域互不交叉。
  */
 const CHANNEL_GET_CONVERSATION = 'wb:conversations:get';
 /**
@@ -100,6 +125,19 @@ const CHANNEL_GET_CONVERSATION = 'wb:conversations:get';
  * 但桌面端卡顿时也只允许它最多拖 2s 就放弃（"近乎即时"优先于"读到识别面"）。
  */
 const READ_SETTINGS_BUDGET_MS = 2_000;
+
+/**
+ * direct ignition（点火轮）专用通道 —— **只在 `ignite()` 里出现**，`followUp()` 永不使用。
+ * 真机实测（2026-10-04 探针 `tmp/probe-direct-create.mjs`）：
+ * `create` 123ms / `configSetThoughtLevel` 4ms / `configSetPermissionMode` 6ms / `delete` 610ms。
+ */
+const CHANNEL_CREATE = 'wb:conversations:create';
+const CHANNEL_SET_THOUGHT_LEVEL = 'wb:conversations:configSetThoughtLevel';
+const CHANNEL_SET_PERMISSION_MODE = 'wb:conversations:configSetPermissionMode';
+/** 回收半途失败的自建会话（**只删我们自己建的、从未派发过 prompt 的会话**）。 */
+const CHANNEL_DELETE = 'wb:conversations:delete';
+/** 建会话/设配这类本地短调用的单步上限（真机百毫秒级；慢盘/杀软下也不许吃满总 deadline）。 */
+const IGNITION_STEP_BUDGET_MS = 15_000;
 
 /**
  * RFC §4.2 七指纹 + 两个 RFC 外成员（`ok:false` 时 `code` 的取值域）。
@@ -127,6 +165,22 @@ export const FOLLOWUP_CODES = Object.freeze({
   /** 调用方契约违约：prompt 不是 ContentBlock 数组（桌面端 conversations.js 同样拒收裸字符串）。 */
   INVALID_PROMPT: 'ERR_INVALID_PROMPT',
 });
+
+/**
+ * 「桌面端在**执行前**就拒了 ⇒ prompt 未执行」的指纹白名单 —— 唯一允许在 runPrompt 表达式
+ * **发出之后**仍判定 `dispatched:false`（从而允许调用方回退计划任务）的集合。
+ * 其余一切发送后失败（evaluate 超时 / WS 断 / `state !== 'completed'` / 未映射 `__wbError`）
+ * 一律 `dispatched:true` ⇒ **禁止回退**（R-NEW-2，防二次执行）。
+ * 位置必须在 `FOLLOWUP_CODES` 之后（模块加载期即求值，放前面会撞 TDZ）。
+ * @type {ReadonlySet<string>}
+ */
+const PRE_EXECUTION_CODES = new Set([
+  FOLLOWUP_CODES.CONVERSATION_NOT_FOUND,
+  FOLLOWUP_CODES.CONVERSATION_CLOSED,
+  FOLLOWUP_CODES.PERMISSION_DENIED,
+  FOLLOWUP_CODES.ACP_CONNECTION_REQUIRED,
+  FOLLOWUP_CODES.INVALID_PROMPT,
+]);
 
 /**
  * 把一段纯文本打包成桌面端要求的 ContentBlock 数组
@@ -537,5 +591,249 @@ export function createFollowUpDispatcher(deps = {}) {
     };
   }
 
-  return { followUp };
+  /**
+   * 通用 invoke 表达式（**仅 direct ignition 用**）：桥缺失哨兵 + context 第二参传 `{}` + 可变参数。
+   * 与 `buildRunPromptExpression` 同形，差别只在通道与参数由调用方给。
+   *
+   * @param {string} channel
+   * @param {unknown[]} args
+   * @returns {string}
+   */
+  function buildInvokeExpression(channel, args) {
+    return `(async () => {
+  if (typeof window.__wbInvoke !== 'function') {
+    return { __error: true, message: 'window.__wbInvoke is not defined' };
+  }
+  return await window.__wbInvoke(
+    ${JSON.stringify(channel)},
+    {},
+${args.map((a) => `    ${JSON.stringify(a)}`).join(',\n')}
+  );
+})()`;
+  }
+
+  /** 桌面端的"返回值即错误"形态 `{errorCode, message}`（create / 设配失败时不 throw，原样回来）。 */
+  const isApiErrorValue = (v) => v !== null && typeof v === 'object' && typeof v.errorCode === 'string';
+
+  /** 把 ApiError 的 `errorCode`/`message` 折进既有七指纹；未映射 ⇒ catch-all（不硬塞清单）。 */
+  const mapApiError = (v) => fingerprintFromMessage(`${String(v?.errorCode ?? '')} ${String(v?.message ?? '')}`)
+    ?? FOLLOWUP_CODES.FOLLOWUP_FAILED;
+
+  /**
+   * direct ignition：**建会话 + 配模型/强度/权限 + 发 prompt + 同步等终态**，一次走完。
+   *
+   * <p>★ 与计划任务（`startAutomationRun`）的关系：**可回退、不替换**。调用方按
+   * `dispatched` 决定能否回退（R-NEW-2）—— 派发前失败可回退计划任务；派发后失败禁止回退。
+   *
+   * <p>★ 永不抛。返回信封：
+   * `{ok:true, conversationId, stage:'dispatch', dispatched:true, created:true, elapsedMs, model, effort,
+   *   title, receipt:{raw, output, state, requestId, clientRequestId, responseModel, artifacts}}`
+   * 或 `{ok:false, code, detail, stage, dispatched, created, conversationId, cleanup}`
+   * 其中 `stage ∈ validate|detect|create|config|dispatch`、`cleanup ∈ none|kept|removed|missed`。
+   *
+   * @param {object} req
+   * @param {Array<{type: string, text?: unknown}>} req.prompt ContentBlock[]（裸字符串直接拒）
+   * @param {string} [req.cwd] 会话工作目录（空 ⇒ 不传，走桌面默认）
+   * @param {string} [req.title] 点火名（空 ⇒ 不传，桌面自行起标题）
+   * @param {string|null} [req.modelId] 空/null ⇒ 不传（沿用桌面默认，不替用户选）
+   * @param {string|null} [req.effort] 空/null ⇒ **不调** `configSetThoughtLevel`（沿用当前档）
+   * @param {string|null} [req.permissionMode] 空/null ⇒ **不调** `configSetPermissionMode`（沿用当前权限）
+   * @param {number} [req.timeoutMs] 总预算（调用方按计划任务 15min 口径给；默认 180s）
+   * @param {number} [req.cdpPort] CDP 口（默认 9222）
+   */
+  async function ignite(req = {}) {
+    const t0 = Date.now();
+    const prompt = req.prompt;
+    const cwd = typeof req.cwd === 'string' ? req.cwd : '';
+    const title = typeof req.title === 'string' ? req.title : '';
+    const modelId = typeof req.modelId === 'string' && req.modelId.trim() !== '' ? req.modelId.trim() : null;
+    const effort = typeof req.effort === 'string' && req.effort.trim() !== '' ? req.effort.trim() : null;
+    const permissionMode = typeof req.permissionMode === 'string' && req.permissionMode.trim() !== '' ? req.permissionMode.trim() : null;
+    const timeoutMs = Number.isFinite(req.timeoutMs) && req.timeoutMs > 0 ? Number(req.timeoutMs) : defaultTimeoutMs;
+    const cdpPort = Number.isFinite(req.cdpPort) && req.cdpPort > 0 ? Number(req.cdpPort) : defaultCdpPort;
+    // ★ 自配 id（真机正则 `/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/`）⇒ 超时/半途失败也能定位并回收，
+    //   不会留下"不知道 id 的孤儿对话"。桌面端也接受自配 id（本地 provider 专属能力）。
+    const conversationId = `dsh-ignite-${randomUUID()}`;
+    const deadline = t0 + timeoutMs;
+    const stepBudget = () => Math.max(1, Math.min(IGNITION_STEP_BUDGET_MS, Math.max(1, deadline - Date.now())));
+
+    const fail = (code, detail, stage, { dispatched = false, created = false, cleanup = 'none', id = null } = {}) => ({
+      ok: false, code, detail, stage, dispatched, created, conversationId: id, cleanup,
+    });
+
+    // ① 契约校验（派发前）
+    const check = isValidPromptBlocks(prompt);
+    if (!check.valid) {
+      return fail(FOLLOWUP_CODES.INVALID_PROMPT, `ignite: prompt must be a non-empty ContentBlock[] (${check.error})`, 'validate');
+    }
+
+    // ② 信息性预检 + UA ∧ target 双证据判别（与追发同路同判据）
+    await desktopPrecheck(defaultProbePort);
+    const cdp = await detectLiveCdp(cdpPort, Math.max(1, deadline - Date.now()));
+    if (!cdp.live) return fail(cdp.code, cdp.detail, 'detect');
+    const ws = String(cdp.target.webSocketDebuggerUrl);
+
+    // ③ create（幂等：id 自配 ⇒ evaluate 超时后用 get 复核，仍不在才判失败并尽力回收）
+    const createParams = {
+      conversationId,
+      transport: 'local',
+      isBackgroundAutomation: true,           // ⇒ 桌面按"自动化建的"记 createdBy（与计划任务同语义）
+      ...(cwd !== '' ? { cwd } : {}),
+      ...(modelId !== null ? { model: modelId } : {}),
+      ...(title !== '' ? { title } : {}),
+    };
+    const cOut = await evaluateOverWebSocket(ws, buildInvokeExpression(CHANNEL_CREATE, [createParams]), Date.now() + stepBudget());
+    const cVal = cOut.ok ? cOut.value : undefined;
+    if (cOut.ok && cVal !== null && typeof cVal === 'object' && cVal.__error !== true && cVal.__wbError !== true) {
+      if (isApiErrorValue(cVal)) {
+        // 桌面端明确拒绝 ⇒ 没建出来，无需回收，可直接回退
+        return fail(mapApiError(cVal), `create rejected: ${String(cVal.errorCode)}: ${String(cVal.message ?? '')}`.slice(0, 400), 'create');
+      }
+    } else {
+      // evaluate 级失败（超时/WS 断/桥哨兵）⇒ 幂等复核
+      const probe = await evaluateOverWebSocket(ws, buildGetConversationExpression(conversationId), Date.now() + stepBudget());
+      const pVal = probe.ok ? probe.value : undefined;
+      const built = probe.ok && pVal !== null && typeof pVal === 'object' && pVal.__error !== true && pVal.info !== undefined
+        && !isApiErrorValue(pVal);
+      if (!built) {
+        const del = await evaluateOverWebSocket(ws, buildInvokeExpression(CHANNEL_DELETE, [conversationId, 'local']), Date.now() + stepBudget());
+        return fail(
+          cOut.ok ? FOLLOWUP_CODES.FOLLOWUP_FAILED : cOut.code,
+          `create failed: ${cOut.ok ? JSON.stringify(cVal)?.slice(0, 300) : String(cOut.detail ?? '')}`.slice(0, 400),
+          'create',
+          { id: conversationId, cleanup: del.ok ? 'removed' : 'missed' },
+        );
+      }
+    }
+
+    // ④ 设配（**只设不复位**：仅当本轮请求了对应值才调；失败 ⇒ 删掉刚建的会话再回退，不留垃圾）
+    const applyConfig = async (channel, value) => {
+      const out = await evaluateOverWebSocket(ws, buildInvokeExpression(channel, [conversationId, value]), Date.now() + stepBudget());
+      if (!out.ok) return { ok: false, code: out.code, detail: `${channel} evaluate failed: ${String(out.detail ?? '')}` };
+      const v = out.value;
+      if (v === undefined || v === null || typeof v !== 'object') return { ok: true };   // 真机成功返回 undefined
+      if (v.__error === true || v.__wbError === true || isApiErrorValue(v)) {
+        return { ok: false, code: mapApiError(v), detail: `${channel}: ${JSON.stringify(v)?.slice(0, 300)}` };
+      }
+      return { ok: true };
+    };
+    const cleanupCreated = async () => {
+      const del = await evaluateOverWebSocket(ws, buildInvokeExpression(CHANNEL_DELETE, [conversationId, 'local']), Date.now() + stepBudget());
+      return del.ok ? 'removed' : 'missed';
+    };
+    if (effort !== null) {
+      const r = await applyConfig(CHANNEL_SET_THOUGHT_LEVEL, effort);
+      if (!r.ok) return fail(r.code, `configSetThoughtLevel(${effort}) failed: ${r.detail}`.slice(0, 400), 'config', { id: conversationId, cleanup: await cleanupCreated() });
+    }
+    if (permissionMode !== null) {
+      const r = await applyConfig(CHANNEL_SET_PERMISSION_MODE, permissionMode);
+      if (!r.ok) return fail(r.code, `configSetPermissionMode(${permissionMode}) failed: ${r.detail}`.slice(0, 400), 'config', { id: conversationId, cleanup: await cleanupCreated() });
+    }
+
+    // ⑤ 只读回执面：设完再读一次（派发**前**），随回执如实带回（读不到 ⇒ null，不编造）
+    const settings = await readConversationSettings(cdp.target, conversationId, deadline);
+
+    // ⑥ 派发 + 同步等终态
+    const clientRequestId = `dsh-cdp-${randomUUID()}`;
+    const outcome = await evaluateOverWebSocket(ws, buildRunPromptExpression(conversationId, prompt, { clientRequestId }), deadline);
+    const dispatchedFail = (code, detail) => ({
+      ok: false, code, detail, stage: 'dispatch', dispatched: true, created: true, conversationId, cleanup: 'kept',
+    });
+    if (!outcome.ok) {
+      // ★ 表达式已发出 ⇒ 保守判 `dispatched:true`（超时/断连都可能已执行，回退 = 二次执行）
+      return dispatchedFail(outcome.code, String(outcome.detail ?? ''));
+    }
+    const value = outcome.value;
+    if (value === null || typeof value !== 'object') {
+      return dispatchedFail(FOLLOWUP_CODES.FOLLOWUP_FAILED, `runPrompt returned a non-object value (${value === undefined ? 'undefined' : JSON.stringify(value)?.slice(0, 200)})`);
+    }
+    if (value.__error === true) {
+      // 桥缺失哨兵：表达式本身没跑成 ⇒ 未派发，允许回退。会话是**空的**（没发过 prompt）⇒ 顺手回收，
+      // 不给用户留垃圾对话；桥都没了 ⇒ delete 同样打不通，如实记 'missed'。
+      const message = String(value.message ?? 'unknown __wbInvoke error');
+      return {
+        ok: false,
+        code: fingerprintFromMessage(message) ?? FOLLOWUP_CODES.PERMISSION_DENIED,
+        detail: message.slice(0, 400),
+        stage: 'dispatch',
+        dispatched: false,
+        created: true,
+        conversationId,
+        cleanup: await cleanupCreated(),
+      };
+    }
+    if (value.__wbError === true) {
+      const message = String(value.message ?? 'unknown __wbError');
+      const rawCode = typeof value.code === 'string' ? value.code : '';
+      const mapped = fingerprintFromMessage(rawCode !== '' ? `${rawCode} ${message}` : message) ?? FOLLOWUP_CODES.FOLLOWUP_FAILED;
+      // ★ 只有"执行前拒绝"白名单里的指纹才允许回退（R-NEW-2）。允许回退 ⇒ 那条会话是空的 ⇒ 回收，
+      //   不留垃圾对话；判定已派发 ⇒ **保留**（它可能正在跑，删了等于杀用户的活）。
+      const dispatched = !PRE_EXECUTION_CODES.has(mapped);
+      return {
+        ok: false,
+        code: mapped,
+        detail: `${rawCode === '' ? '' : `${rawCode}: `}${message}`.slice(0, 400),
+        stage: 'dispatch',
+        dispatched,
+        created: true,
+        conversationId,
+        cleanup: dispatched ? 'kept' : await cleanupCreated(),
+      };
+    }
+    if (value.state !== 'completed') {
+      return dispatchedFail(FOLLOWUP_CODES.FOLLOWUP_FAILED, `runPrompt did not complete: state=${JSON.stringify(value.state ?? null)}`
+        + `${typeof value.error === 'string' && value.error !== '' ? ` · ${value.error.slice(0, 200)}` : ''}`);
+    }
+    log(`ignite: conversation ${JSON.stringify(conversationId)} completed in ${Date.now() - t0}ms (requestId=${String(value.requestId ?? '?')})`);
+    return {
+      ok: true,
+      stage: 'dispatch',
+      dispatched: true,
+      created: true,
+      conversationId,
+      title,
+      elapsedMs: Date.now() - t0,
+      // ★ 设配后派发前读到的现配：读到什么写什么（null ⇔ 没读到，不编造）
+      model: settings.model,
+      effort: settings.effort,
+      receipt: {
+        raw: value,
+        output: extractReceiptOutput(value),
+        state: value.state,
+        requestId: typeof value.requestId === 'string' ? value.requestId : null,
+        clientRequestId: typeof value.clientRequestId === 'string' ? value.clientRequestId : clientRequestId,
+        responseModel: value.responseModel ?? null,
+        artifacts: Array.isArray(value.artifacts) ? value.artifacts : [],
+      },
+    };
+  }
+
+  /**
+   * ★ 只读 CDP 可用性探针（2026-10-04 D6）：给 `workbuddy_status` / 提示词用，**与点火面同一套**
+   *   UA ∧ target 判别 —— 状态面说"可用"而点火回退（或反之）这种自相矛盾从结构上不可能发生。
+   *   **永不 throw、只读**（状态工具自己抛异常 ⇒ 模型连"为什么查不到"都看不到）。
+   *   它**不**改变任何配置、不设环境变量、不重启 WorkBuddy —— 只探测、只报告（D6：只告知只询问）。
+   *
+   * @param {number} [port] CDP 口（缺省 = 构造时的 cdpPort）
+   * @param {number} [timeoutMs] 本次预算（缺省 = HTTP 单次探针超时）
+   * @returns {Promise<{available: boolean, reason: string}>}
+   *   `reason` ∈ `live` / `no-listener` / `not-workbuddy-target` / `probe-error: …`
+   */
+  async function probeCdp(port = defaultCdpPort, timeoutMs = HTTP_PROBE_TIMEOUT_MS) {
+    try {
+      const budget = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+        ? Number(timeoutMs)
+        : HTTP_PROBE_TIMEOUT_MS;
+      const r = await detectLiveCdp(port, budget);
+      if (r.live === true) return { available: true, reason: 'live' };
+      return {
+        available: false,
+        reason: r.code === FOLLOWUP_CODES.CDP_UNAVAILABLE ? 'no-listener' : 'not-workbuddy-target',
+      };
+    } catch (err) {
+      return { available: false, reason: `probe-error: ${err instanceof Error ? err.message : String(err)}`.slice(0, 200) };
+    }
+  }
+
+  return { followUp, ignite, probeCdp };
 }

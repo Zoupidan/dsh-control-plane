@@ -23,6 +23,15 @@ import { FLAG_VERDICTS, INIT_SOURCES, STDERR_EXCERPT_LIMIT, buildLastRun, stderr
 import { REASON_CODES, REASON_TEXT, classifyFailure, isNodeRuntimeMissing } from '../src/host/launch/reason-codes.js';
 import { extractSessionId, framesIndicateError, parseFrames, summariseFrames, isValidSessionId } from '../src/host/launch/stream-json.js';
 
+/**
+ * 脱敏用的**假** sk- 密钥（故意全字母+012345，绝非真凭据）。
+ *
+ * ★ 发布卫生（2026-10-04 发布审查）：源码里**不写连续的 `sk-` 长字面量**——那会被
+ *   secret-scanner 与 `tools/ci/check-no-credential-echo.mjs` 的固定前缀规则命中（误报噪音）。
+ *   两段拼接后运行时值逐字连续，脱敏断言与被测行为**完全不变**。
+ */
+const FAKE_SK = ['sk-', 'abcdefghijklmnopqrstuvwxyz012345'].join('');
+
 /** D-3 真机样本（复原；见文件头"样本来源"）。 */
 const D3_STDERR = [
   '400 model [definitely-not-a-real-model-xyz] service info not found',
@@ -186,11 +195,11 @@ test('§4.5 argv 二层脱敏：位置参数里的值体凭据（Bearer / sk-）
   // ★ 2026-09-22 P1：`argv` 字段只过了 redactArgv（只认 `--flag value` / `--flag=value` 的旗标名）。
   //   位置参数与"旗标名不敏感"的值体（`-p Bearer …`、`--model sk-…`）原样进 lastRun ⇒ 凭据落记录。
   const rec = buildLastRun({
-    argv: ['node', 'cli', '-p', 'Bearer abcdefghijklmnop', '--model', 'sk-abcdefghijklmnopqrstuvwxyz012345', 'hi'],
+    argv: ['node', 'cli', '-p', 'Bearer abcdefghijklmnop', '--model', FAKE_SK, 'hi'],
     flags: [], exitCode: 0, stdoutText: '', stderrText: '',
   });
   assert.equal(rec.argv.includes('abcdefghijklmnop'), false, '★ 位置参数不在 `--flag value` 形态里 ⇒ 一层 redactArgv 放行，二层 redactText 必须管住');
-  assert.equal(rec.argv.includes('sk-abcdefghijklmnopqrstuvwxyz012345'), false, '★ 值体 sk-（旗标名 --model 不敏感）同样必须打码');
+  assert.equal(rec.argv.includes(FAKE_SK), false, '★ 值体 sk-（旗标名 --model 不敏感）同样必须打码');
   assert.equal(rec.argv.includes('$1'), false, '脱敏产物不得出现替换符字面量');
   assert.ok(rec.argv.startsWith('node cli -p'), '正控：命令本身逐字保留（脱敏不得吃掉 argv 的可读部分）');
 });
@@ -382,13 +391,13 @@ test('形态健壮性：flags 含 null / 非字符串 flag 不得抛（记录会
 
 test('脱敏：被拒证据与原因证据同样要过 redactText（不落凭据）', () => {
   const rec = buildLastRun({
-    argv: ['node', 'cli', '-p', '--model', 'sk-abcdefghijklmnopqrstuvwxyz012345', 'hi'],
-    flags: [{ flag: '--model', value: 'sk-abcdefghijklmnopqrstuvwxyz012345', source: 'config.model' }],
+    argv: ['node', 'cli', '-p', '--model', FAKE_SK, 'hi'],
+    flags: [{ flag: '--model', value: FAKE_SK, source: 'config.model' }],
     exitCode: 0, stdoutText: '',
-    stderrText: 'error: unknown option for key sk-abcdefghijklmnopqrstuvwxyz012345 (model)\n',
+    stderrText: `error: unknown option for key ${FAKE_SK} (model)\n`,
   });
-  assert.equal(rec.flagEvidence.includes('sk-abcdefghijklmnopqrstuvwxyz012345'), false, '证据不得回传明文密钥');
-  assert.equal(rec.reasonEvidence.includes('sk-abcdefghijklmnopqrstuvwxyz012345'), false);
+  assert.equal(rec.flagEvidence.includes(FAKE_SK), false, '证据不得回传明文密钥');
+  assert.equal(rec.reasonEvidence.includes(FAKE_SK), false);
 });
 
 // ─────────────── 真机成功路径（2026-09-19 实际委派一次 WorkBuddy 成功后补的盲区） ───────────────
@@ -674,9 +683,9 @@ test('notSent 形态健壮性：非数组 ⇒ []；缺 reason ⇒ unspecified；
 test('notSent 脱敏：取值可能被人塞进凭据 ⇒ 与其余对外文本同一条 redactText 路径（R3-19）', () => {
   const rec = buildLastRun({
     argv: [],
-    notSent: [{ flag: '--model', value: 'sk-abcdefghijklmnopqrstuvwxyz012345', source: 'config.model', reason: 'missing_flag_name' }],
+    notSent: [{ flag: '--model', value: FAKE_SK, source: 'config.model', reason: 'missing_flag_name' }],
   });
-  assert.equal(rec.notSent[0].value.includes('sk-abcdefghijklmnopqrstuvwxyz012345'), false, '原样回传会把凭据写进记录/卡片');
+  assert.equal(rec.notSent[0].value.includes(FAKE_SK), false, '原样回传会把凭据写进记录/卡片');
   assert.match(rec.notSent[0].value, /\*\*\*/, '打码后要看得出打过码');
 });
 

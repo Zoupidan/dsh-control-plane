@@ -57,7 +57,7 @@
 - `test/`: Existing test suites, must pass 100% with zero regressions.
 
 ## M2 Addenda (2026-10-03)
-- **Live closure**: Track A verified on the real desktop (`WORKBUDDY_REMOTE_DEBUGGING_PORT=9222` env-var route, CDP ready in 2s). Two turns into one conversationId; turn 2 reproduced the turn-1 agreed word ("收到"). Evidence: `00-recon/evidence/CDP-LIVE-20261003/` (also mirrored in local-only branch `research-evidence-local`, worktree `D:\cheng\Documents\Code\dsh-evidence-vault` — never push).
+- **Live closure**: Track A verified on the real desktop (`WORKBUDDY_REMOTE_DEBUGGING_PORT=9222` env-var route, CDP ready in 2s). Two turns into one conversationId; turn 2 reproduced the turn-1 agreed word ("收到"). Evidence: `00-recon/evidence/CDP-LIVE-20261003/` (also mirrored in local-only branch `research-evidence-local`, worktree kept **outside this repo — local path never published**; never push).
 - **Real receipt contract** (differs from probe assumption): `state:'completed'` (not `status`), `content: ContentBlock[]` (not `output`), no top-level `turnCount`/`usage` (use `wb:conversations:requests`), cross-bridge errors return `{__wbError:true,...}` instead of throwing, `sendPrompt` normally returns `undefined`.
 - **Production knobs** (flat top-level, default off): `enableMultiTurnFollowUp=false`, `followupCdpPort=9222`, `followupTimeoutMs=180000` (live first-turn cold start measured 13.4s; budget 180s).
 - **Gates at M2 close**: `test:host` 560/560 · `test:client` 79/79 · `ci:redlines` 4/4 · harness 10/10 · challenger 19 PASS · `probe-automation-main` PASS · live e2e (through production dispatcher) PASS.

@@ -146,6 +146,7 @@ $s = (Invoke-WebRequest -UseBasicParsing -Uri "$DSH_WEB/plugin-workbuddy/status"
 
 - **推理强度以桌面端的实际口径为准**。插件保证把选定的档位写进下发请求，能否生效由桌面端决定，实际生效情况以回执为准。
 - **多轮归组默认每轮都是新对话**；`enableMultiTurnFollowUp` 开启后（默认关）才会在记性命中时续接同一条对话，且追发失败会自动回退新开，任务不丢。
+- **模型 / 思考强度只识别、不改动**。追发轮不发送任何模型或强度设定，只读回报该对话的当前设定（回执 `follow_up.conversationModel` / `conversationEffort`，读不到为 `null`）；你在 WorkBuddy 桌面端手动改过的值会被如实带回，插件不复位、不回写。
 - **追发会真实消耗 WorkBuddy 积分**（实测约 0.01–0.4 credit/轮，随 prompt 大小浮动）；计费记账目前未接入，由桌面端账单为准。
 - **追发需要桌面端带调试端口启动**：以环境变量 `WORKBUDDY_REMOTE_DEBUGGING_PORT=9222` 启动 WorkBuddy；未启用时追发自动回退点火路线。
 - **建议先正常用过 WorkBuddy 再点火**：插件从本机数据解析"当前登录账号"来归属下发记录；全新安装且桌面端从未有过任何会话记录时，归属解析可能拿不到值，点火行会以无主形态写入（桌面端是否派发取决于其版本行为）。

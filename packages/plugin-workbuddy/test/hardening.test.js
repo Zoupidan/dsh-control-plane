@@ -803,6 +803,31 @@ test('目标⑤：schema ↔ 载荷一致 —— 已声明/required 全覆盖，
     [],
     'workbuddy_run：载荷必须完全落在已声明 schema 内',
   );
+  // ★ 施工单 #2：follow_up 识别面两键是 `oneOf(string|null)` —— 必须用**官方校验器**钉住
+  //   （只在声明里加字段却不验 = 静默契约破损）：字符串 / null 合法，数字越界，未声明键越界。
+  const fuSchema = runDef.output.schema.properties.follow_up;
+  assert.equal(typeof fuSchema, 'object', 'follow_up 必须在声明里');
+  const fuBase = { channel: 'track_a', elapsedMs: 12 };
+  assert.deepEqual(
+    validateJsonSchemaValue(fuSchema, { ...fuBase, conversationModel: 'kimi-k3-1', conversationEffort: null }, 'follow_up'),
+    [],
+    '识别面两键：字符串与 null 都必须是合法取值',
+  );
+  assert.deepEqual(
+    validateJsonSchemaValue(fuSchema, { ...fuBase, conversationModel: null, conversationEffort: 'high' }, 'follow_up'),
+    [],
+    'conversationModel=null（读取失败）同样合法：null 就是"没读到"的如实表达',
+  );
+  assert.deepEqual(
+    validateJsonSchemaValue(fuSchema, { ...fuBase, conversationModel: 42, conversationEffort: 'high' }, 'follow_up'),
+    ['"follow_up.conversationModel" must match exactly one oneOf branch (matched 0)'],
+    '越界取值必须被抓（否则 schema 只是装饰）',
+  );
+  assert.deepEqual(
+    validateJsonSchemaValue(fuSchema, { ...fuBase, conversationModel: '', surprise: 1 }, 'follow_up'),
+    ['"follow_up.surprise" is not a declared property (additionalProperties: false)'],
+    'follow_up 仍是封闭对象：加键必须同时进声明',
+  );
   // 收尾：不要让假宿主的在途作业悬着（本用例只关心形状，不关心终态）。
   // ★ 2026-10-02：网关路没有进程句柄可 `_resolve` —— 作业由 dispatch 自己收敛。
   await host.jobs.get(started.job_id)?.hooks?.done;

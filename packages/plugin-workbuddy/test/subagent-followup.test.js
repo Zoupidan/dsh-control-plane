@@ -77,7 +77,13 @@ function makeFollowUp(calls, failWith = null, throwWith = null) {
     return {
       ok: true,
       channel: 'track_a',
-      receipt: { output: 'REPLY-FU', state: 'completed', requestId: 'rq-fu', clientRequestId: 'cr-fu', responseModel: null, artifacts: [] },
+      receipt: {
+        output: 'REPLY-FU', state: 'completed', requestId: 'rq-fu', clientRequestId: 'cr-fu', responseModel: null,
+        // ★ 施工单 #2：dispatcher 派发前读到的会话现配（读到什么带什么）。
+        conversationModel: 'kimi-k3-1',
+        conversationEffort: 'high',
+        artifacts: [],
+      },
     };
   };
 }
@@ -133,6 +139,9 @@ test('★★★ 追发成功：不点火、不重放前情，回执 origin=resum
   assert.equal(typeof report.createdAt, 'string', 'createdAt 是 ISO 时间戳');
   assert.equal(typeof report.followUp?.elapsedMs, 'number', '追发元数据（channel/elapsedMs）随回执带出');
   assert.equal(report.followUp.channel, 'track_a');
+  // ★ 施工单 #2：只读识别两键随 followUp 元数据透传（与 tools/run.js 的 follow_up 同名同义）。
+  assert.equal(report.followUp.conversationModel, 'kimi-k3-1', '会话当前模型随回执透传');
+  assert.equal(report.followUp.conversationEffort, 'high', '会话当前思考强度随回执透传');
   assert.equal('fallback' in report, false, '成功轮不带回退键');
 
   // 记账：会话 id 没变 ⇒ 只 touch 推进热度戳，不 forget 不 adopt。
@@ -159,7 +168,13 @@ test('★★★ 追发失败：forget 带指纹码、照旧 replayPrefix + 点�
     return {
       ok: true,
       channel: 'track_a',
-      receipt: { output: 'REPLY-FU', state: 'completed', requestId: 'rq-fu', clientRequestId: 'cr-fu', responseModel: null, artifacts: [] },
+      receipt: {
+        output: 'REPLY-FU', state: 'completed', requestId: 'rq-fu', clientRequestId: 'cr-fu', responseModel: null,
+        // ★ 施工单 #2：dispatcher 派发前读到的会话现配（读到什么带什么）。
+        conversationModel: 'kimi-k3-1',
+        conversationEffort: 'high',
+        artifacts: [],
+      },
     };
   };
   const exec = createTaskExecutor({

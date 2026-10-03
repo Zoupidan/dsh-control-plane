@@ -313,7 +313,10 @@ function continuityHint(runtime) {
       return base + ' Multi-turn follow-up is ON: when a resumable conversation is recorded for the session_key, '
         + 'the next round is appended to that SAME conversation (the receipt then reads continuity=same-conversation '
         + 'with origin=resumed); only when that append fails does the round open a new conversation instead '
-        + '(the receipt reads fallback=<code>).';
+        + '(the receipt reads fallback=<code>). A follow-up round sends NO model or effort setting: it runs under '
+        + 'whatever model and thinking level that conversation already has (the receipt reports them read-only as '
+        + 'follow_up.conversationModel / follow_up.conversationEffort, null when unreadable) — if the user changed '
+        + 'them in the WorkBuddy desktop, that is their setting to keep; the plugin never resets or writes it back.';
     }
     return base;
   }

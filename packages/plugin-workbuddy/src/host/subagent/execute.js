@@ -271,6 +271,14 @@ export function createTaskExecutor({
           channel: typeof outcome.channel === 'string' && outcome.channel !== '' ? outcome.channel : 'track_a',
           elapsedMs: Date.now() - startedAt,
           conversationId: recorded.cliSessionId,
+          // ★ 施工单 #2 只读识别：会话当前模型/思考强度（读到什么带什么，读不到 null；
+          //   与 tools/run.js 的 follow_up 两键同名同义，绝不回写、绝不复位）。
+          conversationModel: typeof outcome.receipt?.conversationModel === 'string'
+            ? outcome.receipt.conversationModel
+            : null,
+          conversationEffort: typeof outcome.receipt?.conversationEffort === 'string'
+            ? outcome.receipt.conversationEffort
+            : null,
         };
         // ★ 成功：只推进热度戳（会话 id 没变 ⇒ 不 adopt 不 forget，run.js 同款）。
         try {
@@ -305,8 +313,14 @@ export function createTaskExecutor({
           createdAt: new Date().toISOString(),
           transcriptPath: null,
           cwd: typeof req.cwd === 'string' ? req.cwd : null,
-          // ★ 追发元数据：notes.js 据此渲染 `follow-up=<channel> in <ms>` 位。
-          followUp: { channel: followUpMeta.channel, elapsedMs: followUpMeta.elapsedMs },
+          // ★ 追发元数据：notes.js 据此渲染 `follow-up=<channel> in <ms>` 位；
+          //   两键识别面只进折叠/回执（正文词表不扩 —— BIT_KEYS 白名单不动，坑#6）。
+          followUp: {
+            channel: followUpMeta.channel,
+            elapsedMs: followUpMeta.elapsedMs,
+            conversationModel: followUpMeta.conversationModel,
+            conversationEffort: followUpMeta.conversationEffort,
+          },
         };
       }
       fallbackReason = typeof outcome?.code === 'string' && outcome.code !== ''

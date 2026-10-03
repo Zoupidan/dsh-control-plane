@@ -56,6 +56,17 @@
  * <p>★ 零凭据 ★ CDP 本地回环无需鉴权；本模块全程不读、不存、不打任何凭据。日志只含端口、
  * target 标题/URL、指纹码与耗时；prompt 内容**不进日志**。
  *
+ * <p>★ 只读识别面（★ 2026-10-03 施工单 #2；语义红线 = 零设置调用、不复位、不回写）★
+ * 派发**前**用同一个桥读一次 `wb:conversations:get`，从回执的 `configManager` 取
+ * `model`（会话当前模型，`''` = 桌面默认未覆盖）与 `thoughtLevel`（会话当前思考强度，
+ * 缺席 = 从未覆盖）—— 源码依据：main 侧 `toRemoteConversationSnapshot()` 把这两个字段
+ * 连同 `contextWindow` 一起放进跨桥快照（asar `conversations.js:34100`，getter 在 :10617），
+ * 只因值为 `undefined` 时被 JSON 丢弃，早先"info 无 model 字段"的结论只看了 `info`。
+ * 读到什么写什么：读取失败/会话不可见 ⇒ 两个键都 `null`（`conversationModel` 恒为字符串
+ * ⇒ 它为 null 即"读取失败"这个事实的唯一标识）；**绝不**因为读不到就去改会话设定。
+ * 本模块对会话的写操作面恒为空集：只允许 `wb:conversations:get` 这一个通道，
+ * `set*` 类（含 `setThoughtLevel`/`setModel`）一次都不许出现在 evaluate 表达式里。
+ *
  * 约束：本文件属于 packages/*​/src（CI ② 扫描范围）—— 不得出现裸进程出口字样；
  *       只用 Node >= 22.5 内置模块（node:http + node:crypto + 全局 WebSocket），零第三方依赖。
  */
@@ -78,6 +89,17 @@ const HTTP_PROBE_TIMEOUT_MS = 1_500;
 
 /** 追发通道：等待本轮跑完再回（拿到完整回执）。★ 真机已验证。 */
 const CHANNEL_RUN_PROMPT = 'wb:conversations:runPrompt';
+/**
+ * 只读识别通道（施工单 #2）：取会话快照 `{info, configManager}` —— **本模块唯一允许的
+ * 会话通道**，纯读、无副作用；`set*` 类写口一次都不许出现在表达式里（测试钉死）。
+ */
+const CHANNEL_GET_CONVERSATION = 'wb:conversations:get';
+/**
+ * 只读识别的独立预算（毫秒）：与派发预算分开 —— 识别读失败**绝不**吃掉 runPrompt 的
+ * 确认窗口（读超时 ⇒ 如实 null，照常追发）。取 2s：本地回环一次快照读远用不到，
+ * 但桌面端卡顿时也只允许它最多拖 2s 就放弃（"近乎即时"优先于"读到识别面"）。
+ */
+const READ_SETTINGS_BUDGET_MS = 2_000;
 
 /**
  * RFC §4.2 七指纹 + 两个 RFC 外成员（`ok:false` 时 `code` 的取值域）。
@@ -344,6 +366,61 @@ export function createFollowUpDispatcher(deps = {}) {
   }
 
   /**
+   * 组装 `wb:conversations:get` 的只读表达式（施工单 #2）。与 runPrompt 表达式同形：
+   * 桥缺失哨兵 + context 第二参传 `{}` + 单参数 conversationId。**纯读**：该通道在
+   * main 侧只做快照序列化（`toRemoteConversationSnapshot`），不写任何会话状态。
+   */
+  function buildGetConversationExpression(conversationId) {
+    return `(async () => {
+  if (typeof window.__wbInvoke !== 'function') {
+    return { __error: true, message: 'window.__wbInvoke is not defined' };
+  }
+  return await window.__wbInvoke(
+    ${JSON.stringify(CHANNEL_GET_CONVERSATION)},
+    {},
+    ${JSON.stringify(conversationId)}
+  );
+})()`;
+  }
+
+  /**
+   * 只读识别：会话"当前模型 / 当前思考强度"（★ 施工单 #2；语义红线见模块头注）。
+   *
+   * <p>失败语义（**不编造**）：读取异常 / 超预算 / 回执无 `configManager`（会话不可见等）
+   * ⇒ `{model:null, effort:null}`；读到但桌面从未覆盖 `thoughtLevel` ⇒ `effort:null`
+   * （`model` 读到时恒为字符串 ⇒ `model === null` 唯一指向"没读到"）。
+   *
+   * @param {{webSocketDebuggerUrl?: unknown}} target 已判别的 WorkBuddy renderer target
+   * @param {string} conversationId
+   * @param {number} deadlineMs 派发总 deadline（识别走独立小预算，不蚕食派发窗口）
+   * @returns {Promise<{model: string|null, effort: string|null}>}
+   */
+  async function readConversationSettings(target, conversationId, deadlineMs) {
+    const budget = Math.max(1, Math.min(READ_SETTINGS_BUDGET_MS, deadlineMs - Date.now()));
+    try {
+      const outcome = await evaluateOverWebSocket(
+        String(target.webSocketDebuggerUrl),
+        buildGetConversationExpression(conversationId),
+        Date.now() + budget,
+      );
+      // ★ 信封：evaluateOverWebSocket 给的是 {ok:true, value} / {ok:false, code, detail}；
+      //   任何非 ok（超预算/CDP 报错/表达式异常）都只落成 null，绝不影响本轮派发。
+      if (outcome === null || typeof outcome !== 'object' || outcome.ok !== true) return { model: null, effort: null };
+      const value = outcome.value;
+      if (value === null || typeof value !== 'object') return { model: null, effort: null };
+      if (value.__error === true || value.__wbError === true) return { model: null, effort: null };
+      const cm = value.configManager;
+      if (cm === null || typeof cm !== 'object') return { model: null, effort: null };
+      return {
+        model: typeof cm.model === 'string' ? cm.model : null,
+        effort: typeof cm.thoughtLevel === 'string' ? cm.thoughtLevel : null,
+      };
+    } catch {
+      return { model: null, effort: null };
+    }
+  }
+
+  /**
    * 从 runPrompt 回执提取人话输出：`content[]` 里 text block 的 text 拼接
    * （真机形状 `[{type:'text', text:'收到', messageId:…}]`；无 output 字符串字段）。
    */
@@ -392,6 +469,10 @@ export function createFollowUpDispatcher(deps = {}) {
       return { ok: false, code: cdp.code, detail: cdp.detail };
     }
 
+    // ②′ 只读识别（施工单 #2）：派发前读一次会话当前模型/思考强度，随回执如实带回。
+    //    ★ 零设置调用：本步只发 `wb:conversations:get`；读失败不改判本轮走向（null 照发）。
+    const settings = await readConversationSettings(cdp.target, conversationId, deadline);
+
     // ③ 连 renderer target 并在页面里调 runPrompt（options 带 clientRequestId，真机原样回显）。
     const clientRequestId = `dsh-cdp-${randomUUID()}`;
     const outcome = await evaluateOverWebSocket(
@@ -437,6 +518,8 @@ export function createFollowUpDispatcher(deps = {}) {
     log(`followup: dispatched to ${JSON.stringify(conversationId)} in ${Date.now() - t0}ms (requestId=${String(value.requestId ?? '?')})`);
     // ★ 回执信封：raw = 原始对象逐字保留；output = content[] 的 text block 拼接；
     //   turnCount / usage 不在此处（回执没有，走 wb:conversations:requests —— 见模块头注）。
+    // ★ conversationModel/conversationEffort（施工单 #2）：派发**前**读到的会话现配，
+    //   读到什么写什么；`conversationModel` 为 null ⇔ 识别面没读到（此时 effort 也是 null）。
     return {
       ok: true,
       channel: 'track_a',
@@ -447,6 +530,8 @@ export function createFollowUpDispatcher(deps = {}) {
         requestId: typeof value.requestId === 'string' ? value.requestId : null,
         clientRequestId: typeof value.clientRequestId === 'string' ? value.clientRequestId : clientRequestId,
         responseModel: value.responseModel ?? null,
+        conversationModel: settings.model,
+        conversationEffort: settings.effort,
         artifacts: Array.isArray(value.artifacts) ? value.artifacts : [],
       },
     };

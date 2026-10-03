@@ -324,9 +324,23 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
           properties: {
             channel: { type: 'string', required: true },
             elapsedMs: { type: 'number', required: true },
+            // ★ 施工单 #2：会话现配的只读识别（派发前读 `wb:conversations:get`）。
+            //   `conversationModel` 为 null ⇔ 识别面没读到（`''` = 桌面默认未覆盖，
+            //   是读到了的字符串）；`conversationEffort` 为 null = 没读到或该会话从未覆盖。
+            conversationModel: {
+              oneOf: [{ type: 'string' }, { type: 'null' }],
+              description: 'Conversation model in force BEFORE this follow-up (verbatim; '
+                + '\'\' = desktop default not overridden; null = identification read failed).',
+            },
+            conversationEffort: {
+              oneOf: [{ type: 'string' }, { type: 'null' }],
+              description: 'Conversation thought level in force BEFORE this follow-up '
+                + '(verbatim, e.g. "high"; null = not overridden or identification read failed).',
+            },
           },
           description: 'Present only when the prompt was appended to the EXISTING conversation ' +
-            '(resume:true + enableMultiTurnFollowUp): follow-up transport (track_a) and elapsed time.',
+            '(resume:true + enableMultiTurnFollowUp): follow-up transport (track_a), elapsed time, ' +
+            'and the read-only model/effort identification (never written back by the plugin).',
         },
         fallback: {
           type: 'boolean',
@@ -464,6 +478,14 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
           elapsedMs: Date.now() - startedAt,
           conversationId: recorded.cliSessionId,
           output: typeof outcome.receipt?.output === 'string' ? outcome.receipt.output : '',
+          // ★ 施工单 #2 只读识别：会话当前模型/思考强度（dispatcher 派发前经
+          //   `wb:conversations:get` 读到什么就带什么；读不到为 null —— 不编造、不复位）。
+          conversationModel: typeof outcome.receipt?.conversationModel === 'string'
+            ? outcome.receipt.conversationModel
+            : null,
+          conversationEffort: typeof outcome.receipt?.conversationEffort === 'string'
+            ? outcome.receipt.conversationEffort
+            : null,
         };
         // ★ 成功：不 forget 不 adopt（会话 id 没变），只把热度戳推进 —— `sweepOwnSessions`
         //   按 lastUsedAt 判陈旧，不 touch 的追发会话会在 7 天后被误判成无人认领的遗留。
@@ -666,10 +688,16 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
             sessionKey,
             // ★ M2：resumed 不再写死 false —— 追发成功为 true；点火轮（含追发失败回退）仍为 false。
             resumed: followUpMeta !== null,
-            // ★ M2：追发元数据进 lastRun（channel/elapsedMs），与回执的 follow_up 同源同值。
+            // ★ M2：追发元数据进 lastRun（channel/elapsedMs + 施工单 #2 的只读识别两键），
+            //   与回执的 follow_up 同源同值（workbuddy_status / 卡片据此透传）。
             followUp: followUpMeta === null
               ? null
-              : { channel: followUpMeta.channel, elapsedMs: followUpMeta.elapsedMs },
+              : {
+                channel: followUpMeta.channel,
+                elapsedMs: followUpMeta.elapsedMs,
+                conversationModel: followUpMeta.conversationModel,
+                conversationEffort: followUpMeta.conversationEffort,
+              },
             // ★ M2：回退轮（追发失败→照旧点火）在 lastRun 里与普通点火轮逐字同形 —— 补两个如实
             //   记账键，status 路由 / workbuddy_status / client 卡片据此区分"这一轮是回退轮"。
             //   成功追发轮不靠这两键（由 transport/sessionOrigin/followUp 三键辨认）。
@@ -715,7 +743,13 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
         resumed: true,
         resumed_session_id: followUpMeta.conversationId,
         not_sent: buildNotSent(args, c),
-        follow_up: { channel: followUpMeta.channel, elapsedMs: followUpMeta.elapsedMs },
+        // ★ 施工单 #2：会话现配只读识别随回执透传（null 如实，不编造、不回写）。
+        follow_up: {
+          channel: followUpMeta.channel,
+          elapsedMs: followUpMeta.elapsedMs,
+          conversationModel: followUpMeta.conversationModel,
+          conversationEffort: followUpMeta.conversationEffort,
+        },
       };
     }
     return {

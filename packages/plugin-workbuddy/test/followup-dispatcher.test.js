@@ -13,6 +13,8 @@
  *   - dispatcher 单元面：成功路径（state/content/raw/evaluate 形状 + context 传 {}）、
  *     裸字符串 prompt 拒绝、CDP 关闭、UA/target 双证据判别两侧、超时、桥缺失、
  *     __wbError 三分支（NOT_FOUND/CLOSED/未映射 catch-all）、非 completed state。
+ *   - ★ 施工单 #2 只读识别面：派发前 `wb:conversations:get` 一次（恰两次 evaluate、
+ *     零 setter）、model/thoughtLevel 如实随回执带回、读失败 ⇒ null 且派发不受影响。
  *   - run.js 接线面：开关关 ⇒ followUp 一次都不被调（spy 断言）、成功 ⇒ touch + resumed:true、
  *     失败 ⇒ forget(指纹码) → 点火 顺序正确 + fallback 回执、resume 省略不追发、
  *     resume:true 无记性仍报错。
@@ -214,6 +216,26 @@ class FakeCdpServer {
       });
       return;
     }
+    // ★ 施工单 #2 只读识别：`wb:conversations:get` 回 {info, configManager}（真机形状，
+    //   见 CDP-LIVE-20261003 与 asar conversations.js toRemoteConversationSnapshot）。
+    //   缺省带 model/thoughtLevel 覆盖值，好让 D1 断言"识别面两键如实随回执带回"。
+    //   ★ 必须排在 typeof 分支之前：本表达式里同样含 "typeof window.__wbInvoke" 子串。
+    if (expr.includes('"wb:conversations:get"')) {
+      const gm = expr.match(/"wb:conversations:get",\s*\{\},\s*"([^"]+)"/);
+      reply({
+        info: { id: gm !== null ? gm[1] : 'fake-conv', title: 'fake' },
+        configManager: {
+          mode: 'craft',
+          model: 'kimi-k3-1',
+          connectors: [],
+          expertId: '',
+          permissionMode: 'fullAccess',
+          useSandboxCLI: false,
+          thoughtLevel: 'high',
+        },
+      });
+      return;
+    }
     if (expr.includes('typeof window.__wbInvoke')) {
       this.sendFrame(JSON.stringify({ id: msg.id, result: { result: { type: 'string', value: 'function' } } }));
       return;
@@ -362,6 +384,10 @@ function harness({ flag = false, followUpOutcome = null } = {}) {
         requestId: '01a1',
         clientRequestId: 'dsh-cdp-x',
         responseModel: { id: 'glm-5.3-flash' },
+        // ★ 施工单 #2 只读识别：dispatcher 派发前读到的会话现配（真机实测见过
+        //   model='kimi-k3-1' / thoughtLevel='high'），默认回执带上好断言透传链路。
+        conversationModel: 'kimi-k3-1',
+        conversationEffort: 'high',
         artifacts: [],
       },
     };
@@ -420,9 +446,19 @@ test('D1 ★ 成功路径（真机回执契约）：state/content/raw 解析 + e
     assert.equal(r.receipt.raw.state, 'completed', 'raw 必须逐字保留原始回执');
     assert.equal(r.receipt.raw.content[0].text, 'FAKE-REPLY for conv-1');
     assert.equal('turnCount' in r.receipt, false, '★ 回执信封不承诺 turnCount（真机没有；轮次走 requests 通道）');
-    assert.equal(srv.evaluations.length, 1, '恰一次 Runtime.evaluate');
-    const { expression, params } = srv.evaluations[0];
+    // ★ 施工单 #2：派发前**多一次**只读识别 evaluate ⇒ 恰两次，且顺序必须"先读后发"。
+    assert.equal(srv.evaluations.length, 2, '恰两次 Runtime.evaluate（只读识别 1 次 + runPrompt 1 次）');
+    const read = srv.evaluations[0];
+    assert.ok(read.expression.includes('"wb:conversations:get"'), '第 1 次 evaluate 必须是只读识别通道');
+    assert.equal(read.expression.includes('"wb:conversations:runPrompt"'), false, '识别表达式不得夹带派发');
+    // ★ 语义红线（不复位、不回写）：识别面表达式里一个 set/update/write 词都不许出现。
+    assert.equal(/\b(set|update|write|delete|remove|send|run)[A-Z]/.test(read.expression), false,
+      '★ 零设置调用：识别表达式不得含任何 setter（setThoughtLevel/setModel/…）');
+    const { expression, params } = srv.evaluations[1];
     assert.ok(expression.includes('"wb:conversations:runPrompt"'), 'evaluate 必须打 runPrompt 通道');
+    // ★ 施工单 #2 识别面回执：假机给 model='kimi-k3-1' / thoughtLevel='high' ⇒ 如实带回。
+    assert.equal(r.receipt.conversationModel, 'kimi-k3-1', '会话当前模型须随回执如实带回');
+    assert.equal(r.receipt.conversationEffort, 'high', '会话当前思考强度须随回执如实带回');
     assert.ok(expression.includes('"conv-1"'), '目标对话 id 必须在表达式里');
     assert.ok(expression.includes('[{"type":"text","text":"turn 2 text"}]'), 'prompt 必须以 ContentBlock 数组进表达式');
     assert.ok(expression.includes('__wbInvoke'), '必须经 window.__wbInvoke 桥');
@@ -430,6 +466,12 @@ test('D1 ★ 成功路径（真机回执契约）：state/content/raw 解析 + e
     assert.ok(expression.includes('{},'), 'context 第二参必须是 {}');
     assert.equal(expression.includes('"subject"'), false, '不得再构造 {subject:…}（真机已证实被忽略）');
     assert.ok(expression.includes('"clientRequestId":"dsh-cdp-'), 'options 必须带 clientRequestId（真机回显可作关联键）');
+    // ★ 验收①（用户语义"点火设定一次，之后只识别不改"）：追发调用参数里绝无模型/强度键。
+    assert.equal(
+      /"(model|effort|thoughtLevel|reasoning_effort|reasoningEffort|permissionMode)"\s*:/.test(expression),
+      false,
+      '★ 零设定调用：runPrompt 表达式不得携带任何模型/思考强度/权限设定键',
+    );
     assert.equal(params.awaitPromise, true, '必须 awaitPromise（等本轮跑完）');
     assert.equal(params.returnByValue, true, '必须 returnByValue（拿纯值回执）');
     assert.ok(logs.some((l) => l.includes('CDP target matched')), 'target 命中应有日志');
@@ -615,6 +657,40 @@ test('D10 ★ state 非 completed（非 __wbError）⇒ ERR_FOLLOWUP_FAILED，de
   }
 });
 
+test('D11 ★ 识别面读不到 ⇒ conversationModel/conversationEffort 如实 null，追发照常（不复位不回写）', async () => {
+  // 会话不可见（跨桥 __wbError）：configManager 拿不到 ⇒ 两键 null；派发不受影响。
+  const srv = new FakeCdpServer({
+    onEvaluate: (expr, reply) => {
+      if (expr.includes('wb:conversations:runPrompt')) {
+        reply({
+          clientRequestId: 'req-x', requestId: '01a1', state: 'completed',
+          content: [{ type: 'text', text: 'OK' }], artifacts: [], responseModel: { id: 'glm-5.3-flash' },
+        });
+        return;
+      }
+      if (expr.includes('"wb:conversations:get"')) {
+        reply({ __wbError: true, message: 'conversation not found', code: 4004 });
+        return;
+      }
+      reply({ state: 'unknown-expression' });
+    },
+  });
+  const port = await srv.start();
+  try {
+    const d = createFollowUpDispatcher({ cdpPort: port, desktopProbePort: port });
+    const r = await d.followUp({ conversationId: 'conv-x', prompt: packageContentBlocks('round') });
+    assert.equal(r.ok, true, '★ 识别面读失败绝不判死这一轮（派发照常）');
+    assert.equal(r.receipt.conversationModel, null, '读不到就 null，不编造');
+    assert.equal(r.receipt.conversationEffort, null, '读不到就 null，不编造');
+    // 语义红线：整轮只允许两次 evaluate（get + runPrompt），一个 setter 都不许。
+    assert.equal(srv.evaluations.length, 2, '零设置调用：只读识别 1 次 + runPrompt 1 次');
+    const bad = srv.evaluations.filter((e) => /\b(set|update|write|delete|remove)[A-Z]/.test(e.expression));
+    assert.deepEqual(bad.map((e) => e.expression), [], '★ 语义红线：全程零 setter 调用');
+  } finally {
+    await srv.stop();
+  }
+});
+
 test('W1 ★★★ 开关关闭（默认）⇒ followUp 一次都不被调，回执键集与既有逐字一致', async () => {
   const h = harness({ flag: false });
   await h.call({ prompt: 'round one', session_key: 'K' });
@@ -655,7 +731,13 @@ test('W2 ★★★ 开关开 + resume:true + 追发成功 ⇒ 不点火、touch�
   // 回执：resumed:true + 追发元数据；其余既有字段全部保留；无 fallback 键。
   assert.equal(second.resumed, true);
   assert.equal(second.resumed_session_id, 'conv-1');
-  assert.deepEqual(second.follow_up, { channel: 'track_a', elapsedMs: second.follow_up.elapsedMs });
+  // ★ 施工单 #2：识别面两键随 follow_up 同源透传（读到什么写什么）。
+  assert.deepEqual(second.follow_up, {
+    channel: 'track_a',
+    elapsedMs: second.follow_up.elapsedMs,
+    conversationModel: 'kimi-k3-1',
+    conversationEffort: 'high',
+  });
   assert.ok(Number.isFinite(second.follow_up.elapsedMs) && second.follow_up.elapsedMs >= 0);
   assert.equal(Object.prototype.hasOwnProperty.call(second, 'fallback'), false);
   assert.equal(second.job_id, 'job-2', '★ 作业句柄照发（回执字段全保留）');
@@ -670,7 +752,12 @@ test('W2 ★★★ 开关开 + resume:true + 追发成功 ⇒ 不点火、touch�
   assert.equal(last?.transport, 'followup', '★ lastRun transport 如实记 followup');
   assert.equal(last?.sessionOrigin, 'resumed', '★ origin 为 resumed（同一条对话续用）');
   assert.equal(last?.resumed, true);
-  assert.deepEqual(last?.followUp, { channel: 'track_a', elapsedMs: last.followUp.elapsedMs });
+  assert.deepEqual(last?.followUp, {
+    channel: 'track_a',
+    elapsedMs: last.followUp.elapsedMs,
+    conversationModel: 'kimi-k3-1',
+    conversationEffort: 'high',
+  }, '★ lastRun.followUp 与回执 follow_up 同源同值（status/卡片据此透传）');
   assert.equal(last?.sessionId, 'conv-1');
   assert.equal(last?.automationId, null, '★ Track A 不建行 ⇒ automationId 如实为 null');
   assert.equal(last?.retired, false, '★ 无行可退 ⇒ retired false（不谎报）');
@@ -734,4 +821,25 @@ test('W5 开关开 + resume:true + 无记性 ⇒ 仍明确报错（追发面不�
   );
   assert.equal(h.followUpCalls.length, 0);
   assert.equal(h.automationCalls.length, 0);
+});
+
+test('W6 ★ 识别面缺键（读失败/旧 seam 回执）⇒ follow_up 两键如实 null（不编造、不复位）', async () => {
+  const h = harness({
+    flag: true,
+    // 旧形状回执：不带 conversationModel/conversationEffort（等价于识别面没读到）。
+    followUpOutcome: {
+      ok: true,
+      channel: 'track_a',
+      receipt: { output: 'REPLY', state: 'completed', requestId: 'r', clientRequestId: 'c', responseModel: null, artifacts: [] },
+    },
+  });
+  await h.call({ prompt: 'round one', session_key: 'K' });
+  await h.jobs.handles[0].done;
+  const second = await h.call({ prompt: 'round two', session_key: 'K', resume: true });
+  assert.equal(second.resumed, true);
+  assert.equal(second.follow_up.conversationModel, null, '读不到如实 null，绝不用设置面"补"一个值');
+  assert.equal(second.follow_up.conversationEffort, null, '读不到如实 null');
+  const last = h.runtime.notes[1];
+  assert.equal(last?.followUp?.conversationModel, null, 'lastRun 与回执同源同值');
+  assert.equal(last?.followUp?.conversationEffort, null);
 });

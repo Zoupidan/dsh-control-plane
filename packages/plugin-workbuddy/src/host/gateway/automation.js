@@ -347,13 +347,30 @@ function sleep(ms, signal) {
  * 取本机账号 id。
  *
  * ★ 不硬编码任何账号 id：把某台机器的 `owner_user_id` 写死进源码，等于把源码变成"只对一台机器成立"。
- *   从**本机既有的行**里取，取不到就如实留 NULL（`owner_status` 随之落到 `legacy_unassigned`）。
+ *
+ * ★★ 取值顺序（2026-10-03 真机事故修正）：**sessions 表最近活跃的 user_id 优先** —— 它是守护进程
+ *   自己盖章的"当前登录账号"。此前只抄 automations 历史行的 owner：桌面一旦切换账号，新点火的行
+ *   顶着旧 owner，被调度器 `ownerVisibility()` 的 fail-closed 归属隔离整批过滤——**零日志、零 dispatch、
+ *   桥面 list 返回 []**，点火在用户眼里表现为"永远没有新会话"。旧 owner 行只配当兜底。
+ *   旧库/夹具可能没有 `last_activity_at` 列，逐级降级到 `updated_at` / 无排序。
  */
-function resolveOwnerUserId(db) {
+export function resolveOwnerUserId(db) {
+  const sessionAttempts = [
+    "SELECT user_id FROM sessions WHERE user_id IS NOT NULL AND user_id <> '' ORDER BY last_activity_at DESC LIMIT 1",
+    "SELECT user_id FROM sessions WHERE user_id IS NOT NULL AND user_id <> '' ORDER BY updated_at DESC LIMIT 1",
+  ];
+  for (const sql of sessionAttempts) {
+    try {
+      const row = db.prepare(sql).get();
+      // 与桌面 currentUserId() 的 `uid?.trim() || void 0` 同语义：trim 后判定，空白串不算登录态。
+      const uid = typeof row?.user_id === 'string' ? row.user_id.trim() : '';
+      if (uid !== '') return uid;
+      break; // sessions 表存在但没有可用行：换排序不再有信息量，直接走兜底
+    } catch { /* 列/表不存在（旧库或夹具）：降级到下一档 */ }
+  }
   const a = db.prepare("SELECT owner_user_id FROM automations WHERE owner_user_id IS NOT NULL AND owner_user_id <> '' LIMIT 1").get();
-  if (typeof a?.owner_user_id === 'string' && a.owner_user_id !== '') return a.owner_user_id;
-  const s = db.prepare("SELECT user_id FROM sessions WHERE user_id IS NOT NULL AND user_id <> '' LIMIT 1").get();
-  if (typeof s?.user_id === 'string' && s.user_id !== '') return s.user_id;
+  const legacyUid = typeof a?.owner_user_id === 'string' ? a.owner_user_id.trim() : '';
+  if (legacyUid !== '') return legacyUid;
   return null;
 }
 

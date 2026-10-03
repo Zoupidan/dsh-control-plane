@@ -670,6 +670,11 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
             followUp: followUpMeta === null
               ? null
               : { channel: followUpMeta.channel, elapsedMs: followUpMeta.elapsedMs },
+            // ★ M2：回退轮（追发失败→照旧点火）在 lastRun 里与普通点火轮逐字同形 —— 补两个如实
+            //   记账键，status 路由 / workbuddy_status / client 卡片据此区分"这一轮是回退轮"。
+            //   成功追发轮不靠这两键（由 transport/sessionOrigin/followUp 三键辨认）。
+            fallback: fallbackReason !== null,
+            fallbackReason,
             recycle: null,
             instance: null,
             sidecar: null,

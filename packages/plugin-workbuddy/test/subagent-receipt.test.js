@@ -183,10 +183,17 @@ test('★ 取消与故障在正文里读得出差别（旧的 `kind` 映射已�
 // ─────────────────────────────────────────────────────────────────────────────
 
 test('★ 词表对齐：`origin` / `continuity` 只发契约里逐字存在的取值，认不出的一律不回显', () => {
-  // origin：只有 new / loaded 两种（dispatch.js:573-576 的真机结论）。
+  // origin：new（点火自建）/ loaded（session/load 绑定）/ resumed（Track A 追发续用）。
   assert.ok(receiptNote(okReport({ sessionOrigin: 'new' })).includes('origin=new'));
   assert.ok(receiptNote(okReport({ sessionOrigin: 'loaded' })).includes('origin=loaded'));
-  const unknownOrigin = receiptNote(okReport({ sessionOrigin: 'resumed' }));
+  // ★★ 2026-10-03 语义升级（会话复用 Track A 接入子智能体面）：本行原先是对 'resumed' 的
+  //   **负控**（"认不出的来源不得回显"），随词表扩容**翻转为正控** —— `execute.js` 的追发分支
+  //   成功时回执带 `sessionOrigin:'resumed'`（同一条对话续用，不是新建），词表必须认它并回显，
+  //   否则追发轮在正文里读不出"接在哪条对话上"。翻转依据：resumed 现在是 notes.js 词表内的
+  //   合法值（notes.js origin 词表注释同日更新）。
+  assert.ok(receiptNote(okReport({ sessionOrigin: 'resumed' })).includes('origin=resumed'));
+  // ★ 负控保留（换上真正词表外的值）：认不出的来源仍不得回显 —— 回显等于把没验证过的值当成事实。
+  const unknownOrigin = receiptNote(okReport({ sessionOrigin: 'adopted' }));
   assert.equal(unknownOrigin.includes('origin='), false, '★ 认不出的来源不得回显 —— 回显等于把没验证过的值当成事实');
   assert.notEqual(unknownOrigin, '', '★ 自证：这条用例不是靠"整行都空"才通过的');
 
@@ -208,14 +215,18 @@ test('★ 词表对齐：`origin` / `continuity` 只发契约里逐字存在的�
 test('★ 契约纪律：任何回执形状下只发白名单里的键，别的字段一个都不外泄', () => {
   const BIT_KEYS = [
     'session=', 'origin=', 'continuity=', 'session-memory=',
+    'follow-up=', 'fallback=',
     'model-used=', 'model-chosen-by=', 'model-requested=',
     'phases=', 'stopReason=', 'outcome=', 'traceId=',
   ];
   const reports = [
     okReport(),
     okReport({ sessionOrigin: 'loaded' }),
+    okReport({ sessionOrigin: 'resumed', continuity: 'same-conversation' }),
     okReport({ continuity: 'same-conversation' }),
     okReport({ sessionMemory: 'mem-1' }),
+    okReport({ followUp: { channel: 'track_a', elapsedMs: 1234 } }),
+    okReport({ fallback: true, fallbackReason: 'ERR_WORKBUDDY_CDP_UNAVAILABLE' }),
     okReport({ usedModelId: 'fast-model' }),
     { ...okReport(), requestedModelId: '' },
     { ...okReport(), requestedModelId: 'deepseek-v4.1-flash' },
@@ -307,6 +318,55 @@ test('★ 记不住对话 id 时必须说出来（不许静默开新对话）', 
 
   // ★ 反向对照：没发生这件事就不许出现这一段（否则这句告示会变成常驻噪声）。
   assert.equal(receiptNote(okReport()).includes('session-memory='), false);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★ 追发位与回退位（2026-10-03，Track A 会话复用接入子智能体面）
+//   `follow-up=`（追发成功轮）与 `fallback=`（追发失败回退轮）各带各的事实，
+//   主控模型据此分辨"等了 9 秒的真追发"与"又开了一条新对话"。
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('★★ 追发成功轮：`follow-up=track_a in <ms>` 位必须出现；没有追发事实就不许出现', () => {
+  // execute.js 追发分支造的回执形状（不走 reportFromAutomation）：phases 只有一级。
+  const resumed = receiptNote({
+    ok: true,
+    transport: 'followup',
+    text: '续聊回答',
+    receipt: null,
+    sessionId: 'conv-7',
+    sessionOrigin: 'resumed',
+    continuity: 'same-conversation',
+    phases: ['followup-dispatch'],
+    requestedModelId: null,
+    usedModelId: null,
+    followUp: { channel: 'track_a', elapsedMs: 1234 },
+  });
+  assert.ok(resumed.includes('follow-up=track_a in 1234ms'), `追发位必须带通道与耗时；实际=${resumed}`);
+  assert.ok(resumed.includes('origin=resumed'), '追发轮的来源是续用，必须回显 resumed');
+  assert.ok(resumed.includes('continuity=same-conversation'), '真续接的人话解释必须在场');
+  assert.ok(resumed.includes('phases=followup-dispatch'), '追发轮的阶段轨迹如实只有一级');
+
+  // ★ 反向对照：没发生追发就不许出现这一位（否则它会变成常驻噪声）。
+  assert.equal(receiptNote(okReport()).includes('follow-up='), false);
+  assert.equal(receiptNote(okReport({ followUp: null })).includes('follow-up='), false);
+  // 耗时不可读时不编数字。
+  assert.equal(receiptNote(okReport({ followUp: { channel: 'track_a' } })).includes('follow-up='), false);
+});
+
+test('★★ 回退轮：`fallback=<code>` 位必须出现（追发失败 ⇒ 照旧点火成了新对话，归因不能丢）', () => {
+  const line = receiptNote({
+    ...okReport(),
+    fallback: true,
+    fallbackReason: 'ERR_WORKBUDDY_CDP_UNAVAILABLE',
+  });
+  assert.ok(line.includes('fallback=ERR_WORKBUDDY_CDP_UNAVAILABLE'), `回退轮必须带指纹码；实际=${line}`);
+  assert.ok(line.includes('ignited as a NEW conversation'), '必须说清后果：该轮是新对话，没接上前情');
+
+  // ★ 反向对照：没回退就不许出现这一位。
+  assert.equal(receiptNote(okReport()).includes('fallback='), false);
+  // 只有 fallbackReason 一件事的回执也不许被闸门吞成空串（形状变了也不会沉默）。
+  const bare = receiptNote({ ok: true, text: 'x', fallback: true, fallbackReason: 'ERR_DISPATCH_TIMEOUT' });
+  assert.ok(bare.includes('fallback=ERR_DISPATCH_TIMEOUT'), '只带回退事实的回执同样要能过闸');
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -88,13 +88,19 @@ export function reconcileSubagentProvider(ctx, { runtime, NS, dispatch, sessions
    * <p>传输面只有 `automation`（与 `tools/run.js` 同一路）：点火 `startAutomationRun`，
    * 不再走 `dispatch.run`。`dispatch` 参数仅为兼容旧调用方保留，不再被读取。
    *
-   * <p>多轮靠 `transcript` 重放前情（每轮都是新对话，该表无对话列），
-   * 点火在 `sessions.id` 一确认就 `retireRow` + `adopt(sessionKey)`，后续走复用不再建行。
-   */
+ * <p>多轮靠 `transcript` 重放前情（每轮都是新对话，该表无对话列），
+ * 点火在 `sessions.id` 一确认就 `retireRow` + `adopt(sessionKey)`，后续走复用不再建行。
+ * <p>★ 2026-10-03 起另有 Track A 追发支（会话复用）：总闸 `enableMultiTurnFollowUp` 开着且
+ * 记性命中时本轮不点火，直接追加进既有对话 —— 语义与接线见 `execute.js` 的追发块；
+ * 开关默认 false，关闭时执行口行为与未接线版本逐字节一致。
+ */
   let runTask = null;
   const ensureRunTask = () => {
     if (runTask === null) {
-      runTask = createTaskExecutor({ setting: (key) => read()?.[key], sessions });
+      // ★ 追发接线（Track A）：`setting` 让执行口现取 `enableMultiTurnFollowUp` /
+      //   `followupCdpPort` / `followupTimeoutMs`（.volatile() 字段必须现取，不能装配期拍死）；
+      //   `log` 透给追发调度器（CDP 判别/耗时日志，与工具面同一出口风格）。
+      runTask = createTaskExecutor({ setting: (key) => read()?.[key], sessions, log });
     }
     return runTask;
   };

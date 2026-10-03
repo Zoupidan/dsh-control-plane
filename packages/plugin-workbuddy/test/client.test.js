@@ -318,6 +318,11 @@ function autoRun(overrides = {}) {
     retired: null,
     sessionKey: '',
     resumed: false,
+    // ★ M2 会话复用可见性：host 的 noteRun 现在总产出这三个键（fallback 恒布尔、
+    //   fallbackReason 指纹码或 null、followUp 元数据或 null）—— 夹具形状保持与 host 同步。
+    fallback: false,
+    fallbackReason: null,
+    followUp: null,
     recycle: null,
     instance: null,
     sidecar: null,
@@ -956,6 +961,74 @@ test('判据④：任务失败 —— 人话主视图，归因码/编号/退出�
     assert.ok(fold.includes(leaked), `★ ${leaked} 必须在折叠里可核对`);
   }
   assert.ok(fold.includes('退出码：1'), '★ 退出码在折叠里可核对');
+});
+
+test('判据⑤：会话复用可见 —— 追发轮主视图一行人话，通道/耗时/origin/编号只进折叠', async () => {
+  const app = await boot({
+    scopeValue: { enabled: true, model: 'm1', effort: 'low' },
+    status: statusPayload({
+      lastRun: autoRun({
+        title: '续跑任务',
+        sessionId: 'conv-resumed-1',
+        transport: 'followup',
+        sessionOrigin: 'resumed',
+        resumed: true,
+        followUp: { channel: 'track_a', elapsedMs: 6217 },
+      }),
+    }),
+  });
+  app.expand();
+  app.flushEffects();
+  await settle();
+  const tree = app.expand();
+  const main = mainText(tree);
+  const fold = foldText(tree);
+  assert.ok(main.includes('会话复用：复用上次对话续发'), '★ 复用续发必须显示（主视图人话）');
+  for (const leaked of ['track_a', '6217', 'resumed', 'conv-resumed-1']) {
+    assert.equal(main.includes(leaked), false, `★ ${leaked} 不得出现在主视图（只进折叠）`);
+    assert.ok(fold.includes(leaked), `★ ${leaked} 必须在折叠里可核对`);
+  }
+  assert.ok(fold.includes('追发通道：track_a · 6217ms'), '★ 追发通道与耗时的折叠记账行');
+  assert.ok(fold.includes('会话来源：resumed'), '★ 会话来源枚举在折叠里可核对');
+});
+
+test('判据⑤：回退轮 —— 主视图说"已回退新开"，指纹码只进折叠', async () => {
+  const app = await boot({
+    scopeValue: { enabled: true, model: 'm1', effort: 'low' },
+    status: statusPayload({
+      lastRun: autoRun({
+        title: '回退轮',
+        sessionId: 'conv-fallback-1',
+        fallback: true,
+        fallbackReason: 'ERR_WORKBUDDY_CDP_UNAVAILABLE',
+      }),
+    }),
+  });
+  app.expand();
+  app.flushEffects();
+  await settle();
+  const tree = app.expand();
+  const main = mainText(tree);
+  const fold = foldText(tree);
+  assert.ok(main.includes('会话复用：续发失败，已回退新开对话'), '★ 回退轮必须有人话（主视图）');
+  assert.equal(main.includes('ERR_WORKBUDDY_CDP_UNAVAILABLE'), false, '★ 回退指纹码不得进主视图');
+  assert.ok(fold.includes('回退原因：ERR_WORKBUDDY_CDP_UNAVAILABLE'), '★ 回退原因在折叠里可核对');
+  assert.equal(fold.includes('会话来源：resumed'), false, '★ 回退轮的 origin 是 new/null，不得冒充 resumed');
+});
+
+test('判据⑤：默认轮（开关关闭的既有形状）不渲染任何追发字样 —— 未知不编造', async () => {
+  const app = await boot({
+    scopeValue: { enabled: true, model: 'm1', effort: 'low' },
+    status: statusPayload({
+      lastRun: autoRun({ title: '普通轮', sessionId: 'conv-plain-1', retired: true, createdAt: 1727846400000 }),
+    }),
+  });
+  app.expand();
+  app.flushEffects();
+  await settle();
+  const main = mainText(app.expand());
+  assert.equal(main.includes('会话复用'), false, '★ 普通点火轮不得出现"会话复用"行');
+  assert.equal(main.includes('追发'), false, '★ 普通点火轮不得出现任何追发字样');
 });
 
 test('判据④：未安装 ⇒ ○ 未安装 + 开关置灰 + 探测证据只进折叠（S1 责任归属）', async () => {

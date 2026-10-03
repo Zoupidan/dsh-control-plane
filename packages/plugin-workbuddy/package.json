@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-workbuddy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "WorkBuddy CLI as model-facing dsh tools (spawned via ctx.subprocess, tracked via ctx.jobs).",

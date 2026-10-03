@@ -986,11 +986,17 @@ export function startAutomationRun({
         const waited = Date.now() - t0;
         if (!sawRun && waited > AUTOMATION_DEFAULTS.ignitionGraceMs) {
           // ★ 这一条是**最有信息量的失败**：行写进去了、库也认了，但调度器没接住。
-          //   原因可能是桌面端没在跑、版本里没有这个调度器、或 id/字段形态被它拒了——
-          //   所以把"写进去了什么"一并印出来，让下一个人不用重跑一遍才能查。
+          //   原因可能是桌面端没在跑、版本里没有这个调度器、id/字段形态被它拒了，
+          //   或（2026-10-03 真机事故）**调度器按登录账号做了归属隔离**：owner_user_id
+          //   ≠ 当前登录 uid 的行被 fail-closed 过滤——零日志、零 dispatch。所以把
+          //   "写进去了什么（含 owner）"一并印出来，让下一个人不用重跑一遍才能查。
           return fail(REASON_CODES.TASK_ERROR,
-            `the automation row was written (${automationId}) but no automation_runs row appeared within ${AUTOMATION_DEFAULTS.ignitionGraceMs}ms`
-            + ' — the desktop scheduler did not pick it up. Check that the WorkBuddy desktop is running, and read'
+            `the automation row was written (${automationId}, owner_user_id=${ownerUserId === null ? 'NULL/legacy_unassigned' : ownerUserId})`
+            + ` but no automation_runs row appeared within ${AUTOMATION_DEFAULTS.ignitionGraceMs}ms`
+            + ' — the desktop scheduler did not pick it up. The scheduler only dispatches rows owned by the'
+            + ' currently logged-in desktop account (owner-isolated, fail-closed): if the WorkBuddy desktop is'
+            + ' logged into a different account than when this row\'s owner was resolved, the row is invisible'
+            + ' and will never fire. Check that the WorkBuddy desktop is running and logged in, and read'
             + ` ${join(workbuddyHome(), 'logs', 'automation.log')} for a dispatch line.`);
         }
         if (waited > timeoutMs) {

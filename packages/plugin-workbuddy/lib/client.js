@@ -160,6 +160,14 @@ window.__ModuleLoader__.load({
             stderrPrefix: '原始错误输出：',
             sessionPrefix: '会话：',
             automationPrefix: '任务编号：',
+            /** ★ M2 会话复用可见性：主视图一行人话（复用续发 / 回退新开）；通道、耗时、
+             *  指纹码、origin 枚举是内部串，只进折叠（折叠纪律同上）。 */
+            reusePrefix: '会话复用：',
+            reusedText: '复用上次对话续发',
+            fallbackText: '续发失败，已回退新开对话',
+            followUpPrefix: '追发通道：',
+            fallbackReasonPrefix: '回退原因：',
+            originPrefix: '会话来源：',
           },
           /** 状态区。 */
           status: {
@@ -984,6 +992,30 @@ window.__ModuleLoader__.load({
           }
           if (aid !== '') {
             fold.push(h('div', { className: 'dsh-wb-status__line dsh-wb-status__mono', key: 'fold-automation' }, t.automationPrefix + aid));
+          }
+        }
+        // ★ M2 会话复用可见性：主视图只说人话（复用续发 / 回退新开）；通道、耗时、指纹码、
+        //   origin 枚举是内部串，只进折叠。缺字段（开关关闭时的历史轮）⇒ 不渲染（未知不编造）。
+        if (lastRun.resumed === true) {
+          lines.push(h('div', { className: 'dsh-wb-status__line', key: 'task-reuse' }, t.reusePrefix + t.reusedText));
+        } else if (lastRun.fallback === true) {
+          lines.push(h('div', { className: 'dsh-wb-status__line dsh-wb-warn', key: 'task-reuse' }, t.reusePrefix + t.fallbackText));
+        }
+        {
+          const fu = lastRun.followUp !== null && typeof lastRun.followUp === 'object' ? lastRun.followUp : null;
+          const ch = fu !== null && typeof fu.channel === 'string' ? fu.channel : '';
+          const ms = fu !== null && Number.isFinite(fu.elapsedMs) ? String(fu.elapsedMs) : '';
+          if (ch !== '' || ms !== '') {
+            fold.push(h('div', { className: 'dsh-wb-status__line dsh-wb-status__mono', key: 'fold-followup' },
+              t.followUpPrefix + [ch, ms !== '' ? ms + 'ms' : ''].filter(Boolean).join(' · ')));
+          }
+          if (lastRun.fallback === true && typeof lastRun.fallbackReason === 'string' && lastRun.fallbackReason !== '') {
+            fold.push(h('div', { className: 'dsh-wb-status__line dsh-wb-status__mono', key: 'fold-fallback-reason' },
+              t.fallbackReasonPrefix + lastRun.fallbackReason));
+          }
+          if (typeof lastRun.sessionOrigin === 'string' && lastRun.sessionOrigin !== '') {
+            fold.push(h('div', { className: 'dsh-wb-status__line dsh-wb-status__mono', key: 'fold-origin' },
+              t.originPrefix + lastRun.sessionOrigin));
           }
         }
         // 实际模型与强度（折叠）：它们是"上次实际用了什么"的记账，不是本次配置 ⇒ 不进配置行，去折叠。

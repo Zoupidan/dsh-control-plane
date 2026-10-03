@@ -16,6 +16,15 @@
  * <p>每轮都是新对话（该表无对话列）：同任务多轮靠 `transcript` 重放前情，
  * 并在回执里如实标 `continuity='fresh-conversation-per-round'`。
  *
+ * <p>★ 会话复用（Track A 追发，2026-10-03 接入；与 `tools/run.js` 同一条三条件语义）★
+ *
+ * <p>设置总闸 `enableMultiTurnFollowUp` 开着且记性命中可续接对话时，本轮**不点火**：
+ * 走 `followup/dispatcher.js` 把 prompt 直接追加进**既有** WorkBuddy 对话（CDP 直发）。
+ * 与 `run.js` 的差别只有一处 —— 这里不重放 `replayPrefix`：追发进的是**同一条**对话，
+ * 前情本来就在里面，重放会把同样的历史说第二遍。追发失败 ⇒ `forget(指纹码)` 作废记性，
+ * 然后**照旧**走既有的重放 + 点火路，回执追加 `{fallback, fallbackReason}` 两键。
+ * 开关关闭 / 记性未命中 ⇒ 本文件行为与未接线版本逐字节一致（连记性都不查，短路在总闸之后）。
+ *
  * <p>约束：本文件属于 packages 下的 src（CI ② 扫描范围）—— 不得出现裸进程出口字样。
  *
  * @module host/subagent/execute
@@ -23,6 +32,7 @@
 
 import { REASON_CODES } from '../launch/reason-codes.js';
 import { startAutomationRun } from '../gateway/automation.js';
+import { createFollowUpDispatcher, packageContentBlocks } from '../followup/dispatcher.js';
 
 /**
  * 传输面归一：只有 `automation`。保留该函数只为兼容配置里的显式传值；
@@ -132,15 +142,25 @@ export function reportFromAutomation(out) {
  * @param {object} deps
  * @param {(o: object) => {cancel: () => void, done: Promise<object>, readOutput: () => string}|null} [deps.automation]
  *   点火函数（默认真 `startAutomationRun`；测试可注入假点火以不碰真库）。
- * @param {(key: string) => unknown} [deps.setting] 读插件配置。
+ * @param {(key: string) => unknown} [deps.setting] 读插件配置（追发总闸与 CDP 口/超时由此现取）。
  * @param {(phase: string) => void} [deps.onPhase] 阶段回调（可选）。
- * @param {{lookup?: (k: string) => {cliSessionId: string}|null, adopt?: (k: string, r: object) => object}|null} [deps.sessions]
+ * @param {{lookup?: (k: string) => {cliSessionId: string}|null, adopt?: (k: string, r: object) => object,
+ *           resumable?: (k: string) => {cliSessionId: string, cwd: string|null}|null,
+ *           touch?: (k: string) => object, forget?: (k: string, reason?: string) => object}|null} [deps.sessions]
  *   会话记性：拿到 `sessions.id` 后立刻 `adopt(sessionKey)`，后续走复用不再建行；
- *   当前主路每轮仍是新对话（该表无对话列），记性只做"后续复用"的账，不做本轮续接。
+ *   追发接线（Track A）用 `resumable` 查可续接对话、`touch` 推进热度戳、`forget(指纹码)` 作废记性。
+ * @param {(req: {conversationId: string, prompt: Array<{type: string, text?: unknown}>, timeoutMs?: number,
+ *           cdpPort?: number}) => Promise<{ok: true, channel: string, receipt: object} |
+ *           {ok: false, code: string, detail: string}>} [deps.followUp]
+ *   ★ 追发 seam（**只为可测而开**，与 `tools/run.js` 的 `seams.followUp` 同风格）：
+ *   缺省时惰性构造真 `createFollowUpDispatcher(...).followUp` —— 构造点在开关**与**记性都命中之后，
+ *   开关关闭时一次都不会构造。注入件供测试/上层复用，绕开真 CDP。
+ * @param {(message: string) => void} [deps.log] 追发调度的日志出口（缺省静默）。
  * @returns {(req: object) => Promise<object>} 返回统一形状回执的函数。
  */
-export function createTaskExecutor({ automation = null, setting = () => undefined, onPhase = null, sessions = null } = {}) {
-  void setting;
+export function createTaskExecutor({
+  automation = null, setting = () => undefined, onPhase = null, sessions = null, followUp = null, log = null,
+} = {}) {
   /** @type {Map<string, Array<{role: 'user'|'assistant', text: string}>>} */
   const transcript = new Map();
   const MAX_TURNS = 8;
@@ -199,6 +219,128 @@ export function createTaskExecutor({ automation = null, setting = () => undefine
         effort: { requested: '', effective: '(unknown)', confirmed: false },
       };
     }
+    // ═══ M2 Track A 追发（会话复用；与 `tools/run.js` 同一条三条件语义，第二个调用点）══════
+    // 触发条件（三条同时成立；任一不成立 ⇒ 本块整体跳过，行为与未接线版本逐字节一致）：
+    //   ① setting('enableMultiTurnFollowUp') === true（设置总闸，默认 false —— 关闭时**绝不构造** dispatcher，
+    //     连记性都不查：短路在总闸之后）
+    //   ② taskKey 非空（没有归组键就没有"同一条对话"可言）
+    //   ③ sessions.resumable(taskKey) 命中可续接对话
+    // 与 `run.js` 的语义差别只有一处：这里**不重放 replayPrefix** —— 追发进的是**同一条**对话，
+    // 前情本来就在里面，重放会把同样的历史说第二遍。
+    // 成功 ⇒ 不点火（零 INSERT）、不 forget 不 adopt（会话 id 没变，只 `touch` 推进热度戳 ——
+    //       `sweepOwnSessions` 按 lastUsedAt 判陈旧），回执 `sessionOrigin='resumed'` /
+    //       `continuity='same-conversation'`（词表见 notes.js，2026-10-03 起认 'resumed'）。
+    // 失败 ⇒ `sessions.forget(taskKey, <指纹码>)` 作废记性（死 id 不得留在记性里），然后**照旧**
+    //       replayPrefix + 点火；回执追加 `{ fallback:true, fallbackReason:<码> }`，指纹码同时
+    //       拼进失败诊断（见下方 `withFallback` 出口装饰）。
+    // 两条纪律（与 run.js 同款）：绝不抛（异常也收敛为回退）；绝不静默（走向写在回执与正文里）。
+    let followUpMeta = null;    // 成功：{ channel, elapsedMs, conversationId }
+    let fallbackReason = null;  // 失败：RFC §4.2 指纹码（execute 层字段 fallbackReason）
+    const followUpWanted = setting('enableMultiTurnFollowUp') === true;
+    const recorded = (followUpWanted && taskKey !== '' && sessions !== null && typeof sessions.resumable === 'function')
+      ? sessions.resumable(taskKey)
+      : null;
+    if (recorded !== null && typeof recorded.cliSessionId === 'string' && recorded.cliSessionId !== '') {
+      // ★ seam：注入的 followUp（测试/上层复用）优先；缺省惰性构造真 dispatcher ——
+      //   构造点在开关**与**记性都命中之后，开关关闭时一次都不会构造（run.js 的 seams 同风格）。
+      const followUpFn = typeof followUp === 'function'
+        ? followUp
+        : createFollowUpDispatcher({
+          cdpPort: setting('followupCdpPort'),
+          timeoutMs: setting('followupTimeoutMs'),
+          log: typeof log === 'function' ? log : () => {},
+        }).followUp;
+      const startedAt = Date.now();
+      let outcome;
+      try {
+        outcome = await followUpFn({
+          conversationId: recorded.cliSessionId,
+          // ★ prompt 必须打包成 ContentBlock 数组（桌面端拒收裸字符串；run.js 双保险同款）。
+          prompt: packageContentBlocks(prompt),
+          timeoutMs: setting('followupTimeoutMs'),
+          cdpPort: setting('followupCdpPort'),
+        });
+      } catch (err) {
+        // dispatcher 的契约是**永不抛**（错误一律收敛 ok:false）；这里兜的是注入件/未来回归，
+        // 归因不明 ⇒ RFC 之外的 catch-all 指纹，绝不让异常炸掉本轮。
+        outcome = { ok: false, code: 'ERR_FOLLOWUP_FAILED', detail: err instanceof Error ? err.message : String(err) };
+      }
+      if (outcome !== null && typeof outcome === 'object' && outcome.ok === true) {
+        const output = typeof outcome.receipt?.output === 'string' ? outcome.receipt.output : '';
+        followUpMeta = {
+          channel: typeof outcome.channel === 'string' && outcome.channel !== '' ? outcome.channel : 'track_a',
+          elapsedMs: Date.now() - startedAt,
+          conversationId: recorded.cliSessionId,
+        };
+        // ★ 成功：只推进热度戳（会话 id 没变 ⇒ 不 adopt 不 forget，run.js 同款）。
+        try {
+          if (typeof sessions.touch === 'function') sessions.touch(taskKey);
+        } catch { /* 热度戳失败不改判追发成败（下轮点火 adopt 会再记账） */ }
+        // ★ 追发轮同样落转写：万一这条对话日后消失，回退轮的新对话仍能带上完整前情。
+        pushTurn(taskKey, 'user', prompt);
+        if (output.trim() !== '') pushTurn(taskKey, 'assistant', output);
+        // ★★ 追发轮回执：不走 reportFromAutomation（这一趟没有 automations 行，也没有
+        //   ACP 消息链）—— 字段形状与它对齐，缺的事实如实 null/false，绝不编。
+        return {
+          ok: true,
+          transport: 'followup',
+          text: output,
+          reason: REASON_CODES.OK,
+          phases: ['followup-dispatch'],
+          receipt: null,
+          sessionId: recorded.cliSessionId,
+          // ★ 同一条对话续用：origin 用 'resumed'（notes.js 词表 2026-10-03 起认它），不谎称 'new'。
+          sessionOrigin: 'resumed',
+          continuity: 'same-conversation',
+          // 追发沿用对话现配 ⇒ 请求/生效值都未知，如实 '(unknown)'，不编造。
+          permission: { requested: '', effective: '(unknown)', confirmed: false },
+          effort: { requested: '', effective: '(unknown)', confirmed: false },
+          requestedEffort: '',
+          effectiveEffort: null,
+          usedModelId: null,
+          requestedModelId: null,
+          usage: null,
+          automationId: null,
+          title: null,
+          createdAt: new Date().toISOString(),
+          transcriptPath: null,
+          cwd: typeof req.cwd === 'string' ? req.cwd : null,
+          // ★ 追发元数据：notes.js 据此渲染 `follow-up=<channel> in <ms>` 位。
+          followUp: { channel: followUpMeta.channel, elapsedMs: followUpMeta.elapsedMs },
+        };
+      }
+      fallbackReason = typeof outcome?.code === 'string' && outcome.code !== ''
+        ? outcome.code
+        : 'ERR_FOLLOWUP_FAILED';
+      // ★ 失败：指纹码作废记性（RFC §4.2 —— 死 id 不得留在记性里），随后照旧点火新会话。
+      try {
+        if (typeof sessions.forget === 'function') sessions.forget(taskKey, fallbackReason);
+      } catch { /* 回收失败 = 下轮多建一次，不拦兜底 */ }
+    }
+    // ★★ 回退轮（追发失败 ⇒ 照旧点火）的**统一出口装饰**：execute 层两键 + 失败诊断里带指纹码。
+    //   `fallbackReason` 给 notes.js 渲染 `fallback=<code>` 位；诊断合并点在 `error.message` 上
+    //   （`failureDetailFor` 的 message 直通道）—— 否则读者只看到点火失败，看不到"追发先折在这里"。
+    //   点火照旧成功时只带两键，不加失败话术。点火路有**三个**返回点（点火抛 / done 抛 /
+    //   reportFromAutomation），全都得过这道装饰 —— 只装饰最后一处会让前两条失败路把
+    //   "为什么没追发成"静默吞掉。
+    const withFallback = (r) => {
+      if (fallbackReason === null) return r;
+      return {
+        ...r,
+        fallback: true,
+        fallbackReason,
+        ...(r?.ok !== true
+          ? {
+            error: {
+              code: r?.error?.code ?? REASON_CODES.TASK_ERROR,
+              message: `${typeof r?.error?.message === 'string' ? r.error.message : ''} · follow-up fallback `
+                + `${fallbackReason}: the recorded conversation could not be continued, so this round ignited a new one`,
+            },
+          }
+          : {}),
+      };
+    };
+
     const ignite = typeof automation === 'function' ? automation : startAutomationRun;
     const requestedModel = automationModelId(req.model);
     const requestedPerm = typeof req.permissionMode === 'string' ? req.permissionMode : '';
@@ -226,7 +368,7 @@ export function createTaskExecutor({ automation = null, setting = () => undefine
         ...(typeof onPhase === 'function' ? { onPhase } : {}),
       });
     } catch (err) {
-      return {
+      return withFallback({
         ok: false,
         transport: 'automation',
         text: '',
@@ -239,7 +381,7 @@ export function createTaskExecutor({ automation = null, setting = () => undefine
         continuity: 'fresh-conversation-per-round',
         permission: { requested: requestedPerm, effective: '(unknown)', confirmed: false },
         effort: { requested: requestedEffort, effective: '(unknown)', confirmed: false },
-      };
+      });
     }
     let out;
     try {
@@ -250,7 +392,7 @@ export function createTaskExecutor({ automation = null, setting = () => undefine
         out = await handle;
       }
     } catch (err) {
-      return {
+      return withFallback({
         ok: false,
         transport: 'automation',
         text: '',
@@ -263,9 +405,9 @@ export function createTaskExecutor({ automation = null, setting = () => undefine
         continuity: 'fresh-conversation-per-round',
         permission: { requested: requestedPerm, effective: '(unknown)', confirmed: false },
         effort: { requested: requestedEffort, effective: '(unknown)', confirmed: false },
-      };
+      });
     }
-    const report = reportFromAutomation(out);
+    const report = withFallback(reportFromAutomation(out));
     // 补上"请求了哪个"（点火回执里没有这两列，由本层如实带出，不编造实际值）。
     if (report.permission !== null && typeof report.permission === 'object') {
       const eff = typeof report.permission.effective === 'string' ? report.permission.effective : '(unknown)';

@@ -58,6 +58,20 @@
         # 等目标实例出现的窗口（毫秒）。30s 的依据：桌面端激活 prewarm sidecar 实测 1–3s，
         #   30s 覆盖"慢盘/杀软冷扫"；再大就是让用户对着一个本轮注定失败的作业干等。
         instanceTimeoutMs: 30000
+        # ── 多轮追发（★ 2026-10-03 M2 新增；RFC-SESSION-RESUME-INTEGRATION）────────
+        # Track A（CDP 直发既有对话）总闸，**默认 false**（opt-in）。开着时仅当调用方
+        #   resume:true 且记性命中，workbuddy_run 才先尝试追发进既有对话；失败按 RFC §4.2
+        #   优雅回退（forget 记性 → 照旧点火新会话）。默认关的依据：回执形状/参数打包为
+        #   探针逆向所得，pending live calibration，未过真机校准不得默认启用。
+        enableMultiTurnFollowUp: false
+        # Track A 的 CDP 远程调试口（桌面端以 WORKBUDDY_REMOTE_DEBUGGING_PORT 启动才监听）。
+        #   9222 与外部 Chrome/Edge 调试口共用是常态 ⇒ UA + target 指纹双证据判别
+        #   （真机 2026-10-03：/json/version 的 Browser 只写 "Chrome/138…"，身份在 User-Agent），
+        #   不是 WorkBuddy 时如实报 ERR_NON_WORKBUDDY_CDP_TARGET 并回退，绝不劫持。
+        followupCdpPort: 9222
+        # 追发确认超时（毫秒，默认 180000）。真机实测（2026-10-03）首转 13.4s（模型 worker
+        #   冷启动）、次转 9.1s ⇒ 15s 在冷启动边缘，180s 留足慢机余量；超时即回退点火新会话。
+        followupTimeoutMs: 180000
         # ── 传输面（★ 2026-10-02 切回 automation 为默认）──────────────
         # automation = 插件往桌面端自己的计划任务表（`~/.workbuddy/workbuddy.db` 的
         #   `automations`）写一条**一次性**任务，由**桌面端自己的调度器**开一个新会话并把

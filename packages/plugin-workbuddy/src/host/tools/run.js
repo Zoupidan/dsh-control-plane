@@ -13,6 +13,11 @@
  *     附 `model_id` / `permission_mode` / `cwd`；建会话成功立刻 `retireRow` 软删，
  *     任何终态都退役，启动期扫遗留活行全软删（止损就靠删行）。
  *
+ * ★ M2 追加一条 **opt-in** 的追发面（RFC-SESSION-RESUME-INTEGRATION）：`resume:true` +
+ *   `enableMultiTurnFollowUp`（默认 false）+ 记性命中时，先尝试把 prompt 追发进**既有**
+ *   对话（Track A，`followup/dispatcher.js`）；失败优雅回退到上面那条 automation 主路。
+ *   开关关闭（默认）时本文件行为与未接线版本逐字节一致。
+ *
  * 形态要点（全部 `实测`，见 §3.4.3 表 + 真机 `dsh-jobs-local/lib/index.js:127-142`）：
  *   - `defineTool` 的 `output.render` 必需（顶层 render ⇒ 定义期 TypeError）；
  *   - `ctx.jobs.start(spec)` **同步**返回 JobId，且**同步调用 `spec.run()`**；start 前会校验
@@ -27,8 +32,9 @@
  */
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
-import { EFFORT_LEVELS, TOOL_RUN } from '../../shared/constants.js';
+import { EFFORT_LEVELS, PLUGIN_ID, TOOL_RUN } from '../../shared/constants.js';
 import { OUTPUT_LIMIT_BYTES, REGISTRY_STATES } from '../config/constants.js';
+import { createFollowUpDispatcher, packageContentBlocks } from '../followup/dispatcher.js';
 import { REASON_CODES } from '../launch/reason-codes.js';
 import { automationHeader, startAutomationRun } from '../gateway/automation.js';
 import { cheapestModelId, desktopModels } from '../launch/desktop-models.js';
@@ -208,10 +214,13 @@ const MODEL_ARG_DESCRIPTION =
  * @param {object} ctx 宿主 ctx（取 ctx.jobs）
  * @param {object|null} [credits]
  * @param {object|null} [dispatch] 未使用（网关已禁用，保留参数仅为兼容旧调用方，不再走网关任何接口）
- * @param {{ automationRun?: Function, catalog?: { projection: Function } }} [seams] **只为可测而开**的覆盖：
+ * @param {{ automationRun?: Function, catalog?: { projection: Function }, followUp?: Function }} [seams] **只为可测而开**的覆盖：
  *   `automationRun` 默认走真 `startAutomationRun`（首轮唯一写入点）；
  *   `catalog` 默认读共享 `desktopModels` 单例
- *   （测试经 `catalog.projection()` 注入假目录，永不触真机 IPC）。
+ *   （测试经 `catalog.projection()` 注入假目录，永不触真机 IPC）；
+ *   `followUp` 默认 = **惰性构造**的 `createFollowUpDispatcher(...).followUp`（Track A 追发，
+ *   M2；总闸 `enableMultiTurnFollowUp` 关闭时**绝不构造**——零网络、零套接字），
+ *   测试注入 fake 以断言接线与回退顺序。
  */
 export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatch = null, seams = {}) => defineTool({
   name: TOOL_RUN,
@@ -307,12 +316,41 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
           description: 'Requested inputs that were NOT sent, one human-readable line each ' +
             '(empty = everything requested was dispatched).',
         },
+        // ★ M2 追发（三键都**条件性出现** —— 开关关闭时回执键集与既有逐字一致，hardening 的
+        //   "返回值键集应与声明逐字一致"断言因此不受影响）：
+        follow_up: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            channel: { type: 'string', required: true },
+            elapsedMs: { type: 'number', required: true },
+          },
+          description: 'Present only when the prompt was appended to the EXISTING conversation ' +
+            '(resume:true + enableMultiTurnFollowUp): follow-up transport (track_a) and elapsed time.',
+        },
+        fallback: {
+          type: 'boolean',
+          description: 'Present only when the follow-up attempt failed and the run fell back to a ' +
+            'fresh automation session; resumed stays false in that case.',
+        },
+        fallbackReason: {
+          type: 'string',
+          description: 'Canonical error fingerprint (RFC §4.2, e.g. ERR_WORKBUDDY_CDP_UNAVAILABLE) ' +
+            'that triggered the fallback; present only alongside fallback:true.',
+        },
       },
     },
     render: (_args, value) => [{
       type: 'text',
       text: `started job ${value.job_id} (session ${value.session_key}, ` +
         (value.resumed === true ? `resumed ${value.resumed_session_id})` : 'new session)') +
+        // ★ M2：追发走向一行说清（成功 = 经哪条通道耗时多少；失败 = 指纹码 + 已回退新会话）。
+        (value.follow_up !== undefined && value.follow_up !== null
+          ? ` · follow-up delivered via ${value.follow_up.channel} in ${value.follow_up.elapsedMs}ms`
+          : '') +
+        (value.fallback === true
+          ? ` · follow-up failed (${String(value.fallbackReason ?? 'unknown reason')}); started a fresh session instead`
+          : '') +
         `\nargv: ${value.argv_preview}` +
         (Array.isArray(value.not_sent) && value.not_sent.length > 0
           ? `\n${value.not_sent.join('\n')}`
@@ -386,6 +424,64 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
       );
     }
 
+    // ═══ M2 多轮追发（Track A；RFC-SESSION-RESUME-INTEGRATION §3.2/§4.2 状态机 S2）══════
+    // 触发条件（三条同时成立；任一不成立 ⇒ 本块整体跳过，行为与未接线版本逐字节一致）：
+    //   ① args.resume === true（调用方显式续接意图；省略/false 一律不追发）
+    //   ② c.enableMultiTurnFollowUp === true（设置总闸，默认 false —— 关闭时**绝不构造** dispatcher）
+    //   ③ recorded !== null（记性命中可续接会话；上一段已保证 resume:true 必有记录）
+    // 成功 ⇒ `sessions.touch(sessionKey)`（同一条对话续用，只推进热度戳），回执 resumed:true
+    //       并带追发元数据；失败 ⇒ `sessions.forget(sessionKey, <指纹码>)` 作废记性，然后走
+    //       **完全不变**的既有点火路径，回执追加 { fallback:true, fallbackReason:<码> }。
+    // 两条纪律：绝不抛（异常也收敛为回退）；绝不静默（走向写在回执与 lastRun 里）。
+    let followUpMeta = null;    // 成功：{ channel, elapsedMs, conversationId, output }
+    let fallbackReason = null;  // 失败：RFC §4.2 指纹码（回执 fallbackReason）
+    if (intent === true && recorded !== null && c.enableMultiTurnFollowUp === true) {
+      const followUpFn = typeof seams.followUp === 'function'
+        ? seams.followUp
+        : createFollowUpDispatcher({
+          cdpPort: c.followupCdpPort,
+          timeoutMs: c.followupTimeoutMs,
+          log: (message) => ctx.logger?.warn?.(`[${PLUGIN_ID}] ${message}`),
+        }).followUp;
+      const startedAt = Date.now();
+      let outcome = null;
+      try {
+        // ★ prompt 必须 ContentBlock 数组打包（桌面端拒收裸字符串）；裸字符串在 dispatcher
+        //   侧同样被拒 —— 双保险，契约见 followup/dispatcher.js。
+        outcome = await followUpFn({
+          conversationId: recorded.cliSessionId,
+          prompt: packageContentBlocks(args.prompt),
+          timeoutMs: c.followupTimeoutMs,
+        });
+      } catch (err) {
+        // dispatcher 的契约是**永不抛**（错误一律收敛 ok:false）；这里兜的是注入件/未来回归，
+        // 归因不明 ⇒ RFC 之外的 catch-all 指纹，绝不让异常炸掉本轮。
+        outcome = { ok: false, code: 'ERR_FOLLOWUP_FAILED', detail: err instanceof Error ? err.message : String(err) };
+      }
+      if (outcome !== null && typeof outcome === 'object' && outcome.ok === true) {
+        followUpMeta = {
+          channel: typeof outcome.channel === 'string' && outcome.channel !== '' ? outcome.channel : 'track_a',
+          elapsedMs: Date.now() - startedAt,
+          conversationId: recorded.cliSessionId,
+          output: typeof outcome.receipt?.output === 'string' ? outcome.receipt.output : '',
+        };
+        // ★ 成功：不 forget 不 adopt（会话 id 没变），只把热度戳推进 —— `sweepOwnSessions`
+        //   按 lastUsedAt 判陈旧，不 touch 的追发会话会在 7 天后被误判成无人认领的遗留。
+        try {
+          if (typeof sessions?.touch === 'function') sessions.touch(sessionKey);
+        } catch { /* 热度戳失败不改判追发成败（下轮点火 adopt 会再记账） */ }
+      } else {
+        fallbackReason = typeof outcome?.code === 'string' && outcome.code !== ''
+          ? outcome.code
+          : 'ERR_FOLLOWUP_FAILED';
+        // ★ 失败：指纹码作废记性（RFC §4.2 —— 死 id 不得留在记性里），随后照旧点火新会话。
+        try {
+          if (typeof sessions?.forget === 'function') sessions.forget(sessionKey, fallbackReason);
+          else if (typeof sessions?.supersede === 'function') sessions.supersede(sessionKey);
+        } catch { /* 回收失败 = 下轮多建一次，不拦兜底 */ }
+      }
+    }
+
     // ═══ 可二次下发：每轮都走点火 INSERT 一行 once，不再有“已记住就失败”分支 ═══
     //   `sessionStore` 按 `session_key` 记 own 映射（`adopt` 记住、`lookup`/`resumable` 查、
     //   `forget` 回收，均在 `session/map.js`）。职责：调用方只传 `session_key` + `resume`，
@@ -447,16 +543,47 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
           : {}),
       }
       : null;
-    const a = (seams.automationRun ?? startAutomationRun)({
-      prompt: args.prompt,
-      cwd: autoCwd,
-      modelId: await awaitModelId(args, c),
-      permissionMode: requestedPerm,
-      reasoningEffort: requestedEffort,
-      sessionKey,
-      ...(automationSessionStore !== null ? { sessionStore: automationSessionStore } : {}),
-      signal: exec.signal,
-    });
+    // ★ M2 三分支：追发成功 ⇒ 作业包**已完成**的追发结果（不点火、零 INSERT，见下方 automation
+    //   造型的"无行可退"如实记账）；追发失败/未尝试 ⇒ 完全不变的既有点火路径。
+    const a = followUpMeta !== null
+      ? {
+        cancel: () => { /* Track A 无行无进程可撤：prompt 已进入那条对话，不存在"撤回点火行"这回事 */ },
+        done: Promise.resolve({
+          status: 'completed',
+          detail: followUpMeta.output,
+          exitCode: 0,
+          automation: {
+            reason: null,
+            // ★ Track A 不写 automations 表 ⇒ 四方闭合的"行"两角如实为无（automationId=null、
+            //   retired=false）—— 回执照常可查，只是查到的是"没建过行"这个事实。
+            automationId: null,
+            conversationId: followUpMeta.conversationId,
+            sessionId: followUpMeta.conversationId,
+            sessionKey: sessionKey === '' ? null : sessionKey,
+            sessionPersist: null,
+            retired: false,
+            transcriptPath: null,
+            reply: followUpMeta.output !== '' ? followUpMeta.output : null,
+            creditsUsed: null, model: null, permission: null,
+            usedModelId: null, sessionCwd: null,
+            // 追发沿用对话现配 ⇒ requested/effective 均未知（pending live calibration：回执未带模型面）。
+            requestedEffort: null, effectiveEffort: null, effort: null,
+            title: null, createdAt: null, tokensUsed: null,
+            phases: ['followup-dispatch'],
+          },
+        }),
+        readOutput: () => followUpMeta.output,
+      }
+      : (seams.automationRun ?? startAutomationRun)({
+        prompt: args.prompt,
+        cwd: autoCwd,
+        modelId: await awaitModelId(args, c),
+        permissionMode: requestedPerm,
+        reasoningEffort: requestedEffort,
+        sessionKey,
+        ...(automationSessionStore !== null ? { sessionStore: automationSessionStore } : {}),
+        signal: exec.signal,
+      });
     const aJobId = ctx.jobs.start({
       kind: 'workbuddy',
       label: args.prompt.slice(0, 60),
@@ -500,7 +627,8 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
           const effEffRaw = typeof au.effectiveEffort === 'string' ? au.effectiveEffort
             : (typeof au.effort === 'string' ? au.effort : '');
           runtime.noteRun({
-            transport: 'automation',
+            // ★ M2：追发轮的 transport 如实记 'followup'（不是 automation —— 它没建行）。
+            transport: followUpMeta !== null ? 'followup' : 'automation',
             at: Date.now(),
             exitCode: typeof out.exitCode === 'number' ? out.exitCode : null,
             reasonCode: status === 'completed' ? REASON_CODES.OK : (au.reason ?? REASON_CODES.TASK_ERROR),
@@ -522,7 +650,10 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
             // ★ 任务可视：title = 对话标题（点火名/会话标题），createdAt/created_at = 会话或点火创建时间，
             //   卡片与 workbuddy_status 据此显示"哪条对话、什么时候建的、回执在哪"。
             automationId: typeof au.automationId === 'string' ? au.automationId : null,
-            sessionOrigin: (au.sessionId ?? au.conversationId) ? 'new' : null,
+            // ★ M2：追发成功 ⇒ origin 'resumed'（同一条对话续用，不是新建）；点火轮仍按既有口径。
+            sessionOrigin: followUpMeta !== null
+              ? 'resumed'
+              : ((au.sessionId ?? au.conversationId) ? 'new' : null),
             sessionId: (au.sessionId ?? au.conversationId) ?? null,
             title: typeof au.title === 'string' ? au.title : null,
             createdAt: typeof au.createdAt === 'number' ? au.createdAt
@@ -533,7 +664,12 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
             sessionPersist: au.sessionPersist ?? null,
             retired: au.retired === true,
             sessionKey,
-            resumed: false,
+            // ★ M2：resumed 不再写死 false —— 追发成功为 true；点火轮（含追发失败回退）仍为 false。
+            resumed: followUpMeta !== null,
+            // ★ M2：追发元数据进 lastRun（channel/elapsedMs），与回执的 follow_up 同源同值。
+            followUp: followUpMeta === null
+              ? null
+              : { channel: followUpMeta.channel, elapsedMs: followUpMeta.elapsedMs },
             recycle: null,
             instance: null,
             sidecar: null,
@@ -562,14 +698,30 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
       },
     });
     runtime.start(aJobId, { terminate: a.cancel });
-    // ★ 每轮新对话（INSERT 一行 once）：`resumed:false`。无复用分支，每轮都新建。
+    // ★ M2 追发回执：走向**两分支**，字段名/取值与既有契约逐字对齐 ——
+    //   · 追发成功：resumed:true + 续用的对话 id + follow_up 元数据（channel/elapsedMs）；
+    //   · 点火/回退轮：既有逐字形状（resumed:false、resumed_session_id 空串），仅追发失败时
+    //     追加 fallback 两键（指纹码可见，不静默）。开关关闭时不含任何新键（hardening 键集契约）。
+    if (followUpMeta !== null) {
+      return {
+        job_id: aJobId,
+        session_key: sessionKey,
+        argv_preview: automationHeader({ model: typeof args.model === 'string' ? args.model : c.model, cwd: autoCwd }),
+        resumed: true,
+        resumed_session_id: followUpMeta.conversationId,
+        not_sent: buildNotSent(args, c),
+        follow_up: { channel: followUpMeta.channel, elapsedMs: followUpMeta.elapsedMs },
+      };
+    }
     return {
       job_id: aJobId,
       session_key: sessionKey,
       argv_preview: automationHeader({ model: typeof args.model === 'string' ? args.model : c.model, cwd: autoCwd }),
+      // ★ 点火轮（含追发失败回退轮）恒为新对话（INSERT 一行 once）：`resumed:false` 逐字保留。
       resumed: false,
       resumed_session_id: '',
       not_sent: buildNotSent(args, c),
+      ...(fallbackReason !== null ? { fallback: true, fallbackReason } : {}),
     };
   },
   presentCall: (a) => ({ card: 'generic', title: `Delegate to WorkBuddy: ${a.prompt.slice(0, 60)}`, kind: 'execute' }),

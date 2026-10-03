@@ -576,6 +576,64 @@ export function loadSessionMap(ctx, ns) {
     },
 
     /**
+     * 只更新**已有**记录的热度/元数据（★ M2 多轮追发的保鲜口；RFC-SESSION-RESUME-INTEGRATION §3.2：
+     * Track A 追发成功 ⇒ `touch(sessionKey)` —— 会话 id 没变，只有 `lastUsedAt` 需要推进）。
+     *
+     * <p>★ 为什么不用 `adopt`：adopt 的语义是"收下一条**新的**会话 id"—— 它会把 `outputBytes`
+     * 清零、把 `createdAt` 重算、把判死位清真。而追发**没有**新 id：同一条对话还在原地，
+     * 需要的只是"这条 key 刚刚被用过"（`sweepOwnSessions` 按 `lastUsedAt` 判陈旧，
+     * 不 touch 的追发会话会在 7 天后被误判成遗留）。touch 只做热度合并，别的字段一律保留。
+     *
+     * <p>★ 安全 no-op：key 不存在 ⇒ 不造记录（与 `supersede` 同一纪律——为一次写入凭空造出的
+     * 空壳既不可续接，还会把 settings 表撑出垃圾）。返回 `{ ok:false, persistState:'no_record' }`。
+     *
+     * @param {string} key
+     * @param {object} [patch] 追加字段（后置合并，同键以补丁为准；类型不合法的字段被
+     *   `sanitizeRecord` 丢弃 —— 与 capture/adopt 同一条"写入前净化"纪律，不让一次坏写入
+     *   拖垮整份 namespace 校验）。
+     * @returns {{ ok: boolean, persistState: string, persistError: string }}
+     */
+    touch(key, patch = undefined) {
+      if (typeof key !== 'string' || key === '') return { ok: false, persistState: 'failed', persistError: 'empty session key' };
+      const existing = api.lookup(key);
+      if (existing === null) {
+        // 安全 no-op：没有记录就没有"热度"可推进，绝不凭空造记录。
+        return { ok: false, persistState: 'no_record', persistError: '' };
+      }
+      const nowMs = Date.now();
+      // ★ 合并顺序：现有记录打底（判死位 / own / createdAt **显式**保真 —— 深度合并下省略 = 保留
+      //   旧值，但内存侧必须显式，否则 view 的缺省归一会把"粘滞的判死位"悄悄洗成 false）
+      //   → `lastUsedAt = now` → 调用方补丁最后（同键以补丁为准）。
+      const merged = sanitizeRecord({
+        ...(typeof existing.cliSessionId === 'string' && existing.cliSessionId !== ''
+          ? { cliSessionId: existing.cliSessionId } : {}),
+        ...(typeof existing.cwd === 'string' && existing.cwd !== '' ? { cwd: existing.cwd } : {}),
+        lastUsedAt: nowMs,
+        ...(Number.isSafeInteger(existing.outputBytes) && existing.outputBytes > 0
+          ? { outputBytes: existing.outputBytes } : {}),
+        ...(existing.outputTruncated === true ? { outputTruncated: true } : {}),
+        ...(existing.superseded === true ? { superseded: true } : {}),
+        ...(existing.unconfirmed === true ? { unconfirmed: true } : {}),
+        ...(existing.own === true ? { own: true } : {}),
+        ...(Number.isFinite(existing.createdAt) && existing.createdAt > 0 ? { createdAt: existing.createdAt } : {}),
+        ...(typeof patch === 'object' && patch !== null ? sanitizeRecord(patch) : {}),
+      });
+      memory.set(key, {
+        cliSessionId: typeof merged.cliSessionId === 'string' ? merged.cliSessionId : null,
+        cwd: typeof merged.cwd === 'string' ? merged.cwd : null,
+        lastUsedAt: Number.isFinite(merged.lastUsedAt) ? Number(merged.lastUsedAt) : nowMs,
+        outputBytes: Number.isSafeInteger(merged.outputBytes) ? merged.outputBytes : 0,
+        outputTruncated: merged.outputTruncated === true,
+        superseded: existing.superseded === true || merged.superseded === true,
+        unconfirmed: existing.unconfirmed === true || merged.unconfirmed === true,
+        own: existing.own === true || merged.own === true,
+        createdAt: Number.isFinite(merged.createdAt) && merged.createdAt > 0 ? Number(merged.createdAt) : 0,
+      });
+      const outcome = persist(key, merged);
+      return { ok: true, persistState: outcome.persistState, persistError: outcome.persistError };
+    },
+
+    /**
      * 作业收敛时记录（§3.4.3 settle 调用点；**签名与 T02 基线保持兼容**：`(key, stdout, lossy)`，
      * 第 4 个参数是 T05 新增的可选选项，不传 ⇒ 行为与基线逐字一致）。
      *
@@ -738,11 +796,18 @@ export function loadSessionMap(ctx, ns) {
      * 按 `sessionStore` 的 `{read, adopt, forget}` 三件套接线，而不用知道底层叫
      * `supersede`。没有记录 ⇒ `no_record`，不凭空造空壳（与 `supersede` 同）。
      *
+     * <p>★ M2 增量：第二参数 `reason` **透传**给 `supersede`（默认 `'superseded'`，
+     * 与既有行为逐字一致 —— 向后兼容）。多轮追发的优雅回退链（RFC-SESSION-RESUME-INTEGRATION
+     * §4.2）用它携带 RFC 七指纹码（如 `ERR_WORKBUDDY_CDP_UNAVAILABLE`），让"这条记性为什么
+     * 被作废"沿既有调用链可达；`supersede` 目前把 reason 视作文档性入参（记录形状不变），
+     * 指纹码的落点是 run.js 回执的 `fallbackReason` 与日志。
+     *
      * @param {string} key
+     * @param {string} [reason] 稳定原因码（默认 'superseded'；非空字符串才透传）
      * @returns {{ ok: boolean, persistState: string, persistError: string }}
      */
-    forget(key) {
-      return api.supersede(key, 'superseded');
+    forget(key, reason = 'superseded') {
+      return api.supersede(key, typeof reason === 'string' && reason !== '' ? reason : 'superseded');
     },
 
     /** 合并视图：settings 用户层（若有）+ 内存态（**内存优先 = 更新**）。 */

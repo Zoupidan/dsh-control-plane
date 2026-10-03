@@ -67,6 +67,24 @@ export const Config = z.object({
   // 取 30s 的依据：桌面端激活 prewarm sidecar 实测 1–3s；30s 是"慢盘/杀软冷扫"的量级，
   // 再大就等于让用户对着一个转圈的作业干等，而那条作业本来也不会成功。
   instanceTimeoutMs: z.number().default(30_000).volatile(),
+  // ═══ 多轮追发（★ 2026-10-03 M2 新增；RFC-SESSION-RESUME-INTEGRATION §6 Phase 2/3）═══
+  // `enableMultiTurnFollowUp` = Track A（CDP 直发既有对话）的**总闸，默认 false**（opt-in）：
+  //   开着时，仅当调用方 `resume:true` 且记性命中可续接会话，`workbuddy_run` 才先尝试把
+  //   prompt 追发进既有对话（`src/host/followup/dispatcher.js`）；追发失败按 RFC §4.2
+  //   优雅回退（forget 记性 → 照旧点火新会话），关着时行为与未接线版本逐字节一致。
+  //   默认 false 的依据：回执形状/参数打包均为探针逆向所得，**pending live calibration**，
+  //   未过真机校准前不得默认启用（零回归门禁的保守面）。
+  enableMultiTurnFollowUp: z.boolean().default(false).volatile(),
+  // Track A 的 CDP 远程调试口（桌面端须以 WORKBUDDY_REMOTE_DEBUGGING_PORT 启动才监听）。
+  // 9222 与外部 Chrome/Edge 的调试口共用是常态 ⇒ 调度器按 UA + target 指纹双证据严格判别
+  // （真机 2026-10-03：/json/version 的 Browser 只写 "Chrome/138…"，身份在 User-Agent），
+  // 外部浏览器占口时如实报 `ERR_NON_WORKBUDDY_CDP_TARGET` 并回退，绝不劫持。
+  followupCdpPort: z.number().default(9222).volatile(),
+  // 追发确认超时（毫秒；RFC §4.2 指纹 6）。★ 默认 180s 的依据是真机实测
+  // （2026-10-03，00-recon/evidence/CDP-LIVE-20261003/）：首转 13.4s（模型 worker 冷启动）、
+  // 次转 9.1s —— 15s 已在冷启动边缘，慢盘/杀软/更长系统提示必然越界，留足 12 倍余量。
+  // 超时即回退到点火新会话，绝不让调用方对着转圈的作业干等。
+  followupTimeoutMs: z.number().default(180_000).volatile(),
   // ═══ 传输面（★ 2026-10-02 起只有 `automation`）════════════════════
   // `automation` = 往计划任务表写一行 `once`（`startAutomationRun` 唯一写入点），
   // 等桌面端调度器建会话。`schedule_type='once'`、`next_run_at=now`、`valid_until=+25min`，

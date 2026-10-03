@@ -28,6 +28,7 @@
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|-------------|--------|
 | M1 | Prototype Spikes, Reverse-Engineering Dossier, Architecture RFC & Verification Harness | Implement runnable spike probes for Tracks A, B, C, compile reverse-engineering dossier, draft comprehensive Architecture RFC with evaluation matrix and fallback state machine, build master verification harness, and verify 100% zero-regression baseline | Survey | DONE |
+| M2 | Live-Desktop Closure & Flag-Off Production Integration | Real-desktop CDP follow-up closure (LIVE-VERIFIED), `followup/dispatcher.js` calibrated to live receipt contract, `enableMultiTurnFollowUp` knob (default false) wired into `run.js` with graceful fallback, hardened verification suites | M1 | DONE |
 
 ## Interface Contracts
 ### Follow-Up Channel Probe Contract
@@ -52,5 +53,12 @@
 ## Code Layout
 - `00-recon/`: Reverse-engineering evidence archives, spike probes, and Architecture RFC documents.
 - `tmp/`: Experimental probes, mock servers, and execution logs.
-- `packages/plugin-workbuddy/`: **STRICT READ-ONLY (LOCKED)**. No modifications permitted.
+- `packages/plugin-workbuddy/`: modifications permitted only behind the zero-regression gates (M2+); the M1 research phase was strictly read-only.
 - `test/`: Existing test suites, must pass 100% with zero regressions.
+
+## M2 Addenda (2026-10-03)
+- **Live closure**: Track A verified on the real desktop (`WORKBUDDY_REMOTE_DEBUGGING_PORT=9222` env-var route, CDP ready in 2s). Two turns into one conversationId; turn 2 reproduced the turn-1 agreed word ("收到"). Evidence: `00-recon/evidence/CDP-LIVE-20261003/` (also mirrored in local-only branch `research-evidence-local`, worktree `D:\cheng\Documents\Code\dsh-evidence-vault` — never push).
+- **Real receipt contract** (differs from probe assumption): `state:'completed'` (not `status`), `content: ContentBlock[]` (not `output`), no top-level `turnCount`/`usage` (use `wb:conversations:requests`), cross-bridge errors return `{__wbError:true,...}` instead of throwing, `sendPrompt` normally returns `undefined`.
+- **Production knobs** (flat top-level, default off): `enableMultiTurnFollowUp=false`, `followupCdpPort=9222`, `followupTimeoutMs=180000` (live first-turn cold start measured 13.4s; budget 180s).
+- **Gates at M2 close**: `test:host` 560/560 · `test:client` 79/79 · `ci:redlines` 4/4 · harness 10/10 · challenger 19 PASS · `probe-automation-main` PASS · live e2e (through production dispatcher) PASS.
+- **Leftovers**: credit accounting for follow-up turns (0.01–0.4 credit/turn observed); second wiring point `subagent/execute.js`; multi-window /json/list target picking; client settings UI for new knobs; offline-mode challenger SKIP validation on next natural desktop downtime.

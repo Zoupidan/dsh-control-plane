@@ -29,7 +29,9 @@ SOFTWARE.
 > 若**更换许可证**，请同时更新 `package.json` 的 `"license"` 字段 ——
 > 两处不一致会让 npm 与 GitHub 渲染出互相矛盾的许可证信息。
 
-1. 本项目处于 `0.1.0` 早期阶段，**尚未发布正式版本**，也不对稳定性或可用性作出承诺。
+1. 本项目处于 `0.x` 早期阶段（当前版本 `0.2.1`，发布记录见
+   [Releases](https://github.com/Zoupidan/dsh-control-plane/releases) 与 `CHANGELOG.md`），
+   **尚未发布 1.0 稳定版**，也不对稳定性或可用性作出承诺。
    已知缺口写在 README 的「已知限制」一节 —— 请在依赖本项目前先读那一节。
 
 2. 本仓库的文档引用了第三方软件（WorkBuddy、Qoder 等）的名称、安装路径与观测到的接口形态，

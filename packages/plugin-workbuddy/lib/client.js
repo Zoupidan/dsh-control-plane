@@ -471,9 +471,13 @@ window.__ModuleLoader__.load({
       // 控件去边框化：灰底 pill（iOS 表单控件观感）。
       // `width:100%` 让「标签 · 备注（倍率）」整条不被截断（原先 min-width:16em 会截）；
       // `max-width:30em` 兜住宽设置面板 —— 铺满一整行反而像一张没排版的表。
-      '.dsh-wb-select{font:inherit;font-size:13px;width:100%;min-width:0;max-width:30em;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-border-l1,rgba(0,0,0,.04));border:0;border-radius:8px;padding:5px 10px}' +
+      // ★ 2026-10-08：下拉框**独占整行**（标签在上、控件在下满宽），不再挤在 5.5em 标签列右边。
+      //   原先 `max-width:30em` + 双列栅格 ⇒ 面板一窄，模型名只剩半截、倍率被切掉。
+      //   `max-width:none` = 跟随面板宽度；`min-width:12em` = 极窄面板下的下限。
+      '.dsh-wb-select{font:inherit;font-size:13px;width:100%;min-width:12em;max-width:none;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-border-l1,rgba(0,0,0,.04));border:0;border-radius:8px;padding:5px 10px}' +
+      '.dsh-wb-row--model,.dsh-wb-row--effort{grid-template-columns:minmax(0,1fr);row-gap:6px}' +
       // 模型搜索框与下拉同款灰底 pill，独占一行（栅格换行），筛选只影响分组内的候选。
-      '.dsh-wb-search{font:inherit;font-size:13px;width:100%;min-width:0;max-width:30em;grid-column:1/-1;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-border-l1,rgba(0,0,0,.04));border:0;border-radius:8px;padding:5px 10px}' +
+      '.dsh-wb-search{font:inherit;font-size:13px;width:100%;min-width:0;max-width:none;grid-column:1/-1;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-border-l1,rgba(0,0,0,.04));border:0;border-radius:8px;padding:5px 10px}' +
       // 倍率对比：原生 <select> 的 option 无法逐项排版，能做的是让数字**列对齐**（等宽数字）
       // 并给每项留出行高 —— 十几条倍率竖着扫时，这是唯一能让"x0.06 / x0.16"不靠逐行辨读的杠杆。
       '.dsh-wb-select,.dsh-wb-select option{font-variant-numeric:tabular-nums;font-feature-settings:"tnum"}' +

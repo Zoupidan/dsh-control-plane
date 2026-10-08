@@ -710,7 +710,10 @@ test('判据① + ⑤：ON（已装）⇒ 注册两工具；每定义含 output.
       // ★ 2026-10-04：新增 `cdp` / `ignition`（D6 直接点火）—— 模型据此判断"该不该开口问用户"。
       //   两块都由 `execute()` 单处承载（`json` 型同 lastRun）；CDP 实况走 `probeCdp()`，
       //   与点火面**同一套** UA ∧ target 判别 ⇒ 状态说"可用"而点火回退这种自相矛盾不可能发生。
-      'cdp', 'config', 'cost', 'effort', 'ignition', 'inFlight', 'lastRun',
+      // ★ 2026-10-08 新增 `account`：切号排障要能**读到**插件识别到的现役账号 uid 与识别来源
+      //   （`epoch-marker-align` / `security-holder-mtime` / `none`）。缺它 ⇒ 模型与用户都不知道
+      //   "行写的 owner 和桌面端现役账号是不是同一个"，而这正是 owner 静默过滤的唯一成因。
+      'account', 'cdp', 'config', 'cost', 'effort', 'ignition', 'inFlight', 'lastRun',
       // ★ 2026-09-28 新增 `permission`：它是 `workbuddy_run` 的 `permission_mode` 参数的**唯一真源**
       //   （那张下拉表来自服务端 `config_option_update`，不是本地常量）。少了它，模型在
       //   第一次调用前就不知道有哪些合法值，只能瞎填。

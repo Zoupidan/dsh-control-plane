@@ -15,6 +15,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 import { TOOL_STATUS } from '../../shared/constants.js';
 import { readCostCatalog } from '../launch/cost-catalog.js';
 import { readModelCatalog, detectionStateOf } from '../launch/model-catalog.js';
+import { currentAccountDetection } from '../gateway/automation.js';
 import { detectWorkBuddy } from '../probe/detect.js';
 // 档位能力表与状态路由**共用同一函数**（单一来源；此前两处各写一份已漂移）。
 import { effortCapability } from '../routes/status/get.js';
@@ -175,6 +176,10 @@ export const makeStatusTool = (runtime, cfg, ctx, sessions = null, dispatch = nu
         // ★ 点火走向面（D6）：`ignition:{mode, reason}` —— 这一轮会走 direct 还是计划任务队列、
         //   为什么（含回退预期与"何时必须问"的来由）。
         ignition: { type: 'json', required: true },
+        // ★ 只读账号确认面：`account:{uid, method}` —— 插件识别到的现役账号 id
+        //   与证据来源（epoch-marker-align / security-holder-mtime / none / error）。
+        //   切号后这里应第一个变成新账号；任务 owner 与它对不上 ⇒ 调度器必然过滤。
+        account: { type: 'json', required: true },
         // ★ 会话（功能③"继续会话或新开会话"）：可续接的 session_key 列表。
         sessions: {
           type: 'array',
@@ -290,6 +295,8 @@ return {
       cdp,
       // ★ D6：点火走向（mode = 配置意图；实况与回退预期在 reason 里逐字写清）。
       ignition,
+      // ★ 只读确认面：插件识别到的现役账号 id 与识别来源（epoch 对齐 / holder 最新 / 读不到）。
+      account: currentAccountDetection(),
       // 功能③：会话映射的可续接视图（与状态路由共用 sessionSummary）。
       sessions: sessionSummary(sessions).map((s) => ({
         session_key: s.sessionKey,

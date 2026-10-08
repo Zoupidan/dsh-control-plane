@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-workbuddy",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "description": "WorkBuddy CLI as model-facing dsh tools (spawned via ctx.subprocess, tracked via ctx.jobs).",
@@ -31,8 +31,7 @@
     "client": {
       "inject": [
         "@deepseek-ai/dsh-client-ui-renderer",
-        "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-commands"
+        "@deepseek-ai/dsh-client-ui-settings"
       ],
       "platform": "web"
     },

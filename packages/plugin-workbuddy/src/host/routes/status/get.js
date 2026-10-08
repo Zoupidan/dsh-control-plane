@@ -42,6 +42,7 @@ import { EFFORT_LEVELS, PLUGIN_ID, ROUTE_STATUS } from '../../../shared/constant
 import { disabledSnapshot, readCostCatalog } from '../../launch/cost-catalog.js';
 import { desktopModels } from '../../launch/desktop-models.js';
 import { readModelCatalog, detectionStateOf } from '../../launch/model-catalog.js';
+import { currentAccountDetection } from '../../gateway/automation.js';
 import { sessionSummary } from '../../session/map.js';
 
 /**
@@ -192,6 +193,9 @@ export function makeStatusRoute(settings, runtime, ns, env = process.env, sessio
         sessions: sessionSummary(sessions),
         inFlight: runtime.inFlight(),
         lastRun: runtime.lastRun(),
+        // ★ 只读账号确认面：插件识别到的现役账号 id 与证据来源。
+        //   切号后这里应第一个翻到新账号；点火 owner 与之不符 ⇒ 调度器必然过滤。
+        account: currentAccountDetection(),
         // ★★ 积分（2026-09-28 起为**真值直读**，不再由主理人手填）。
         //   同步投影 + 后台刷新：状态路由**不等**网络往返（读数含一次本机 IPC 往返）。
         //   三态（live / stale / unavailable）由 launch/live-credits.js 判，UI 照着画。

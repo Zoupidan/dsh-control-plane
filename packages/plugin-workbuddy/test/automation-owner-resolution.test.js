@@ -8,7 +8,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { resolveOwnerUserId } from '../src/host/gateway/automation.js';
+import { mkdtempSync, mkdirSync, writeFileSync, utimesSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join as joinPath } from 'node:path';
+import { resolveOwnerUserId, currentAccountFromSecurityDir } from '../src/host/gateway/automation.js';
 
 function memoryDb({ withLastActivity = true } = {}) {
   const db = new DatabaseSync(':memory:');
@@ -68,4 +71,29 @@ test('★ sessions 有行但 user_id 全空串：跳过，回退 automations own
   const { mk } = seed(db);
   mk('s-blank', '   ', 3000);
   assert.equal(resolveOwnerUserId(db), OLD);
+});
+
+test('★ currentAccountFromSecurityDir：epoch-marker 尾号命中 holder ⇒ 现任账号优先', () => {
+  const root = mkdtempSync(joinPath(tmpdir(), 'wb-sec-'));
+  mkdirSync(joinPath(root, 'security', 'uid-current'), { recursive: true });
+  mkdirSync(joinPath(root, 'security', 'uid-stale'), { recursive: true });
+  writeFileSync(joinPath(root, 'epoch-marker.json'), JSON.stringify({ epochAddress: '\\\\.\\pipe\\WbCenter_0001_9384' }));
+  writeFileSync(joinPath(root, 'security', 'uid-current', 'data.lock.holder'), '8400\t\\\\.\\pipe\\WbCenter_0001_9384\n');
+  writeFileSync(joinPath(root, 'security', 'uid-stale', 'data.lock.holder'), '30400\t\\\\.\\pipe\\WbCenter_0001_30400\n');
+  // stale 的文件 mtime 更新，也要被 epoch 尾号压过去
+  const t = new Date();
+  utimesSync(joinPath(root, 'security', 'uid-stale', 'data.lock.holder'), t, t);
+  assert.equal(currentAccountFromSecurityDir(root), 'uid-current');
+});
+
+test('★ currentAccountFromSecurityDir：精确不命中⇒取 mtime 最新 holder；目录缺失⇒null', () => {
+  const root = mkdtempSync(joinPath(tmpdir(), 'wb-sec-'));
+  assert.equal(currentAccountFromSecurityDir(root), null);
+  mkdirSync(joinPath(root, 'security', 'uid-a'), { recursive: true });
+  mkdirSync(joinPath(root, 'security', 'uid-b'), { recursive: true });
+  writeFileSync(joinPath(root, 'security', 'uid-a', 'data.lock.holder'), '1\tpipe\\_1111\n');
+  writeFileSync(joinPath(root, 'security', 'uid-b', 'data.lock.holder'), '2\tpipe\\_2222\n');
+  const oldT = new Date(Date.now() - 3600_000);
+  utimesSync(joinPath(root, 'security', 'uid-a', 'data.lock.holder'), oldT, oldT);
+  assert.equal(currentAccountFromSecurityDir(root), 'uid-b');
 });

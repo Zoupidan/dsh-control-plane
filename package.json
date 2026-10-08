@@ -1,6 +1,6 @@
 {
   "name": "dsh-control-plane",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "description": "DshAgentHub · 本机 agent 控制平面（control plane）—— 把本机 WorkBuddy 桌面端纳管成 DshAgentHub 里看得见、可调度、可观测的执行方（同机通道，不跨网）",

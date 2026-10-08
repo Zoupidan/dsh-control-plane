@@ -38,7 +38,6 @@
  *   - 注册形态 `{ name, key, inject }` + 组件 props 注入：`dsh-client-ui-settings-plugins/lib/client.js:1785-1810`（BashCard 样例）。
  *   - settings 读写 = `ctx.settingsScope.bind({ namespace })` → `{ getSnapshot, subscribe, set, unset, mutate }`：
  *     `dsh-client-ui-settings/lib/client.js:949-1081` + `:1169-1179`；快照字段 {status,value,base,user,revision,writable,mode}。
- *   - `commandUi.register` 形态与 `(session, signal)` 参数序：`dsh-client-ui-model-selection/lib/client.js:919-937`。
  *   - CSS 去重注入模式（tagId + `style[data-plugin-css]` 查询）：`dsh-client-ui-settings-plugins/lib/client.js:378-385`。
  *   - 状态 bridge = 同源 fetch 相对路径（先例 `dsh-client-ui-deliverables/lib/client.js:13-15,136`）。
  *
@@ -186,6 +185,15 @@ window.__ModuleLoader__.load({
             namedSome: (flags) => '被拒绝的参数：' + flags,
             namedNone: '被拒绝的参数：无',
             sourcePrefix: '模型列表来源：',
+            /** 只读账号 id 行的前缀（切号排障的第一行，读不到账号也如实显示）。 */
+            accountPrefix: '账号：',
+            /** 账号 id 识别来源的人话（`epoch-marker-align` = 与当前实例 epoch 精确对齐）。 */
+            accountMethods: {
+              'epoch-marker-align': '精确匹配（epoch 对齐）',
+              'security-holder-mtime': '推断（最新 holder）',
+              none: '未识别',
+              error: '读取异常',
+            },
             /** 列表来源人话：实时读 vs 上次缓存（端点原串回答不了这个问题，只留在载荷里）。 */
             sourceLive: 'WorkBuddy 桌面端（实时）',
             sourceCache: 'WorkBuddy 桌面端（缓存）',
@@ -248,14 +256,8 @@ window.__ModuleLoader__.load({
             /** 写失败 Toast：`scope.set` 被拒时如实说出来，不静默吞掉。 */
             toastPrefix: '保存失败：',
             toastDismiss: '关闭',
-            /** 命令面的描述行（斜杠菜单里可见）与写不进去时的报错。 */
-            commandDesc: '切换 WorkBuddy 模型',
-            writeBlocked: '当前页面无法保存设置',
             /** 枚举值不认识时的统一兜底（宁可说"未知"，也不把机器标识符印给用户，见 enumText）。 */
             unknownText: '未知',
-            /** 命令哨兵行（未固定）的 label 与 detail。 */
-            commandUnsetLabel: '未固定（每次用时现选）',
-            commandUnsetDetail: '每次用时重新选；那次也没选，就用桌面端自己的默认。',
           },
         },
       },
@@ -1158,6 +1160,22 @@ window.__ModuleLoader__.load({
           s.settingsPrefix + enumText(SETTINGS_TEXT, snap.status, L.shell.unknownText) + (snap.writable === false ? s.readonly : ''),
         ),
       );
+      // ★ 只读账号确认：插件识别到的现役 uid 与证据来源（epoch 对齐 / holder 最新）。
+      //   切号后这里应第一个刷新到新账号；点火 owner 与它对不上 ⇒ 调度器必然过滤。
+      {
+        const acc = status && typeof status === 'object' && typeof status.account === 'object' && status.account !== null
+          ? status.account : null;
+        const accUid = acc && typeof acc.uid === 'string' && acc.uid !== '' ? acc.uid : '';
+        const accMethod = acc && typeof acc.method === 'string' ? acc.method : 'none';
+        const methodText = s.accountMethods[accMethod] ?? s.accountMethods.none;
+        lines.push(
+          h(
+            'div',
+            { className: 'dsh-wb-status__line dsh-wb-status__mono', key: 'account' },
+            s.accountPrefix + (accUid === '' ? methodText : accUid + ' · ' + methodText),
+          ),
+        );
+      }
       if (props.failure !== '') {
         lines.push(h('div', { className: 'dsh-wb-status__line dsh-wb-warn', key: 'failure' }, s.routeDown + props.failure));
       }
@@ -1571,55 +1589,6 @@ window.__ModuleLoader__.load({
           makeConfigCard(scope),
         ),
       );
-
-      // ② 快速切换（R3-9：description 必须是函数，传字符串会拖垮整份 `/` 菜单的该 source）。
-      // ⚠ 门控与卡片同规（R2-MEDIUM）：真机可达 {status:'unavailable', writable:true}
-      //   （ui-settings:1089-1094），只看 writable 会让宿主 mutate 静默失败 ⇒"点了没反应"。
-      const writableNow = () => {
-        const snapshot = scope.getSnapshot();
-        return snapshot.status === 'ready' && snapshot.writable === true;
-      };
-      ctx.effect(
-        () =>
-          ctx.commandUi.register({
-            name: 'workbuddy-model',
-            description: () => L.shell.commandDesc,
-            available: () => writableNow(),
-            ui: {
-              kind: 'popupSelect',
-              options: async (session, signal) => {
-                const payload = await fetchStatus(signal);
-                const current = scope.getSnapshot().value?.model ?? '';
-                const built = buildModelOptions(
-                  Array.isArray(payload.models) ? payload.models : [],
-                  payload.cost && Array.isArray(payload.cost.models) ? payload.cost.models : [],
-                );
-                return [
-                  {
-                    id: '',
-                    label: L.shell.commandUnsetLabel,
-                    detail: L.shell.commandUnsetDetail,
-                    active: current === '',
-                  },
-                  ...built.rows.map((m) => ({
-                    id: m.id,
-                    // ★ 命令面与卡片下拉**同一套**候选与同一套措辞（`标签 · 备注（倍率）`，同一函数 modelOptionLabel）。
-                    //   两侧规则分叉是最难查的一类偏差：用户在菜单里看到的与卡片里看到的必须是同一件事。
-                    label: modelOptionLabel(m),
-                    detail: factorText(m.factor),
-                    active: m.id === current,
-                  })),
-                ];
-              },
-              onSelect: async (option) => {
-                // 竞态防御：菜单构建到选择之间快照可能翻转（available 不是围栏）。
-                if (!writableNow()) throw new Error(L.shell.writeBlocked);
-                await scope.set('model', option.id);
-              },
-            },
-          }),
-        PACKAGE_NAME + ': /workbuddy-model command',
-      );
     }
 
     /**
@@ -1633,9 +1602,8 @@ window.__ModuleLoader__.load({
      * - `slots`        = ui-renderer
      * - `locale`       = ui-locale（0.1.7 新增：注册项的 `t` 靠 `locale: NS` 选项获得）
      * - `configForms`  = ui-settings（0.1.7 原 `settingsScope`，`bind()` 一并没了）
-     * - `commandUi`    = ui-commands
      */
-    const inject = ['slots', 'locale', 'configForms', 'commandUi'];
+    const inject = ['slots', 'locale', 'configForms'];
 
     exports.apply = apply;
     exports.inject = inject;

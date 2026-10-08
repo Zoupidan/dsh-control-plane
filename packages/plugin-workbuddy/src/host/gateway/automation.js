@@ -31,7 +31,7 @@
  * @module host/gateway/automation
  */
 
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -344,6 +344,55 @@ function sleep(ms, signal) {
 }
 
 /**
+ * 从桌面端自己的磁盘痕迹里读「现在在服务哪个账号」。
+ *
+ * 每次启动 WorkBuddy 都会往 `epoch-marker.json` 写一条带 `_<pid>` 尾号的
+ * sandbox pipe；`security/<uid>/data.lock.holder` 里的 pipe 带同一个尾号 ⇒
+ * 现任进程服务的账号就是那个 uid。没有精确命中时，退化为「mtime 最新的 holder
+ * 的 uid」（切号事件几乎总会改写 holder，即便还没产生过新对话）。
+ * 任何异常都返回 null ⇒ 上游降级到 sessions / automations 旧链路。
+ */
+export function currentAccountFromSecurityDir(home = null) {
+  return currentAccountDetection(home).uid;
+}
+
+/**
+ * 与 `currentAccountFromSecurityDir` 同源，但把「从哪条证据识别到的」也如实报出
+ * （`epoch-marker-align` = 现任实例 epoch 尾号与某个 holder 对齐；
+ *  `security-holder-mtime` = 只能用最新改动的 holder 推断；`none` = 两者都没证据；
+ *  `error` = 读盘异常）。状态面 / 回执用它让用户确认识别账号 id 的来源，
+ *  而不是只给一个没有来由的 uid。
+ */
+export function currentAccountDetection(home = null) {
+  const none = { uid: null, method: 'none' };
+  try {
+    const root = typeof home === 'string' && home !== '' ? home : workbuddyHome();
+    const securityDir = join(root, 'security');
+    if (!existsSync(securityDir)) return none;
+    let lane = '';
+    try {
+      const marker = JSON.parse(readFileSync(join(root, 'epoch-marker.json'), 'utf8'));
+      const m = /_(\d+)$/.exec(String(marker?.epochAddress ?? ''));
+      if (m !== null) lane = m[1];
+    } catch { /* 没有 marker：按 mtime 启发式 */ }
+    let best = null;
+    for (const entry of readdirSync(securityDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const holderPath = join(securityDir, entry.name, 'data.lock.holder');
+      let holder, mtime = 0;
+      try {
+        holder = readFileSync(holderPath, 'utf8');
+        mtime = statSync(holderPath).mtimeMs;
+      } catch { continue; }
+      if (lane !== '' && holder.includes(`_${lane}`)) return { uid: entry.name, method: 'epoch-marker-align' };
+      if (best === null || mtime > best.mtime) best = { uid: entry.name, mtime };
+    }
+    const uid = typeof best?.uid === 'string' ? best.uid.trim() : '';
+    return uid === '' ? none : { uid, method: 'security-holder-mtime' };
+  } catch { return { uid: null, method: 'error' }; }
+}
+
+/**
  * 取本机账号 id。
  *
  * ★ 不硬编码任何账号 id：把某台机器的 `owner_user_id` 写死进源码，等于把源码变成"只对一台机器成立"。
@@ -353,8 +402,19 @@ function sleep(ms, signal) {
  *   顶着旧 owner，被调度器 `ownerVisibility()` 的 fail-closed 归属隔离整批过滤——**零日志、零 dispatch、
  *   桥面 list 返回 []**，点火在用户眼里表现为"永远没有新会话"。旧 owner 行只配当兜底。
  *   旧库/夹具可能没有 `last_activity_at` 列，逐级降级到 `updated_at` / 无排序。
+ *
+ * ★★ 2026-10-08 事故二修：sessions 表的最新行同样可能是陈旧的 —— 桌面切号
+ *   后如果还没产生过新对话，表里的 latest user_id 就是**旧账号**，而调度器
+ *   `ownerVisibility()` 会把按旧 owner 写的行静默整批过滤（表现又是
+ *   "点火永远没有新会话"）。桌面端真正的现役账号痕迹在
+ *   `~/.workbuddy/security/<uid>/data.lock.holder`：现任进程写的那份
+ *   `epoch-marker.json` 与 holder 内容里带同一个 sandbox pipe 尾号。
+ *   所以把这份磁盘证据挪到 sessions 表**之前**：命中即采用，否则降级到
+ *   sessions / automations 的旧链路（夹具目录没有 security/ 时行为完全不变）。
  */
 export function resolveOwnerUserId(db) {
+  const fromSecurityDir = currentAccountFromSecurityDir();
+  if (fromSecurityDir !== null) return fromSecurityDir;
   const sessionAttempts = [
     "SELECT user_id FROM sessions WHERE user_id IS NOT NULL AND user_id <> '' ORDER BY last_activity_at DESC LIMIT 1",
     "SELECT user_id FROM sessions WHERE user_id IS NOT NULL AND user_id <> '' ORDER BY updated_at DESC LIMIT 1",

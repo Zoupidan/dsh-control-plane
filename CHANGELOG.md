@@ -2,6 +2,32 @@
 
 本项目版本号遵循 [SemVer](https://semver.org/)，格式参照 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.2.2] - 2026-10-08
+
+### 本次更新的目的
+
+切号之后点火连败的根因修复 + 账号识别变**只读可见**。三件事，同一个方向——**点火写进去的 owner 必须等于桌面端现役账号，而且这件事你随时能自己确认**。
+
+### 新增（Added）
+- **现役账号只读确认面**：`workbuddy_status` 顶层键集 +1（`account:{uid, method}`），本机状态接口 `/plugin-workbuddy/status` 与设置卡片「状态」区同步透传。`method` 取值 `epoch-marker-align`（与当前桌面实例的 epoch 精确对齐，权威）／`security-holder-mtime`（只能用最新改动的 holder 推断）／`none`（无证据，如实说"未识别"）／`error`。设置卡片上多一行「账号：<uid> · 来源」——**只读**，不可写、不参与点火；它的作用是让你能自己判断"行的 owner 和它是不是同一个"。**`workbuddy_run` 回执键集一个字未动。**
+- **owner 真源升级**：点火行的 `owner_user_id` 先取 `~/.workbuddy/security/<uid>/data.lock.holder` 与 `epoch-marker.json`（当前实例 epoch）**对齐命中**的账号，取不到才降级到「holder mtime 最新」，再取不到才是旧链路的 sessions 表 / automations 历史行。夹具目录没有 `security/` 时行为与旧版逐字节一致。
+
+### 修复（Fixed）
+- **切号后桌面调度器"不运转"、点火永远没有新会话**：`resolveOwnerUserId` 原先从 `sessions` 表取最近活跃的 `user_id`，而切号后该表最新行仍属**旧账号**（要等产生过新对话才会刷新）⇒ 新点火的行顶着旧 owner，被调度器 `ownerVisibility()` 的 fail-closed 归属隔离**静默整批过滤**（零 dispatch 行、零会话、界面一个新对话都没有）。真机 2026-10-08 复现：三次注入全部 12 轮轮询超时、`toolCalls=0`、无 `sessionId`。修复后同一台机、同一账号，两次真机点火 **23s / 21s** 闭环成功（会话 `f431614b…` / `6770a509…`，模型 `deepseek-v4.1-flash`，积分 0.54 / 0.08）。
+
+### 变更（Changed）
+- 本机 profile `dsh-plugin-workbuddy.config.model` 若残留旧账号才有的模型 id（如 `glm-5.3-flash`），切号后会被服务端拒（400 model unavailable）⇒ **清成 `''`**（未指定，桌面端用其默认模型）。**这是本机配置修正，不是代码变更**：新账号的可用模型以桌面端目录为准。
+- 设置卡片「状态」区新增账号行（位置：设置状态之后、模型来源之前）；其余行文案与 DOM 形状一字未动。
+
+### 验证（真机实测，WorkBuddy 5.7.6 + 新账号）
+- **门禁**：`test:host` **597** 例 · `test:client` **77** 例 · CI 红线 5 项全绿 · `check:knobs` PASS · `check-no-credential-echo` PASS（50 文件零凭据形状）。
+- **真机点火两连发**：`automation.log` 出现 `dispatch automation … dispatchOrder=1` 且 `run finished success=true`（11:41:22Z / 11:42:00Z），对话在桌面端 `sessions` 表里可见，账号为切号后的新账号。
+- **账号识别**：`currentAccountFromSecurityDir()` 在切号后立即返回新账号 uid（epoch 尾号与 holder 精确对齐），不等 `sessions` 表刷新。
+
+### 兼容性
+- 只增不减：`account` 缺省即 `null`，老 host / 老夹具一律不渲染该行。
+- 无默认行为变化：`security/` 不存在（测试夹具、非常规安装）时 owner 解析链与 0.2.1 **逐字节一致**（回归用例仍绿）。
+
 ## [0.2.1] - 2026-10-04
 
 ### 本次更新的目的

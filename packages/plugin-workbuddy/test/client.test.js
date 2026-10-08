@@ -145,7 +145,6 @@ function makeGuardedCtx(plugin, { scope, onEffect } = {}) {
   const verbs = new Set(['effect', 'on', 'get']);
   const slotsCalls = [];
   const registrations = [];
-  const commands = [];
   const bindSpecs = [];
   const locales = [];
   const real = {
@@ -199,12 +198,6 @@ function makeGuardedCtx(plugin, { scope, onEffect } = {}) {
         return () => {};
       },
     },
-    commandUi: {
-      register: (contribution) => {
-        commands.push(contribution);
-        return () => {};
-      },
-    },
   };
   const ctx = new Proxy(
     {},
@@ -218,7 +211,7 @@ function makeGuardedCtx(plugin, { scope, onEffect } = {}) {
       },
     },
   );
-  return { ctx, slotsCalls, registrations, commands, bindSpecs };
+  return { ctx, slotsCalls, registrations, bindSpecs };
 }
 
 /** 伪 document（仅 CSS 去重所需面）。 */
@@ -614,7 +607,6 @@ test('组成前提：bundle id = 包名，dsh.client.platform=web，exports["./c
     assert.deepEqual(PACKAGE_JSON.dsh.client.inject, [
       '@deepseek-ai/dsh-client-ui-renderer',
       '@deepseek-ai/dsh-client-ui-settings',
-      '@deepseek-ai/dsh-client-ui-commands',
     ]);
   });
 });
@@ -671,7 +663,7 @@ test('service 声明守卫：apply 只触达声明过的服务（未声明即抛
     // ★ 2026-10-01 迁移：`settingsScope` 在 0.2.0 已消失，`locale` 成为必需 inject。
     //   ⚠ 这条判据是**启动级**的：`inject` 是硬依赖门顶，少一个服务不是"这插件不显示"，
     //   而是 web boot 完整性校验失败 ⇒ **整个 DSH 起不来**（2026-10-01 真机事故）。
-    assert.deepEqual(plugin.inject, ['slots', 'locale', 'configForms', 'commandUi']);
+    assert.deepEqual(plugin.inject, ['slots', 'locale', 'configForms']);
     assert.equal(typeof plugin.apply, 'function');
     const host = makeGuardedCtx(plugin, { scope: makeScope() });
     assert.doesNotThrow(() => plugin.apply(host.ctx), 'apply 触达未声明服务会被守卫拒绝');
@@ -806,64 +798,6 @@ test('判据②e：宿主 payload 缺 canonical ⇒ 回落到本地 6 档（不�
   assert.equal(high.props.disabled, false);
   const low = options.find((o) => o.props.value === 'low');
   assert.equal(low.props.disabled, true, 'values 表只有 high ⇒ 其余档置灰（与 canonical 是否存在无关）');
-});
-
-test('判据③：commandUi 注册 —— description 为函数（R3-9）、popupSelect、options/onSelect 可用', async () => {
-  const app = await boot({ scopeValue: { enabled: false, model: 'm1', effort: '' } });
-  assert.equal(app.host.commands.length, 1);
-  const contributing = app.host.commands[0];
-  assert.equal(contributing.name, 'workbuddy-model');
-  assert.equal(typeof contributing.description, 'function', 'description 必须是函数（传字符串会拖垮 / 菜单该 source）');
-  assert.ok(contributing.description().length > 0);
-  assert.equal(contributing.available(), true, 'writable 页面 ⇒ 命令可用');
-  assert.equal(contributing.ui.kind, 'popupSelect');
-
-  const controller = new AbortController();
-  const rows = await contributing.ui.options({ sessionId: 's1' }, controller.signal);
-  assert.equal(app.fetches[0].url, ROUTE_STATUS, 'option 读取必须走状态路由（同源相对路径）');
-  assert.equal(app.fetches[0].options.signal, controller.signal, 'AbortSignal 必须转发给 fetch（菜单关闭可取消）');
-  assert.equal(rows[0].id, '');
-  assert.equal(rows[0].active, false);
-  assert.equal(rows.find((r) => r.id === 'm1').active, true, '当前模型应标记 active');
-  // ★ 2026-10-01：命令面的 `detail` 语义改了 —— 它不再是"目录 detail + 支持标注"的拼接，
-  //   而是**倍率行**（与卡片下拉的 option 后缀同一套措辞，见 factorText）。目录 detail 已并入 label。
-  //   m2 在 `cost.models` 里有 factor=0.06 ⇒ `（x0.06）`；m1 没有 ⇒ `（倍率未知）`（不隐藏、不压成 0）。
-  assert.equal(rows.find((r) => r.id === 'm2').detail, '（x0.06）');
-  assert.equal(rows.find((r) => r.id === 'm1').detail, '（倍率未知）');
-
-  await contributing.ui.onSelect({ id: 'm2' }, { sessionId: 's1' });
-  assert.deepEqual(app.scope.commits[0], { op: 'set', field: 'model', value: 'm2' });
-});
-
-test('判据③ 补充：不可写页面 ⇒ 命令不可用（available=false），onSelect 拒写', async () => {
-  const app = await boot({ scopeOptions: { writable: false, status: 'unavailable' } });
-  const contributing = app.host.commands[0];
-  assert.equal(contributing.available(), false, 'memory persistence 下写为静默 no-op ⇒ 不得装作可切换');
-  await assert.rejects(() => contributing.ui.onSelect({ id: 'm2' }, {}), /当前页面无法保存设置/);
-  assert.equal(app.scope.commits.length, 0, '不可写时不得发出写请求');
-});
-
-test('R2 补强：{status:"unavailable", writable:true}（真机可达）⇒ 命令也不可用（与卡片同规）', async () => {
-  // 真机可达性：ui-settings:1089-1094（namespace 行缺失/decode 失败时 writable 仍为 host 值）。
-  // 若只看 writable ⇒ 菜单显示命令、选择后宿主 mutate 静默失败 = "点了没反应"。
-  const app = await boot({ scopeOptions: { status: 'unavailable', writable: true } });
-  const contributing = app.host.commands[0];
-  assert.equal(contributing.available(), false, '快照未 ready ⇒ 命令必须不可用');
-  await assert.rejects(() => contributing.ui.onSelect({ id: 'm2' }, {}), /当前页面无法保存设置/);
-});
-
-test('判据③ 补充：命令注册经 ctx.effect 包裹且返回 disposer', async () => {
-  await withBundle({}, async (registration) => {
-    const { fakeRequire } = makeRequire(makeFakeReact().React);
-    const plugin = registration.factory(fakeRequire);
-    const effects = [];
-    const host = makeGuardedCtx(plugin, { scope: makeScope(), onEffect: (e) => effects.push(e) });
-    plugin.apply(host.ctx);
-    const commandEffect = effects.find((e) => e.label === PACKAGE_NAME + ': /workbuddy-model command');
-    assert.ok(commandEffect !== undefined, '命令注册必须经 ctx.effect 包裹（卸载收敛）');
-    assert.equal(typeof commandEffect.disposer, 'function');
-    assert.equal(host.commands.length, 1);
-  });
 });
 
 test('判据④：任务块 —— 对话标题 + 回执人话 + 在途数；编号/退出码只进折叠', async () => {
@@ -1601,6 +1535,23 @@ test('R1 补强：不可写快照（unavailable/writable=false）⇒ 三控件�
   assert.equal(text.includes('namespace'), false, '★ 宿主内部说法不得上屏');
 });
 
+test('R2 补强：{status:"unavailable", writable:true}（真机可达）⇒ 三控件仍置灰（门控看 status，不只看 writable）', async () => {
+  // 真机可达性：ui-settings:1089-1094（namespace 行缺失/decode 失败时 writable 仍为 host 值）。
+  // 若只看 writable ⇒ 控件显示可编辑、改完宿主 mutate 静默失败 = "点了没反应"。
+  // ★ 这条断言原属已移除的 /workbuddy-model 命令面；门控本身（lib/client.js:1346
+  //   `snap.status === 'ready' && snap.writable === true`）留在卡片上，判据随之搬到这里。
+  const app = await boot({ scopeOptions: { status: 'unavailable', writable: true } });
+  app.expand();
+  app.flushEffects();
+  await settle();
+  const tree = app.expand();
+  const input = findAll(tree, (n) => n.type === 'input' && n.props.className === 'dsh-wb-switch')[0];
+  const selects = findAll(tree, (n) => n.type === 'select');
+  assert.equal(input.props.disabled, true, '快照未 ready ⇒ 开关必须置灰');
+  assert.equal(selects.length, 2);
+  assert.ok(selects.every((s) => s.props.disabled === true), '快照未 ready ⇒ 模型/强度也置灰');
+});
+
 test('R1 补强：路由失败后档位"对应值未知"而非谎报"不支持"（诚实性）', async () => {
   // ★ 载荷未到达**且无失败**时走单骨架（下拉根本不渲染）；"对应值未知"只出现在
   //   "路由失败但卡片仍要给出可操作配置"的形态下 —— 那时能力表确实未知，不得谎报不支持。
@@ -2021,39 +1972,6 @@ test('模型面真实化（f）：未固定 ⇒ hint 把"谁选 + 没选会怎�
     false,
     '★ 已固定模型 ⇒ 不得渲染"该谁选"的解释（会与"当前用 m1"自相矛盾）',
   );
-});
-
-test('模型面真实化（g）：/workbuddy-model 哨兵行的 detail 也必须两分支（旧"不传 --model"只讲了第二半）', async () => {
-  const app = await boot({
-    scopeValue: { enabled: false, model: '', effort: '' },
-    status: statusPayload({ models: CATALOG_TWO, cost: { models: COST_TWO } }),
-  });
-  const rows = await app.host.commands[0].ui.options({ sessionId: 's1' }, new AbortController().signal);
-  const none = rows.find((r) => r.id === '');
-  assert.ok(none !== undefined, '哨兵行（未固定）必须存在且排第一');
-  assert.equal(rows[0].id, '', '★ 哨兵行必须是第一项（与卡片下拉同序）');
-  assert.equal(none.label, '未固定（每次用时现选）');
-  assert.equal(
-    none.detail,
-    '每次用时重新选；那次也没选，就用桌面端自己的默认。',
-    '★ detail 必须同时给出"谁选"与"没选时谁兜底"，只写后者会让人以为总会挑一个',
-  );
-  assert.equal(none.active, true, '当前未固定 ⇒ 哨兵行 active');
-});
-
-test('功能①（命令面）：命令面与卡片下拉**同一套**候选与同一套倍率措辞', async () => {
-  const app = await boot({
-    scopeValue: { enabled: false, model: 'm2', effort: '' },
-    status: statusPayload({ models: CATALOG_TWO, cost: { models: COST_TWO } }),
-  });
-  const rows = await app.host.commands[0].ui.options({ sessionId: 's1' }, new AbortController().signal);
-  // ★ 两侧必须逐项一致：目录两条都在（不因缺倍率被吞），目录 detail 并入 label（不是 detail 字段）。
-  //   命令面是菜单行（扁平列表，不分组），卡片下拉按 免费→按量→未知 分组 —— 候选集合必须一致。
-  assert.deepEqual(rows.map((r) => r.id).sort(), ['', 'm1', 'm2'].sort(), '命令面候选必须与卡片下拉逐项一致');
-  assert.equal(rows.find((r) => r.id === 'm2').label, 'Model Two · 10x', '★ 目录 detail 并入 label（用 · 分隔，不套括号）');
-  assert.equal(rows.find((r) => r.id === 'm2').detail, '（x0.06）', '★ 倍率写在 detail（与卡片 option 后缀同一句）');
-  assert.equal(rows.find((r) => r.id === 'm1').detail, '（倍率未知）', '★ 未知照常列出并如实标注');
-  assert.equal(rows.find((r) => r.id === 'm2').active, true, 'active 仍按当前模型判定（标注不改变 active 语义）');
 });
 
 test('功能①（分组）：模型下拉按计费事实分组 —— 免费 → 按量 → 未知；搜索框过滤候选', async () => {

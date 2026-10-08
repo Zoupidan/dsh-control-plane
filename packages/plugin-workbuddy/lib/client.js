@@ -488,7 +488,15 @@ window.__ModuleLoader__.load({
       '.dsh-wb-credits--note{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary)}' +
       // ③ 诊断区：顶部细线 + 全 tertiary，比配置组明确低一档（不是靠缩字号到看不清，只是降权）。
       '.dsh-wb-card__status{display:flex;flex-direction:column;gap:5px;border-top:.5px solid var(--dsw-alias-border-l2);padding-top:12px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:1.5}' +
+      // ★ 2026-10-08：状态行默认 13px / primary 字色（此前 12px tertiary 让整块像脚注）；
+      //   警告行仍走 warn 字色，折叠内部仍走 mono 小字。
+      '.dsh-wb-card__status .dsh-wb-status__line{color:var(--dsw-alias-label-primary);font-size:13px;line-height:1.55}' +
+      '.dsh-wb-card__status .dsh-wb-diag .dsh-wb-status__line{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:1.5}' +
       '.dsh-wb-status__mono{font-family:ui-monospace,Consolas,monospace;font-size:12px;word-break:break-all}' +
+      // 状态区「标签：值」行的悬挂缩进（2026-10-08 排版重做）：首行拉到左边界，
+      //   折行一律对齐到 6.5em 的值列 ⇒ 一列标签、一列值，而不是每行各自乱折。
+      //   纯 CSS：文本节点一字未动（折叠纪律 + 逐字断言都要求主视图原样）。
+      '.dsh-wb-status__line[data-kv]{padding-left:6.5em;text-indent:-6.5em}' +
       '.dsh-wb-evidence{margin:0;padding-left:18px;font-size:12px}' +
       // 诊断折叠块：默认收起。summary 给手型光标与弱化色，让"这里可以展开"这件事
       // 一眼可见，但不与上面的真实状态抢注意力。任务详情折叠复用同一套。
@@ -963,7 +971,7 @@ window.__ModuleLoader__.load({
       lines.push(
         h(
           'div',
-          { className: 'dsh-wb-status__line', key: 'inflight' },
+          { className: 'dsh-wb-status__line', 'data-kv': '', key: 'inflight' },
           inFlight > 0 ? s.inFlightSome(String(inFlight)) : s.inFlightNone,
         ),
       );
@@ -1156,7 +1164,9 @@ window.__ModuleLoader__.load({
       lines.push(
         h(
           'div',
-          { className: 'dsh-wb-status__line', key: 'settings' },
+          // ★ `[data-kv]` = "这一行是 标签：值"：CSS 用悬挂缩进（首行 −6.5em、折行 +6.5em）
+          //   把值列对齐，**不动文本节点**（折叠纪律与逐字断言都要求主视图原样）。
+          { className: 'dsh-wb-status__line', 'data-kv': '', key: 'settings' },
           s.settingsPrefix + enumText(SETTINGS_TEXT, snap.status, L.shell.unknownText) + (snap.writable === false ? s.readonly : ''),
         ),
       );
@@ -1171,7 +1181,7 @@ window.__ModuleLoader__.load({
         lines.push(
           h(
             'div',
-            { className: 'dsh-wb-status__line dsh-wb-status__mono', key: 'account' },
+            { className: 'dsh-wb-status__line', 'data-kv': '', key: 'account' },
             s.accountPrefix + (accUid === '' ? methodText : accUid + ' · ' + methodText),
           ),
         );
@@ -1242,7 +1252,7 @@ window.__ModuleLoader__.load({
           const human = src.startsWith('desktop-live:')
             ? s.sourceLive
             : (src.startsWith('desktop-cache') ? s.sourceCache : src);
-          lines.push(h('div', { className: 'dsh-wb-status__line', key: 'models' }, s.sourcePrefix + human));
+          lines.push(h('div', { className: 'dsh-wb-status__line', 'data-kv': '', key: 'models' }, s.sourcePrefix + human));
         }
         // ★★ 「支持 N/M 条目录项…」与「已隐藏 N 个未声明倍率的模型…」两行**已整体删除**
         //   （2026-10-01）。它们读的是 `status.cliModels`（废弃字段）与 `hiddenNoFactor`
@@ -1262,7 +1272,7 @@ window.__ModuleLoader__.load({
           lines.push(
             h(
               'div',
-              { className: 'dsh-wb-status__line', key: 'sessions' },
+              { className: 'dsh-wb-status__line', 'data-kv': '', key: 'sessions' },
               s.sessionsSome(resumable.length, sessionRows.length),
             ),
           );

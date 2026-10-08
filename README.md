@@ -159,6 +159,10 @@ $s = (Invoke-WebRequest -UseBasicParsing -Uri "$DSH_WEB/plugin-workbuddy/status"
 
 ---
 
+> **产品用户反馈台账**：[`PRODUCT-FEEDBACK.md`](./PRODUCT-FEEDBACK.md) —— 使用者视角的问题登记与口径核对。
+> 本轮**只登记、不修**：其中「57s 轮询窗口」「静默丢弃」「无终态回传」三条待决策；
+> 「换账号后 `config.model` 失效」已修 owner 一半，跨账号失效仍无代码防护。
+
 ## 安全边界
 
 - **自建自回收**：插件只写自己建的一次性下发记录，终态（成功/失败/超时/取消）一律回收，启动时再扫一遍遗留，不留会自己再跑的活任务；

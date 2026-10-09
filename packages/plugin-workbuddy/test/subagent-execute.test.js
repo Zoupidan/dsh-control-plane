@@ -33,6 +33,7 @@ import {
 //   "进程外委派"语义冲突。留下来的具名助手（回执尾注、权限告示、失败诊断）原样搬进了
 //   `notes.js`；正文的组装者是 `provider.js`。本文件改为在**存活的那两个面**上断言。
 import { PERMISSION_NOTE_MARK, receiptNote } from '../src/host/subagent/notes.js';
+import { PERMISSION_UNREAD } from '../src/shared/constants.js';
 import { createWorkBuddyProvider } from '../src/host/subagent/provider.js';
 import { REASON_CODES } from '../src/host/launch/reason-codes.js';
 
@@ -186,13 +187,20 @@ test('★ 施工单 2026-10-10 #2：请求 fullAccess ⇒ 会话读回 fullAcces
     automation: { ...okAutomation.automation, permission: 'fullAccess' },
   });
   assert.equal(legacy.permission.effective, 'fullAccess');
-  // 真的读不到 ⇒ 仍是 '(unknown)'（不编造），但这是唯一的 '(unknown)' 路径。
+  // ★ 请求过但真的读不到 ⇒ 显式标注 PERMISSION_UNREAD（施工单 #2：不得用含混的 '(unknown)'
+  //   —— "没读到"与"读到了但没兑现"必须可区分），confirmed 如实 false，不编造。
   const unknown = reportFromAutomation({
     status: 'completed',
     automation: { conversationId: 'c', phases: [], requestedPermissionMode: 'fullAccess' },
   });
-  assert.equal(unknown.permission.effective, '(unknown)');
+  assert.equal(unknown.permission.effective, PERMISSION_UNREAD);
   assert.equal(unknown.permission.confirmed, false);
+  // 一条权限都没请求 ⇒ 维持 '(unknown)' 原状（无告示可谈的场合，不新增语义）。
+  const unrequested = reportFromAutomation({
+    status: 'completed',
+    automation: { conversationId: 'c', phases: [], requestedPermissionMode: '' },
+  });
+  assert.equal(unrequested.permission.effective, '(unknown)');
 });
 
 test('★ 只走 automation：点火键名逐字对上，且 sessionKey/sessionStore 透给点火（adopt 记账用）', async () => {

@@ -30,6 +30,13 @@ export const TOOL_STATUS = 'workbuddy_status';
 export const TOOL_PURGE = 'workbuddy_purge';
 
 /**
+ * 权限读回失败的**显式标注**（施工单 2026-10-10 #2：读回失败不得用含混的 '(unknown)'）。
+ * 语义边界：请求过权限档、但会话侧没能读回实际值 —— "没读到"与"读到了但没兑现"
+ * 必须可区分；调用方一条权限都没请求时维持既有 '(unknown)' 原状（那时无告示可谈）。
+ */
+export const PERMISSION_UNREAD = '(unread: the session row did not report a permission mode)';
+
+/**
  * canonical 推理强度 7 档（§4.2 映射矩阵左列；v1 为 UPPERCASE，v3 canonical 用 lowercase）。
  * 抽取源：`_legacy/contracts-v1/dcp-messages.ts:32`（`'OFF'|'MINIMAL'|…|'MAX'`，7 档）。
  * ⚠️ 平台的"支持子集"由 `config.launch.effortValues` 的数据表决定（WorkBuddy 无 `off` ⇒ 置灰）；

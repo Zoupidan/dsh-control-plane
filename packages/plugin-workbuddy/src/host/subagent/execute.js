@@ -38,6 +38,7 @@ import {
 import { REASON_CODES } from '../launch/reason-codes.js';
 import { AUTOMATION_DEFAULTS, startAutomationRun } from '../gateway/automation.js';
 import { createFollowUpDispatcher, packageContentBlocks } from '../followup/dispatcher.js';
+import { PERMISSION_UNREAD } from '../../shared/constants.js';
 
 /**
  * 传输面归一：只有 `automation`。保留该函数只为兼容配置里的显式传值；
@@ -134,11 +135,12 @@ export function reportFromAutomation(out) {
     // ★ ★ 诚实声明：本传输面**没有**会话续接。
     continuity: 'fresh-conversation-per-round',
     // ★ 权限是否兑现：`requested` 与会话上**实际记着的** `permission_mode` 逐字比
-    //   （读回失败 ⇒ '(unknown)' 并 confirmed:false，绝不编造 —— 但**读到了就必须带出**，
-    //   不能再被形状失配吞成 '(unknown)'，见上方根因注）。
+    //   （★ 2026-10-10 施工单 #2：请求过但读不回 ⇒ 显式标注 PERMISSION_UNREAD，不再用含混的
+    //   '(unknown)' —— "没读到"与"读到了但没兑现"必须可区分；一条都没请求 ⇒ 无告示可谈，
+    //   维持 '(unknown)' 原状）。读到了就必须带出，不能被形状失配吞掉（见上方根因注）。
     permission: {
       requested,
-      effective: effective === '' ? '(unknown)' : effective,
+      effective: effective === '' ? (requested !== '' ? PERMISSION_UNREAD : '(unknown)') : effective,
       confirmed: permConfirmed,
     },
     // ★ 强度是否兑现：与 permission 同口径（requested/effective/confirmed），缺失 ⇒ '(unknown)'，不编造。
@@ -555,7 +557,8 @@ export function createTaskExecutor({
         continuity: 'fresh-conversation-per-round',
         permission: {
           requested: requestedPerm,
-          effective: directMeta.permissionMode ?? '(unknown)',
+          // ★ 请求过但读不回 ⇒ 显式标注（施工单 #2）；没请求过维持 '(unknown)' 原状。
+          effective: directMeta.permissionMode ?? (requestedPerm !== '' ? PERMISSION_UNREAD : '(unknown)'),
           confirmed: requestedPerm !== '' && requestedPerm === directMeta.permissionMode,
         },
         effort: {
@@ -594,7 +597,7 @@ export function createTaskExecutor({
         sessionId: directFail.conversationId,
         sessionOrigin: directFail.conversationId === null ? null : 'new',
         continuity: 'fresh-conversation-per-round',
-        permission: { requested: requestedPerm, effective: '(unknown)', confirmed: false },
+        permission: { requested: requestedPerm, effective: requestedPerm !== '' ? PERMISSION_UNREAD : '(unknown)', confirmed: false },
         effort: { requested: requestedEffort, effective: '(unknown)', confirmed: false },
         requestedEffort,
         effectiveEffort: null,
@@ -645,7 +648,7 @@ export function createTaskExecutor({
         sessionId: null,
         sessionOrigin: null,
         continuity: 'fresh-conversation-per-round',
-        permission: { requested: requestedPerm, effective: '(unknown)', confirmed: false },
+        permission: { requested: requestedPerm, effective: requestedPerm !== '' ? PERMISSION_UNREAD : '(unknown)', confirmed: false },
         effort: { requested: requestedEffort, effective: '(unknown)', confirmed: false },
       });
     }
@@ -669,7 +672,7 @@ export function createTaskExecutor({
         sessionId: null,
         sessionOrigin: null,
         continuity: 'fresh-conversation-per-round',
-        permission: { requested: requestedPerm, effective: '(unknown)', confirmed: false },
+        permission: { requested: requestedPerm, effective: requestedPerm !== '' ? PERMISSION_UNREAD : '(unknown)', confirmed: false },
         effort: { requested: requestedEffort, effective: '(unknown)', confirmed: false },
       });
     }

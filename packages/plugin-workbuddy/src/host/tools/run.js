@@ -33,7 +33,7 @@
 import { randomUUID } from 'node:crypto';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
-import { EFFORT_LEVELS, PLUGIN_ID, TOOL_RUN } from '../../shared/constants.js';
+import { EFFORT_LEVELS, PLUGIN_ID, TOOL_RUN, PERMISSION_UNREAD } from '../../shared/constants.js';
 import { OUTPUT_LIMIT_BYTES, REGISTRY_STATES } from '../config/constants.js';
 import { createFollowUpDispatcher, packageContentBlocks, FOLLOWUP_CODES } from '../followup/dispatcher.js';
 import { REASON_CODES } from '../launch/reason-codes.js';
@@ -873,7 +873,16 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
             runtime.setRegistry(REGISTRY_STATES.REGISTERED);
           }
           const reqPerm = typeof requestedPerm === 'string' ? requestedPerm : '';
-          const effPerm = typeof au.permission === 'string' ? au.permission : '';
+          // ★ 读回修复（施工单 2026-10-10 #2，与 subagent/execute.js reportFromAutomation 同根因）：
+          //   `au.permission` 在终态回执里是**对象** `{requested, effective, confirmed, …}`
+          //   （gateway/automation.js 组装点），另有 `effectivePermissionMode` 纯字符串键。
+          //   旧代码只认字符串 ⇒ lastRun（workbuddy_status 面）把读回值吞成 '(unknown)'。
+          //   现按形状容错读，与回执面同一条真源 —— 两处判据不许漂移。
+          const permFact = (au.permission !== null && typeof au.permission === 'object') ? au.permission : null;
+          const effPerm = (typeof au.effectivePermissionMode === 'string' && au.effectivePermissionMode !== ''
+            ? au.effectivePermissionMode
+            : (permFact !== null && typeof permFact.effective === 'string' ? permFact.effective
+              : (typeof au.permission === 'string' ? au.permission : '')));
           // ★ effort 回显（与 permission 同口径）：requested = 本次入参（含设置回落），effective = 会话上
           //   实际记着的 thought_level（automation.js sessionFacts 真源），缺失 ⇒ '(unknown)'，不编造。
           const reqEff = typeof requestedEffort === 'string' ? requestedEffort : '';
@@ -893,7 +902,8 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
             model: au.usedModelId ?? au.model ?? null,
             permission: {
               requested: reqPerm,
-              effective: effPerm === '' ? '(unknown)' : effPerm,
+              // ★ 请求过但读不回 ⇒ 显式标注（施工单 #2）；没请求过维持 '(unknown)' 原状。
+              effective: effPerm === '' ? (reqPerm !== '' ? PERMISSION_UNREAD : '(unknown)') : effPerm,
               confirmed: reqPerm !== '' && reqPerm === effPerm,
             },
             effort: {

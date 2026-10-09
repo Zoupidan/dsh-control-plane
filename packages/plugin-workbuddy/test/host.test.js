@@ -632,7 +632,7 @@ test('模块契约：name / inject 依赖声明与真机加载前提一致', { s
 
 test('第 ⑦ 面：ON ⇒ `workbuddy` 子智能体 provider 注册，且**一个 LLM 适配器都不许**注册', { skip: SKIP }, async () => {
   const host = boot({ enabled: true });
-  await waitFor(() => host.state.registration.size === 2);
+  await waitFor(() => host.state.registration.size === 3);
 
   // ★ 这条断言此前**根本不存在**，而 `ctx.inject(['subagents'], …)` 因为假件没有该服务
   //   从不回调 —— 也就是说"子智能体有没有真的注册进去"此前是**零覆盖**（假绿）。
@@ -653,14 +653,14 @@ test('第 ⑦ 面：ON ⇒ `workbuddy` 子智能体 provider 注册，且**一�
 
 test('第 ⑦ 面：OFF ⇒ provider 与适配器**一处都不许**注册（U4）', { skip: SKIP }, async () => {
   const host = boot({ enabled: false });
-  await waitFor(() => host.state.registration.size === 2);
+  await waitFor(() => host.state.registration.size === 3);
   assert.equal(host.subagents.providers.size, 0, 'enabled=false 时注册 provider = 比工具注册更宽的口子被撬开');
   assert.equal(host.llm.adapters.size, 0, 'enabled=false 时注册适配器 = LLM 路由里多一个无人可委派的面');
 });
 
 test('第 ⑦ 面：OFF ⇒ ON 的重收敛能补注册 provider，且适配器**永远**不补（上一条不是"永远不可注册"）', { skip: SKIP }, async () => {
   const host = boot({ enabled: false });
-  await waitFor(() => host.state.registration.size === 2);
+  await waitFor(() => host.state.registration.size === 3);
   assert.equal(host.subagents.getProvider('workbuddy'), undefined, 'OFF 时就不该有 provider');
   host.setEnabled(true);
   const ok = await waitFor(() => host.subagents.getProvider('workbuddy') !== undefined);
@@ -668,7 +668,7 @@ test('第 ⑦ 面：OFF ⇒ ON 的重收敛能补注册 provider，且适配器*
   assert.equal(host.llm.adapters.size, 0, '重收敛补的也只有 provider —— 适配器在任何路径上都不补');
 });
 
-test('判据① + ⑤：ON（已装）⇒ 注册两工具；每定义含 output.schema + 可调用 output.render', { skip: SKIP }, async () => {
+test('判据① + ⑤：ON（已装）⇒ 注册三工具；每定义含 output.schema + 可调用 output.render', { skip: SKIP }, async () => {
   const host = boot({ enabled: true });
   // ★ 必须等**探测出结论**，不能只等注册：工具是在探测在途期间乐观注册的（未结论 ≠ 未安装），
   //   所以 registration.size > 0 在第一帧就成立 —— 下面要读 `probe.method` / `probe.resolvedPath`，
@@ -678,7 +678,7 @@ test('判据① + ⑤：ON（已装）⇒ 注册两工具；每定义含 output.
   assert.equal(host.state.pendingInjects.length, 0, 'deferred inject 的依赖应全部就绪');
 
   const names = [...host.state.registration.keys()].sort();
-  assert.deepEqual(names, ['workbuddy_run', 'workbuddy_status']);
+  assert.deepEqual(names, ['workbuddy_purge', 'workbuddy_run', 'workbuddy_status']);
 
   for (const [name, def] of host.state.registration) {
     assert.equal(def.name, name);
@@ -858,7 +858,7 @@ test('并发上限 = 1（§7.4 M2）：在途未收敛时二次下发放拒绝�
 
 test('A4 最外层短路：开关转 OFF 后，仍持有的 run 定义 execute 抛错且不再 spawn', { skip: SKIP }, async () => {
   const host = boot({ enabled: true });
-  await waitFor(() => host.state.registration.size === 2);
+  await waitFor(() => host.state.registration.size === 3);
   const runDef = host.state.registration.get('workbuddy_run');
 
   host.setEnabled(false);
@@ -891,7 +891,7 @@ test('C-3 结论"未安装"落地 ⇒ 乐观注册被撤销（收敛点只有一
   //   withEnv：屏蔽本机真实安装位（那是 resolvedPath 的兜底源，会污染 evidence）。
   await withEnv({ ProgramFiles: 'C:\\__dsh_none__', ProgramW6432: undefined, 'ProgramFiles(x86)': undefined, LOCALAPPDATA: 'C:\\__dsh_none__' }, async () => {
     const host = boot({ enabled: true, desktopInstalled: false, catalog: null });
-    assert.equal(host.state.registration.size, 2, '未结论时在场');
+    assert.equal(host.state.registration.size, 3, '未结论时在场');
     const cleared = await waitFor(() => host.state.registration.size === 0);
     assert.ok(cleared, '结论 = 未安装 ⇒ 必须注销');
     assert.equal(host.state.spawnCalls.length, 0, '注销路径不触碰进程');
@@ -955,7 +955,7 @@ test('C-6 探测在途时被拨 OFF ⇒ 落 UNREGISTERED，不得冒充"未安�
   await withEnv({ ProgramFiles: 'C:\\__dsh_none__', ProgramW6432: undefined, 'ProgramFiles(x86)': undefined, LOCALAPPDATA: 'C:\\__dsh_none__' }, async () => {
     const gate = new Promise(() => {}); // 结论永不落地
     const host = boot({ enabled: true, cliPath: '', probeGate: gate });
-    assert.equal(host.state.registration.size, 2, '未结论时在场');
+    assert.equal(host.state.registration.size, 3, '未结论时在场');
     host.setEnabled(false);
     const off = await waitFor(() => host.state.registration.size === 0);
     assert.ok(off, 'OFF ⇒ 注销（硬闸与探测结论无关）');
@@ -967,7 +967,7 @@ test('C-6 探测在途时被拨 OFF ⇒ 落 UNREGISTERED，不得冒充"未安�
 
 test('空 prompt 拒收（真机 label 校验的前置守卫）：不 spawn、不建作业', { skip: SKIP }, async () => {
   const host = boot({ enabled: true });
-  await waitFor(() => host.state.registration.size === 2);
+  await waitFor(() => host.state.registration.size === 3);
   const runDef = host.state.registration.get('workbuddy_run');
   await assert.rejects(() => runDef.execute({ prompt: '   ' }, { signal: new AbortController().signal }), /non-empty/);
   assert.equal(host.state.spawnCalls.length, 0);
@@ -976,7 +976,7 @@ test('空 prompt 拒收（真机 label 校验的前置守卫）：不 spawn、�
 
 test('prompt 以 "-" 开头 ⇒ 拒收（防注入 CLI flag 的提权向量）', { skip: SKIP }, async () => {
   const host = boot({ enabled: true });
-  await waitFor(() => host.state.registration.size === 2);
+  await waitFor(() => host.state.registration.size === 3);
   const runDef = host.state.registration.get('workbuddy_run');
   await assert.rejects(
     () => runDef.execute({ prompt: '--permission-mode bypassPermissions do X' }, { signal: new AbortController().signal }),
@@ -1024,7 +1024,7 @@ test('半注册回滚（U4 抗击穿）：第二个 register 抛 ⇒ 已注册�
   //   早先用 OFF→ON 做这一步，清除会被 `!want` 分支顺带做掉 ⇒ 成功路径自己清不清都测不出来（M10 当时"能绿"）。
   host.state.registration.delete('workbuddy_status');
   await host.settingsService.update(host.state.settingsArgs.ns, { model: 'heal-model-x' });
-  const back = await waitFor(() => host.state.registration.size === 2);
+  const back = await waitFor(() => host.state.registration.size === 3);
   assert.ok(back, '占名者让开后的下一次 reconcile 应能重新注册');
   const healed = await host.statusPayload();
   assert.equal(healed.json.registry, 'REGISTERED');
@@ -1213,7 +1213,7 @@ test('三处同步（P2-11）：patch 的键集合与层级 = Config 声明；�
 
 test('卸载收敛：工具 / 路由 / prompt section / settings fiber 随 effect disposer 全清', { skip: SKIP }, async () => {
   const host = boot({ enabled: true });
-  await waitFor(() => host.state.registration.size === 2);
+  await waitFor(() => host.state.registration.size === 3);
   // ★ 2026-09-28：第 2 个路由是**只读诊断端点**（`/plugin-workbuddy/diagnostics`），
   //   加它的理由不是"多暴露点"：整条下发链路此前**零可观测性**——真机向两条空闲 sidecar
   //   下发全败，而 dsh-web.log 里连 workbuddy 都没出现，成因只能靠猜。
@@ -1419,7 +1419,7 @@ async function callRoute(route, { method = 'GET', remoteAddress = '127.0.0.1', h
 // ★ 2026-10-02 删除：CLI 传输已整体删除。scratch 目录净化那条逻辑（session_key 拼进 cwd）
 test('resume ②：resume:true 但该 key 无记录 ⇒ 抛错（点名 resume 与 session_key），零 spawn', { skip: SKIP }, async () => {
   const host = boot({ enabled: true });
-  await waitFor(() => host.state.registration.size === 2);
+  await waitFor(() => host.state.registration.size === 3);
   const runDef = host.state.registration.get('workbuddy_run');
   // 反向控制：同一次执行里，先证明"同一个 key 在省略 resume 时是可用的新会话"——否则上句是"永远抛错"
   const exec = { signal: new AbortController().signal };
@@ -1445,7 +1445,7 @@ test('resume ②：resume:true 但该 key 无记录 ⇒ 抛错（点名 resume �
 
 test('resume ③：resume:true 且未给 session_key ⇒ 抛错（新 key 无可续接），零 spawn', { skip: SKIP }, async () => {
   const host = boot({ enabled: true });
-  await waitFor(() => host.state.registration.size === 2);
+  await waitFor(() => host.state.registration.size === 3);
   const runDef = host.state.registration.get('workbuddy_run');
   await assert.rejects(
     () => runDef.execute({ prompt: 'continue what?', resume: true }, { signal: new AbortController().signal }),
@@ -1465,7 +1465,7 @@ test('resume ③：resume:true 且未给 session_key ⇒ 抛错（新 key 无可
 //   每轮走点火 INSERT once。
 test('resume ⑤：有记住 ⇒ 仍可二次下发（新对话 INSERT once、不走网关，真实 execute 载荷）', { skip: SKIP }, async () => {
   const host = boot({ enabled: true });
-  await waitFor(() => host.state.registration.size === 2);
+  await waitFor(() => host.state.registration.size === 3);
   const runDef = host.state.registration.get('workbuddy_run');
   const exec = { signal: new AbortController().signal };
   await seedSessions(host, { 'k-r': { cliSessionId: RECORDED_SID, lastUsedAt: 1 } });
@@ -1573,7 +1573,7 @@ test('sessionSummary：list() 抛错 / sessions 为 null / undefined / 无 list 
 // ★ 2026-10-02 删除：`failNextSpawn` 是 spawn 出口的注入面，网关路不再有"启动进程"这一步
 test('workbuddy_status 会话字段：sessionSummary 映射（session_key/cli_session_id/resumable/last_used_at）+ 倒序 + 非法 id 恒不可续接', { skip: SKIP }, async () => {
   const host = boot({ enabled: true });
-  await waitFor(() => host.state.registration.size === 2);
+  await waitFor(() => host.state.registration.size === 3);
   await seedSessions(host, {
     'k-valid': { cliSessionId: RECORDED_SID, lastUsedAt: 2000, outputBytes: 12 },
     'k-bogus': { cliSessionId: BOGUS_SID, lastUsedAt: 1000 },
@@ -1879,7 +1879,7 @@ test('B1：OFF ⇒ 探测从未启动；翻 ON ⇒ reconcile 补跑探测并注�
 
   // 用户拨开关：走真实 settings.update → volatile-update → reconcile 的同一条路径
   host.setEnabled(true);
-  const registered = await waitFor(() => host.state.registration.size === 2);
+  const registered = await waitFor(() => host.state.registration.size === 3);
   assert.ok(registered, '翻 ON 后 reconcile 必须补跑探测并注册（否则开关 ON 永远无效）');
   // ★ 必须等**探测出结论**：注册是乐观的（探测在途即注册），`probe !== null` 才是"补跑完成"的证据。
   const probed = await waitFor(async () => (await host.statusPayload()).json.probe !== null);
@@ -1895,7 +1895,7 @@ test('B1 负控：OFF 期间 spawn 恒零；探测从未启动时"未知乐观�
   const host = boot({ enabled: false });
   await new Promise((r) => setTimeout(r, 30));
   host.setEnabled(true); // 触发一次 reconcile（探测开始）
-  const registered = await waitFor(() => host.state.registration.size === 2);
+  const registered = await waitFor(() => host.state.registration.size === 3);
   assert.ok(registered);
   assert.equal(host.state.spawnCalls.length, 0, '仅注册不 spawn（执行面另有 A4 门）');
 });

@@ -114,6 +114,87 @@ test('权限是否兑现由两边真值逐字比，不在这一侧自称', () =>
   assert.equal(ignored.permission.confirmed, false, '请求的档与实际记着的档不一致 ⇒ 未兑现');
 });
 
+test('★ 施工单 2026-10-10 #2：请求 fullAccess ⇒ 会话读回 fullAccess（真源形状 = startAutomationRun 终态回执）', () => {
+  // ★ 形状取自 gateway/automation.js 终态组装点（成功分支 return 的 automation.permission
+  //   是**对象** `{requested, effective, confirmed}`，另有 `requestedPermissionMode` /
+  //   `effectivePermissionMode` 两个纯字符串键）。旧代码把 `au.permission` 当字符串读 ⇒
+  //   恒不命中 ⇒ 读回值被吞成 '(unknown)'，每轮回执都报 "NOT confirmed (unknown)"。
+  //   本用例按**真实对象形状**钉死：读回必须透传，绝不退回 '(unknown)'。
+  const terminalShape = {
+    status: 'completed',
+    automation: {
+      reason: null,
+      automationId: 'automation-9',
+      conversationId: 'conv-9',
+      sessionId: 'conv-9',
+      sessionKey: 'k',
+      sessionPersist: { ok: true },
+      retired: true,
+      transcriptPath: null,
+      reply: 'PERM-READBACK-OK',
+      artifacts: [],
+      creditsUsed: null,
+      model: 'glm-5.3-flash',
+      usedModelId: 'glm-5.3-flash',
+      // ★ 真源形状：对象 + 两个字符串键（automation.js:1507-1528 逐字段同形）。
+      permission: {
+        requested: 'fullAccess',
+        effective: 'fullAccess',
+        confirmed: true,
+        toString() { return 'fullAccess'; },
+        valueOf() { return 'fullAccess'; },
+        [Symbol.toPrimitive](hint) { return hint === 'string' ? 'fullAccess' : true; },
+      },
+      requestedPermissionMode: 'fullAccess',
+      effectivePermissionMode: 'fullAccess',
+      sessionCwd: null,
+      requestedEffort: null,
+      effectiveEffort: null,
+      effort: {
+        requested: null,
+        effective: null,
+        confirmed: false,
+        toString() { return ''; },
+        valueOf() { return ''; },
+        [Symbol.toPrimitive](hint) { return hint === 'string' ? '' : false; },
+      },
+      title: null,
+      createdAt: null,
+      tokensUsed: null,
+      phases: ['db-open', 'awaiting-scheduler-tick', 'running'],
+    },
+  };
+  const r = reportFromAutomation(terminalShape);
+  assert.equal(r.permission.requested, 'fullAccess');
+  assert.equal(r.permission.effective, 'fullAccess', '会话读回的档必须透传，不得被形状失配吞成 (unknown)');
+  assert.equal(r.permission.confirmed, true, '请求 fullAccess 且会话读回 fullAccess ⇒ 已兑现');
+  // 反向对照：请求与读回不一致 ⇒ 如实 confirmed:false（带真实读回值，而不是 (unknown)）。
+  const mismatched = reportFromAutomation({
+    ...terminalShape,
+    automation: {
+      ...terminalShape.automation,
+      permission: { ...terminalShape.automation.permission, requested: 'bypassPermissions', effective: 'fullAccess', confirmed: false },
+      requestedPermissionMode: 'bypassPermissions',
+    },
+  });
+  assert.equal(mismatched.permission.requested, 'bypassPermissions');
+  assert.equal(mismatched.permission.effective, 'fullAccess');
+  assert.equal(mismatched.permission.confirmed, false);
+  // 旧字符串形状（early-fail 分支 / 旧测试同款）保持兼容。
+  const legacy = reportFromAutomation({
+    status: 'completed',
+    automation: { ...okAutomation.automation, permission: 'fullAccess' },
+  });
+  assert.equal(legacy.permission.effective, 'fullAccess');
+  // 真的读不到 ⇒ 仍是 '(unknown)'（不编造），但这是唯一的 '(unknown)' 路径。
+  const unknown = reportFromAutomation({
+    status: 'completed',
+    automation: { conversationId: 'c', phases: [], requestedPermissionMode: 'fullAccess' },
+  });
+  assert.equal(unknown.permission.effective, '(unknown)');
+  assert.equal(unknown.permission.confirmed, false);
+});
+
 test('★ 只走 automation：点火键名逐字对上，且 sessionKey/sessionStore 透给点火（adopt 记账用）', async () => {
   const seen = [];
   const fakeAutomation = (req) => {

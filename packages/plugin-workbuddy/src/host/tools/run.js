@@ -509,7 +509,10 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
     // 两条纪律：绝不抛（异常也收敛为回退）；绝不静默（走向写在回执与 lastRun 里）。
     let followUpMeta = null;    // 成功：{ channel, elapsedMs, conversationId, output }
     let fallbackReason = null;  // 失败：RFC §4.2 指纹码（回执 fallbackReason）
-    if (intent === true && recorded !== null && c.enableMultiTurnFollowUp === true) {
+    // ★ 追发尝试收敛成**一个**入口（施工单 2026-10-10 #1b）：总闸开着时点火轮先试、
+    //   direct ignition 分支兜底时再试 —— 两处共用同一份代码，行为不会漂移。
+    //   成功 ⇒ `followUpMeta` 置位（下游三分支据此合成"已完成"作业包）；失败 ⇒ forget + 指纹码。
+    const attemptFollowUp = async (record) => {
       const followUpFn = typeof seams.followUp === 'function'
         ? seams.followUp
         : createFollowUpDispatcher({
@@ -523,7 +526,7 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
         // ★ prompt 必须 ContentBlock 数组打包（桌面端拒收裸字符串）；裸字符串在 dispatcher
         //   侧同样被拒 —— 双保险，契约见 followup/dispatcher.js。
         outcome = await followUpFn({
-          conversationId: recorded.cliSessionId,
+          conversationId: record.cliSessionId,
           prompt: packageContentBlocks(args.prompt),
           timeoutMs: c.followupTimeoutMs,
         });
@@ -536,7 +539,7 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
         followUpMeta = {
           channel: typeof outcome.channel === 'string' && outcome.channel !== '' ? outcome.channel : 'track_a',
           elapsedMs: Date.now() - startedAt,
-          conversationId: recorded.cliSessionId,
+          conversationId: record.cliSessionId,
           output: typeof outcome.receipt?.output === 'string' ? outcome.receipt.output : '',
           // ★ 施工单 #2 只读识别：会话当前模型/思考强度（dispatcher 派发前经
           //   `wb:conversations:get` 读到什么就带什么；读不到为 null —— 不编造、不复位）。
@@ -562,6 +565,12 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
           else if (typeof sessions?.supersede === 'function') sessions.supersede(sessionKey);
         } catch { /* 回收失败 = 下轮多建一次，不拦兜底 */ }
       }
+    };
+    // 触发条件（三条同时成立）：① args.resume === true（调用方显式续接意图）② 记性命中
+    //   ③ 总闸未显式关闭（`!== false`：默认 true ⇒ 开；显式 false ⇒ 尊重用户选择，但
+    //   resume:true 的续接仍由下方 direct ignition 分支兜底，不会静默开新对话）。
+    if (intent === true && recorded !== null && c.enableMultiTurnFollowUp !== false) {
+      await attemptFollowUp(recorded);
     }
 
     // ═══ 可二次下发：每轮都走点火 INSERT 一行 once，不再有“已记住就失败”分支 ═══
@@ -642,6 +651,19 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
     let directMeta = null;
     let directFail = null;
     let resolvedModelId;   // direct 轮算过 ⇒ 计划任务分支复用（未尝试 ⇒ undefined）
+    // ★ 施工单 2026-10-10 #1b：direct ignition **不再无条件新建对话**。调用方传了
+    //   `resume:true` 且记性里仍有可续接会话 ⇒ 先走追发续接（followUp 语义与 direct 模式
+    //   打通）；记性无记录（未命中 / 追发失败已 forget）⇒ 照旧直建新对话并 adopt。
+    //   上面总闸开着时已经试过追发：成功 ⇒ followUpMeta 非空（本块整体跳过）、失败 ⇒
+    //   fallbackReason 非空且记性已清 ⇒ 这里不会重复追发。这一段兜的是总闸被显式配成
+    //   `false` 的场合 —— resume 的续接承诺不因总闸关闭而静默失效。
+    if (followUpMeta === null && c.enableDirectIgnition === true && intent === true
+      && fallbackReason === null && typeof sessions?.resumable === 'function') {
+      const stillRecorded = sessions.resumable(sessionKey);
+      if (stillRecorded !== null && typeof stillRecorded.cliSessionId === 'string' && stillRecorded.cliSessionId !== '') {
+        await attemptFollowUp(stillRecorded);
+      }
+    }
     if (followUpMeta === null && c.enableDirectIgnition === true) {
       const igniteFn = typeof seams.directIgnite === 'function'
         ? seams.directIgnite

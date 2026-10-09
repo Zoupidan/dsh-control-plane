@@ -26,6 +26,8 @@ export const NS = PACKAGE_NAME;
 /** 模型可见工具名（§3.4.2：注册/注销以这一对为准）。 */
 export const TOOL_RUN = 'workbuddy_run';
 export const TOOL_STATUS = 'workbuddy_status';
+/** 精准清理对话（施工单 2026-10-10 #3：软删一条对话 + 清 session map 记性）。 */
+export const TOOL_PURGE = 'workbuddy_purge';
 
 /**
  * canonical 推理强度 7 档（§4.2 映射矩阵左列；v1 为 UPPERCASE，v3 canonical 用 lowercase）。

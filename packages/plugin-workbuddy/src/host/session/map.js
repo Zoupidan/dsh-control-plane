@@ -810,6 +810,86 @@ export function loadSessionMap(ctx, ns) {
       return api.supersede(key, typeof reason === 'string' && reason !== '' ? reason : 'superseded');
     },
 
+    /**
+     * ★ 彻底清除一条记录（施工单 2026-10-10 #3：`workbuddy_purge` 的记性清理口）。
+     *
+     * <p>与 `supersede`/`forget` 的区别：那两个是"保留 id 作历史留痕、只停自动续接"；
+     * 本方法是**真删** —— 内存条目直接移除，settings 用户层里 `sessions.<key>` 经
+     * `settings.mutate(ns, [{op:'unset', path:['sessions', key]}])` 删除（0.1.7 面上
+     * `mutate` 的 unset 语义：叶子命中 ⇒ `Reflect.deleteProperty`，契约见
+     * `dsh-settings/lib/index.js:488-499` 与 `applyPathOp` —— 真机源逐字核对，非猜测）。
+     *
+     * <p>降级链（每级都如实回报，不谎报已删）：
+     *  1. `mutate` 可用 ⇒ unset 删除（`mode:'deleted'`）；
+     *  2. `mutate` 缺席（极简假宿主）⇒ 退化为 tombstone（`supersede` 标记，`mode:'tombstoned'`
+     *     —— 不再可续接，但 settings 里留有历史 id）；
+     *  3. 连 settings 服务都没有 ⇒ 只清内存（`mode:'memory-only'`，重启后旧记录会回来 —— 如实说）。
+     *
+     * <p>没有记录 ⇒ 安全 no-op（`ok:false, mode:'no_record'`），绝不凭空造写。
+     *
+     * @param {string} key
+     * @returns {{ ok: boolean, mode: 'deleted'|'tombstoned'|'memory-only'|'no_record', persistError: string }}
+     */
+    purge(key) {
+      if (typeof key !== 'string' || key === '') {
+        return { ok: false, mode: 'no_record', persistError: 'empty session key' };
+      }
+      const existed = api.lookup(key);
+      if (existed === null) {
+        return { ok: false, mode: 'no_record', persistError: 'no record for this session key' };
+      }
+      memory.delete(key);
+      const svc = settingsService();
+      if (svc !== null && typeof svc.mutate === 'function') {
+        persistenceState.attempts += 1;
+        persistenceState.pending += 1;
+        try {
+          const result = svc.mutate(ns, [{ op: 'unset', path: ['sessions', key] }]);
+          const settle = (okFlag, message) => {
+            persistenceState.pending -= 1;
+            if (okFlag) { persistenceState.ok += 1; return; }
+            persistenceState.failures += 1;
+            persistenceState.lastError = message;
+            persistenceState.lastFailure = { key, error: message, at: Date.now() };
+          };
+          if (result !== null && typeof result?.then === 'function') {
+            void Promise.resolve(result).then(
+              () => settle(true, ''),
+              (err) => {
+                const message = err instanceof Error ? err.message : String(err);
+                settle(false, message);
+                ctx.logger?.warn?.(`[dsh-plugin-workbuddy] session map purge 落盘失败（${key}）：${message}`);
+              },
+            );
+            return { ok: true, mode: 'deleted', persistError: '' };
+          }
+          settle(true, '');
+          return { ok: true, mode: 'deleted', persistError: '' };
+        } catch (err) {
+          persistenceState.pending -= 1;
+          persistenceState.failures += 1;
+          const message = err instanceof Error ? err.message : String(err);
+          persistenceState.lastError = message;
+          persistenceState.lastFailure = { key, error: message, at: Date.now() };
+          // mutate 同步抛 ⇒ 退化为 tombstone（至少停止续接），错误如实带回。
+          try { api.supersede(key, 'purge-fallback'); return { ok: true, mode: 'tombstoned', persistError: message }; }
+          catch { return { ok: false, mode: 'memory-only', persistError: message }; }
+        }
+      }
+      // 没有 mutate（极简假宿主）⇒ tombstone 兜底；连 settings 服务都没有 ⇒ 只清内存。
+      if (svc === null) {
+        persistenceState.noop += 1;
+        persistenceState.lastError = 'settings surface unavailable';
+        return { ok: true, mode: 'memory-only', persistError: 'settings surface unavailable' };
+      }
+      try {
+        api.supersede(key, 'purge-fallback');
+        return { ok: true, mode: 'tombstoned', persistError: '' };
+      } catch (err) {
+        return { ok: false, mode: 'memory-only', persistError: err instanceof Error ? err.message : String(err) };
+      }
+    },
+
     /** 合并视图：settings 用户层（若有）+ 内存态（**内存优先 = 更新**）。 */
     list() {
       const merged = new Map();

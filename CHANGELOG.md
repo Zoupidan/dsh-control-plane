@@ -24,6 +24,8 @@
 - **设置卡片**：状态区 +1 行「每日签到：今日已领（今日 +N，连签 M 天）/ 今日未领，将自动领取 / 签到活动已结束」；配置组 +1 个开关「自动领取每日积分」。没读到就说"暂时读不到签到状态"，不猜已领/未领。
 - **落盘快照**（供离线显示）：`checkinLastAt` / `checkinLastResult`（claimed / already / inactive / failed-*）/ `checkinLastCredit` / `checkinStreakDays`，与积分四字段同一条 volatile 硬约束。
 
+> ⚠️ 备注：dsh有了这个插件越来越懒了什么都派出去干。
+
 ### 维护（Chore）
 
 - `automationTimeoutMs` 默认改为 **15 分钟**（900000ms）。

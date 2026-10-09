@@ -70,13 +70,13 @@ export const Config = z.object({
   // 自动化任务超时（毫秒）。默认 15 分钟（900_000ms）。
   automationTimeoutMs: z.number().default(900_000).volatile(),
   // ═══ 多轮追发（★ 2026-10-03 M2 新增；RFC-SESSION-RESUME-INTEGRATION §6 Phase 2/3）═══
-  // `enableMultiTurnFollowUp` = Track A（CDP 直发既有对话）的**总闸，默认 false**（opt-in）：
-  //   开着时，仅当调用方 `resume:true` 且记性命中可续接会话，`workbuddy_run` 才先尝试把
-  //   prompt 追发进既有对话（`src/host/followup/dispatcher.js`）；追发失败按 RFC §4.2
-  //   优雅回退（forget 记性 → 照旧点火新会话），关着时行为与未接线版本逐字节一致。
-  //   默认 false 的依据：回执形状/参数打包均为探针逆向所得，**pending live calibration**，
-  //   未过真机校准前不得默认启用（零回归门禁的保守面）。
-  enableMultiTurnFollowUp: z.boolean().default(false).volatile(),
+  // `enableMultiTurnFollowUp` = Track A（CDP 直发既有对话）的**总闸，默认 true**（2026-10-10
+  //   用户拍板翻默认；原 false 是 live-calibration 前的保守面，回执形状/参数打包已于 2026-10-03
+  //   真机校准闭环 —— 保守期的理由不再成立）。开着时，调用方 `resume:true` 且记性命中可续接
+  //   会话 ⇒ `workbuddy_run` 先尝试把 prompt 追发进既有对话（`src/host/followup/dispatcher.js`），
+  //   direct ignition 分支同样遵守（记性命中 ⇒ 续接，不再无条件直建新对话）；追发失败按 RFC §4.2
+  //   优雅回退（forget 记性 → 照旧点火新会话）。显式配 `false` 仍可整体关闭。
+  enableMultiTurnFollowUp: z.boolean().default(true).volatile(),
   // Track A 的 CDP 远程调试口（桌面端须以 WORKBUDDY_REMOTE_DEBUGGING_PORT 启动才监听）。
   // 9222 与外部 Chrome/Edge 的调试口共用是常态 ⇒ 调度器按 UA + target 指纹双证据严格判别
   // （真机 2026-10-03：/json/version 的 Browser 只写 "Chrome/138…"，身份在 User-Agent），

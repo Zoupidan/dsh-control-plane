@@ -28,6 +28,7 @@ import { disabledSnapshot, readCostCatalog } from '../launch/cost-catalog.js';
 //   都在状态路由里直接回传，不再需要往磁盘上发快照。
 import { makeRunTool } from './run.js';
 import { makeStatusTool } from './status.js';
+import { makePurgeTool } from './purge.js';
 
 /**
  * @param {object} ctx 宿主 ctx（插件级）
@@ -83,6 +84,9 @@ export function reconcileTools(ctx, { runtime, sessions, config, Config, NS, det
         next.push(ctx.tools.register(makeRunTool(runtime, sessions, read, ctx, credits ?? null, dispatch)));
         // sessions：状态工具要回传"可续接会话"（与状态路由同源）。
         next.push(ctx.tools.register(makeStatusTool(runtime, read, ctx, sessions, dispatch, checkin ?? null, credits ?? null)));
+        // ★ 精准清理面（施工单 2026-10-10 #3）：软删一条对话 + 清 session map 记性。
+        //   db 缺省由工具内部按 WORKBUDDY_HOME 现开（测试注入）。
+        next.push(ctx.tools.register(makePurgeTool(runtime, read, ctx, sessions, null)));
       } catch (err) {
         for (const d of next) d();
         runtime.setRegistrationError(err instanceof Error ? err.message : String(err));

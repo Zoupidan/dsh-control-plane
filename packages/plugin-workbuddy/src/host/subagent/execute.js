@@ -86,13 +86,34 @@ export function reportFromAutomation(out) {
   const ok = out?.status === 'completed';
   const isStillRunning = out?.status === 'still_running';
   const requested = typeof au.requestedPermissionMode === 'string' ? au.requestedPermissionMode : '';
-  const effective = typeof au.permission === 'string' ? au.permission : '';
+  // ★★ 读回修复（施工单 2026-10-10 #2 的根因）：`startAutomationRun` 成功回执里的
+  //   `au.permission` 是**对象** `{requested, effective, confirmed, …}`（gateway/automation.js
+  //   终态组装点），不是字符串 —— 旧代码 `typeof au.permission === 'string'` 恒不命中，
+  //   会话上真实记着的 `permission_mode`（如 fullAccess）在这里被丢成 '' ⇒ 折成 '(unknown)'，
+  //   每轮回执都报 "NOT confirmed to be in effect (session reports (unknown))"。
+  //   现按形状容错读：优先结构化两键（`effectivePermissionMode` 纯字符串 / 对象 `.effective`），
+  //   旧字符串形状保留兼容；confirmed 以对象里的布尔为准（对象缺席才按逐字比推）。
+  const permFact = (au.permission !== null && typeof au.permission === 'object') ? au.permission : null;
+  const effective = (typeof au.effectivePermissionMode === 'string' && au.effectivePermissionMode !== ''
+    ? au.effectivePermissionMode
+    : (permFact !== null && typeof permFact.effective === 'string' ? permFact.effective
+      : (typeof au.permission === 'string' ? au.permission : '')));
+  const permConfirmed = permFact !== null && typeof permFact.confirmed === 'boolean'
+    ? permFact.confirmed
+    : (requested !== '' && requested === effective);
   const requestedModel = typeof au.requestedModelId === 'string' ? au.requestedModelId : '';
   // ★ effort 真源与 permission 同口径：requested = 点火写入 reasoning_effort 的值，
   //   effective = 会话上实际记着的 thought_level（automation.js sessionFacts）。
+  //   同一形状容错：`au.effort` 在终态回执里也是对象（同上根因），`effectiveEffort` 是纯字符串。
   const requestedEffort = typeof au.requestedEffort === 'string' ? au.requestedEffort : '';
-  const effectiveEffort = typeof au.effectiveEffort === 'string' ? au.effectiveEffort
-    : (typeof au.effort === 'string' ? au.effort : '');
+  const effortFact = (au.effort !== null && typeof au.effort === 'object') ? au.effort : null;
+  const effectiveEffort = (typeof au.effectiveEffort === 'string' && au.effectiveEffort !== ''
+    ? au.effectiveEffort
+    : (effortFact !== null && typeof effortFact.effective === 'string' ? effortFact.effective
+      : (typeof au.effort === 'string' ? au.effort : '')));
+  const effortConfirmed = effortFact !== null && typeof effortFact.confirmed === 'boolean'
+    ? effortFact.confirmed
+    : (requestedEffort !== '' && requestedEffort === effectiveEffort);
   return {
     ok: ok || isStillRunning,
     transport: 'automation',
@@ -112,17 +133,19 @@ export function reportFromAutomation(out) {
     sessionOrigin: au.conversationId ? 'new' : null,
     // ★ ★ 诚实声明：本传输面**没有**会话续接。
     continuity: 'fresh-conversation-per-round',
-    // ★ 权限是否兑现：`requested` 与会话上**实际记着的** `permission_mode` 逐字比。
+    // ★ 权限是否兑现：`requested` 与会话上**实际记着的** `permission_mode` 逐字比
+    //   （读回失败 ⇒ '(unknown)' 并 confirmed:false，绝不编造 —— 但**读到了就必须带出**，
+    //   不能再被形状失配吞成 '(unknown)'，见上方根因注）。
     permission: {
       requested,
       effective: effective === '' ? '(unknown)' : effective,
-      confirmed: requested !== '' && requested === effective,
+      confirmed: permConfirmed,
     },
     // ★ 强度是否兑现：与 permission 同口径（requested/effective/confirmed），缺失 ⇒ '(unknown)'，不编造。
     effort: {
       requested: requestedEffort,
       effective: effectiveEffort === '' ? '(unknown)' : effectiveEffort,
-      confirmed: requestedEffort !== '' && requestedEffort === effectiveEffort,
+      confirmed: effortConfirmed,
     },
     requestedEffort,
     effectiveEffort: effectiveEffort === '' ? null : effectiveEffort,
@@ -280,13 +303,10 @@ export function createTaskExecutor({
     // ★ 回退来源：`followup`（既有语义）或 `direct`（2026-10-04 direct ignition 派发前失败）。
     //   只影响 `withFallback` 那句诊断的话术 —— 两者回执形状逐字相同，但"为什么回退"不许混说。
     let fallbackOrigin = 'followup';
-    const followUpWanted = setting('enableMultiTurnFollowUp') === true;
-    const recorded = (followUpWanted && taskKey !== '' && sessions !== null && typeof sessions.resumable === 'function')
-      ? sessions.resumable(taskKey)
-      : null;
-    if (recorded !== null && typeof recorded.cliSessionId === 'string' && recorded.cliSessionId !== '') {
-      // ★ seam：注入的 followUp（测试/上层复用）优先；缺省惰性构造真 dispatcher ——
-      //   构造点在开关**与**记性都命中之后，开关关闭时一次都不会构造（run.js 的 seams 同风格）。
+    // ★ 追发尝试收敛成**一个**入口（施工单 2026-10-10 #1b）：总闸开着时点火轮先试、
+    //   direct ignition 分支兜底时再试 —— 两处共用同一份代码，行为不会漂移。
+    //   成功 ⇒ 返回统一形状回执对象（调用方直接 return）；失败 ⇒ forget + 指纹码，返回 null。
+    const runFollowUpAttempt = async (record) => {
       const followUpFn = typeof followUp === 'function'
         ? followUp
         : createFollowUpDispatcher({
@@ -298,7 +318,7 @@ export function createTaskExecutor({
       let outcome;
       try {
         outcome = await followUpFn({
-          conversationId: recorded.cliSessionId,
+          conversationId: record.cliSessionId,
           // ★ prompt 必须打包成 ContentBlock 数组（桌面端拒收裸字符串；run.js 双保险同款）。
           prompt: packageContentBlocks(prompt),
           timeoutMs: setting('followupTimeoutMs'),
@@ -314,7 +334,7 @@ export function createTaskExecutor({
         followUpMeta = {
           channel: typeof outcome.channel === 'string' && outcome.channel !== '' ? outcome.channel : 'track_a',
           elapsedMs: Date.now() - startedAt,
-          conversationId: recorded.cliSessionId,
+          conversationId: record.cliSessionId,
           // ★ 施工单 #2 只读识别：会话当前模型/思考强度（读到什么带什么，读不到 null；
           //   与 tools/run.js 的 follow_up 两键同名同义，绝不回写、绝不复位）。
           conversationModel: typeof outcome.receipt?.conversationModel === 'string'
@@ -340,7 +360,7 @@ export function createTaskExecutor({
           reason: REASON_CODES.OK,
           phases: ['followup-dispatch'],
           receipt: null,
-          sessionId: recorded.cliSessionId,
+          sessionId: record.cliSessionId,
           // ★ 同一条对话续用：origin 用 'resumed'（notes.js 词表 2026-10-03 起认它），不谎称 'new'。
           sessionOrigin: 'resumed',
           continuity: 'same-conversation',
@@ -374,6 +394,20 @@ export function createTaskExecutor({
       try {
         if (typeof sessions.forget === 'function') sessions.forget(taskKey, fallbackReason);
       } catch { /* 回收失败 = 下轮多建一次，不拦兜底 */ }
+      return null;
+    };
+    // 触发条件（三条同时成立；任一不成立 ⇒ 本块整体跳过，行为与未接线版本逐字节一致）：
+    //   ① setting('enableMultiTurnFollowUp') !== false（设置总闸，默认 true —— 2026-10-10
+    //     用户拍板翻默认；显式 false 时本块跳过，但 resume 续接由 direct ignition 分支兜底）
+    //   ② taskKey 非空（没有归组键就没有"同一条对话"可言）
+    //   ③ sessions.resumable(taskKey) 命中可续接对话
+    const followUpWanted = setting('enableMultiTurnFollowUp') !== false;
+    const recorded = (followUpWanted && taskKey !== '' && sessions !== null && typeof sessions.resumable === 'function')
+      ? sessions.resumable(taskKey)
+      : null;
+    if (recorded !== null && typeof recorded.cliSessionId === 'string' && recorded.cliSessionId !== '') {
+      const followUpReceipt = await runFollowUpAttempt(recorded);
+      if (followUpReceipt !== null) return followUpReceipt;
     }
     // ★★ 回退轮（追发失败 ⇒ 照旧点火）的**统一出口装饰**：execute 层两键 + 失败诊断里带指纹码。
     //   `fallbackReason` 给 notes.js 渲染 `fallback=<code>` 位；诊断合并点在 `error.message` 上
@@ -423,6 +457,19 @@ export function createTaskExecutor({
     // 纪律沿用：绝不抛（异常收敛为可回退的派发前失败）；绝不静默（走向写在回执与诊断话术里）。
     let directMeta = null;
     let directFail = null;
+    // ★ 施工单 2026-10-10 #1b：direct ignition **不再无条件新建对话**。记性里仍有可续接
+    //   会话 ⇒ 先走追发续接（followUp 语义与 direct 模式打通）；记性无记录（未命中 /
+    //   追发失败已 forget）⇒ 照旧直建新对话并 adopt。总闸开着时上面已试过追发：成功 ⇒
+    //   followUpMeta 非空（本块整体跳过）、失败 ⇒ fallbackReason 非空且记性已清 ⇒ 不会
+    //   重复追发。这一段兜的是总闸被显式配成 `false` 的场合 —— 续接承诺不因总闸静默失效。
+    if (followUpMeta === null && setting('enableDirectIgnition') === true && fallbackReason === null
+      && taskKey !== '' && sessions !== null && typeof sessions.resumable === 'function') {
+      const stillRecorded = sessions.resumable(taskKey);
+      if (stillRecorded !== null && typeof stillRecorded.cliSessionId === 'string' && stillRecorded.cliSessionId !== '') {
+        const followUpReceipt = await runFollowUpAttempt(stillRecorded);
+        if (followUpReceipt !== null) return followUpReceipt;
+      }
+    }
     if (followUpMeta === null && setting('enableDirectIgnition') === true) {
       const igniteDirectFn = typeof directIgnite === 'function'
         ? directIgnite

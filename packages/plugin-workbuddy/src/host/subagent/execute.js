@@ -30,6 +30,11 @@
  * @module host/subagent/execute
  */
 
+import { randomUUID } from 'node:crypto';
+import {
+  acquireWorkspaceLock as defaultAcquireWorkspaceLock,
+  releaseWorkspaceLock as defaultReleaseWorkspaceLock,
+} from '../config/runtime.js';
 import { REASON_CODES } from '../launch/reason-codes.js';
 import { AUTOMATION_DEFAULTS, startAutomationRun } from '../gateway/automation.js';
 import { createFollowUpDispatcher, packageContentBlocks } from '../followup/dispatcher.js';
@@ -79,6 +84,7 @@ export function automationModelId(model) {
 export function reportFromAutomation(out) {
   const au = out?.automation ?? {};
   const ok = out?.status === 'completed';
+  const isStillRunning = out?.status === 'still_running';
   const requested = typeof au.requestedPermissionMode === 'string' ? au.requestedPermissionMode : '';
   const effective = typeof au.permission === 'string' ? au.permission : '';
   const requestedModel = typeof au.requestedModelId === 'string' ? au.requestedModelId : '';
@@ -88,11 +94,11 @@ export function reportFromAutomation(out) {
   const effectiveEffort = typeof au.effectiveEffort === 'string' ? au.effectiveEffort
     : (typeof au.effort === 'string' ? au.effort : '');
   return {
-    ok,
+    ok: ok || isStillRunning,
     transport: 'automation',
     text: typeof au.reply === 'string' ? au.reply : '',
-    reason: ok ? REASON_CODES.OK : (au.reason ?? REASON_CODES.TASK_ERROR),
-    error: ok ? undefined : {
+    reason: ok ? REASON_CODES.OK : (isStillRunning ? REASON_CODES.STILL_RUNNING : (au.reason ?? REASON_CODES.TASK_ERROR)),
+    error: (ok || isStillRunning) ? undefined : {
       code: au.reason ?? REASON_CODES.TASK_ERROR,
       message: typeof out?.detail === 'string' ? out.detail : 'the automation run did not complete',
     },
@@ -167,7 +173,11 @@ export function reportFromAutomation(out) {
 export function createTaskExecutor({
   automation = null, setting = () => undefined, onPhase = null, sessions = null, followUp = null, log = null,
   directIgnite = null,
+  acquireWorkspaceLock = null, releaseWorkspaceLock = null,
 } = {}) {
+  const acquireLock = typeof acquireWorkspaceLock === 'function' ? acquireWorkspaceLock : defaultAcquireWorkspaceLock;
+  const releaseLock = typeof releaseWorkspaceLock === 'function' ? releaseWorkspaceLock : defaultReleaseWorkspaceLock;
+
   /** @type {Map<string, Array<{role: 'user'|'assistant', text: string}>>} */
   const transcript = new Map();
   const MAX_TURNS = 8;
@@ -226,6 +236,30 @@ export function createTaskExecutor({
         effort: { requested: '', effective: '(unknown)', confirmed: false },
       };
     }
+
+    const taskCwd = typeof req.cwd === 'string' ? req.cwd : '';
+    const subagentJobId = `subagent-${randomUUID()}`;
+    if (!acquireLock(taskCwd, subagentJobId)) {
+      return {
+        ok: false,
+        transport: 'automation',
+        text: '',
+        reason: REASON_CODES.WORKSPACE_BUSY,
+        error: {
+          code: REASON_CODES.WORKSPACE_BUSY,
+          message: 'WorkBuddy workspace is busy: another job is in flight in this workspace.',
+        },
+        phases: [],
+        receipt: null,
+        sessionId: null,
+        sessionOrigin: null,
+        continuity: 'fresh-conversation-per-round',
+        permission: { requested: '', effective: '(unknown)', confirmed: false },
+        effort: { requested: '', effective: '(unknown)', confirmed: false },
+      };
+    }
+
+    try {
     // ═══ M2 Track A 追发（会话复用；与 `tools/run.js` 同一条三条件语义，第二个调用点）══════
     // 触发条件（三条同时成立；任一不成立 ⇒ 本块整体跳过，行为与未接线版本逐字节一致）：
     //   ① setting('enableMultiTurnFollowUp') === true（设置总闸，默认 false —— 关闭时**绝不构造** dispatcher，
@@ -548,6 +582,9 @@ export function createTaskExecutor({
         ...(automationSessionStore !== null ? { sessionStore: automationSessionStore } : {}),
         ...(req.signal !== undefined ? { signal: req.signal } : {}),
         ...(typeof onPhase === 'function' ? { onPhase } : {}),
+        timeoutMs: typeof setting('automationTimeoutMs') === 'number' && setting('automationTimeoutMs') > 0
+          ? setting('automationTimeoutMs')
+          : AUTOMATION_DEFAULTS.timeoutMs,
       });
     } catch (err) {
       return withFallback({
@@ -621,5 +658,8 @@ export function createTaskExecutor({
       pushTurn(taskKey, 'assistant', report.text);
     }
     return report;
-  };
+  } finally {
+    releaseLock(taskCwd, subagentJobId);
+  }
+};
 }

@@ -17,8 +17,9 @@ DshAgentHub 把本机 agent（首个 WorkBuddy）变成看得见、可调度、�
 | 下发任务 | `workbuddy_run` 交代一件事，DshAgentHub 作业面板里有一个对应的作业。 |
 | 多轮归组 | 同 `session_key` 可二次下发；默认每轮都是新对话，见下一条。 |
 | 会话复用（多轮追问） | 设置 `enableMultiTurnFollowUp` 开启后：`resume:true` 且记性命中 ⇒ 追发进**同一条对话**继续干（桌面端可见）；追发失败自动回退点火新开，回执与状态卡带 `fallback` 原因。默认关闭。 |
-| 直接点火（免排队） | 设置 `enableDirectIgnition` 开启后（默认关）：点火轮直接经桌面端 CDP 建对话并下发，省掉计划任务的调度开销。派发**前**失败照旧回退计划任务队列（回执带 `fallback` / `fallbackReason`，任务不丢）；派发**后**失败**绝不回退**——同一条 prompt 再跑一遍就是双份积分。前置条件见「已知限制」。 |
+| 直接点火（免排队） | 设置 `enableDirectIgnition` 开启后（默认关）：点火轮经桌面端 CDP 直接建对话并下发，**零计划任务 INSERT**。派发**前**失败照旧回退自动化队列（回执带 `fallback` / `fallbackReason`，任务不丢）；派发**后**失败**绝不回退**——同一条 prompt 再跑一遍就是双份积分。前置条件见「已知限制」。 |
 | 模型与推理强度 | 下发时可选模型与推理强度（6 档），都不指定时按最省的兜底，实际用了哪个以回执为准。 |
+| 每日签到自动领取 | Buddy 加油站每日积分：状态面读到"活动进行中且今日未签"时在后台顺手领掉（先查后领、领完复核，幂等；今日已领/非活动季静默收尾）。开关 `enableAutoCheckin` 默认开，关掉即停。 |
 | 积分只读显示 | 设置卡片上有一行「剩余积分」，只读展示，读不到就明说读不到。 |
 | 启动清理 | 插件启动时回收上一次遗留的下发记录，不留会自己再跑的活任务。 |
 
@@ -105,11 +106,12 @@ npm run link:dsh-deps
 
 ## 设置卡片
 
-设置页里 WorkBuddy 那张卡片（DshAgentHub 插件）显示四样东西：**模型与倍率**、**推理强度档位**、**剩余积分**、**运行状态**。
+设置页里 WorkBuddy 那张卡片（DshAgentHub 插件）显示五样东西：**模型与倍率**、**推理强度档位**、**剩余积分**、**每日签到**、**运行状态**。
 
 - 模型后面带倍率标注（如 `x0.51`）；没有倍率的显示"倍率未知"，仍然可选；
 - 推理强度档位来自桌面端的实际能力表，标注哪些可选、哪些置灰；
 - 积分读不到时显示"暂时读不到"，不显示为 `0`；
+- 每日签到行显示「今日已领（今日 +N，连签 M 天）」/「今日未领，将自动领取」/「签到活动已结束」；配置组里有「自动领取每日积分」开关（默认开，关掉即停，只读状态不停）；
 - 运行状态区会说明最近一次下发是「**复用上次对话续发**」还是「**续发失败，已回退新开对话**」；内部通道、耗时与原因码收在"任务详情"折叠里。
 
 > **调试端口依赖（`enableDirectIgnition` / `enableMultiTurnFollowUp`）**：这两个开关一开就需要桌面端带 `WORKBUDDY_REMOTE_DEBUGGING_PORT` 启动，具体怎么配、什么时候必须问你，见下方「已知限制」。模型侧的 `workbuddy_status` 会给出 `cdp` / `ignition` 两块**只读**结论——插件不代设环境变量、不代杀也不代重启 WorkBuddy。
@@ -139,9 +141,9 @@ $s = (Invoke-WebRequest -UseBasicParsing -Uri "$DSH_WEB/plugin-workbuddy/status"
 
 ## 发布
 
-当前版本 `0.2.1`（见 `package.json`）。版本号遵循 SemVer；验收以回执与桌面端对话为准：交代的事在 WorkBuddy 里是一条对话，在 DshAgentHub 里是一条回执。
+当前版本 `0.3.0`（见 `package.json`）。版本号遵循 SemVer；验收以回执与桌面端对话为准：交代的事在 WorkBuddy 里是一条对话，在 DshAgentHub 里是一条回执。
 
-本次更新（0.2.1）解决了什么、新增了什么（直接点火 + 会话模型/思考强度只读识别），见 [CHANGELOG.md](./CHANGELOG.md)。
+本次更新（0.3.0）：每日签到自动领取与晚收获通道（`workbuddy_harvest`）、直接点火改零计划任务 INSERT、权限真源直读 SQLite `sessions.permission_mode`（废除 18488/sidecar）、`workbuddy_status` 输出 schema 违约修复，详见 [CHANGELOG.md](./CHANGELOG.md)。
 
 ---
 

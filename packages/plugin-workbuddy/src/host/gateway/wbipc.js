@@ -78,8 +78,8 @@ export class WbipcError extends Error {
   }
 }
 
-/** 连接被拒时的错码 —— 对应"端点没了"而不是"协议说错了话"。 */
-const DEAD_ENDPOINT_CODES = new Set(['ENOENT', 'ECONNREFUSED', 'EPIPE', 'ENOTCONN']);
+/** 连接被拒时的错码 —— 对应"端点没了"或"权限拒绝"而不是"协议说错了话"。 */
+const DEAD_ENDPOINT_CODES = new Set(['ENOENT', 'ECONNREFUSED', 'EPIPE', 'ENOTCONN', 'EPERM', 'EACCES']);
 
 /**
  * 把"连不上端点"翻译成归因码 + **干净**的文案。
@@ -94,9 +94,13 @@ const DEAD_ENDPOINT_CODES = new Set(['ENOENT', 'ECONNREFUSED', 'EPIPE', 'ENOTCON
 export function classifyConnectFailure(e) {
   const code = e && typeof e === 'object' ? e.code : undefined;
   if (DEAD_ENDPOINT_CODES.has(code)) {
+    const isPerm = code === 'EPERM' || code === 'EACCES';
     return new WbipcError(
-      'the WorkBuddy desktop broker endpoint no longer exists (it stops and is rewritten '
-      + 'asynchronously as the desktop restarts) — open the WorkBuddy desktop',
+      isPerm
+        ? 'the WorkBuddy desktop broker endpoint refused connection (EPERM / Access Denied) — '
+          + 'please ensure WorkBuddy desktop is running normally without elevated UAC/Admin privileges, or restart it'
+        : 'the WorkBuddy desktop broker endpoint no longer exists (it stops and is rewritten '
+          + 'asynchronously as the desktop restarts) — open the WorkBuddy desktop',
       WBIPC_MISS.ENDPOINT_GONE,
     );
   }

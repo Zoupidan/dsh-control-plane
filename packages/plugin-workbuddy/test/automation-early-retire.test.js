@@ -114,17 +114,24 @@ test('⓪ 套件级护栏生效：WORKBUDDY_HOME 指着一次性 tmp，真库结
   assert.notEqual(workbuddyDbPath(), REAL_DB, '★★ 点火落点绝不能是真库');
 });
 
-test('① 退避表默认值：首轮2s、之后5s、最多12轮约60s', () => {
+test('① 退避表默认值：首轮2s、之后5s、动态181轮约15分钟（900_000ms）', () => {
   assert.equal(AUTOMATION_DEFAULTS.pollFirstMs, 2_000);
   assert.equal(AUTOMATION_DEFAULTS.pollRestMs, 5_000);
-  assert.equal(AUTOMATION_DEFAULTS.maxPollRounds, 12);
+  assert.equal(AUTOMATION_DEFAULTS.timeoutMs, 900_000);
   const s = buildPollWaits({});
-  assert.equal(s.rounds, 12);
-  assert.equal(s.waits.length, 12);
+  assert.equal(s.rounds, 181);
+  assert.equal(s.waits.length, 181);
   assert.equal(s.waits[0], 2_000);
   assert.ok(s.waits.slice(1).every((w) => w === 5_000));
   const total = s.waits.reduce((a, b) => a + b, 0);
-  assert.ok(total >= 55_000 && total <= 60_000, `total≈60s, got ${total}`);
+  assert.equal(total, 902_000);
+
+  // 显式指定 maxPollRounds 时保持显式轮数（测试快路径兼容）
+  const explicit = buildPollWaits({ maxPollRounds: 12 });
+  assert.equal(explicit.rounds, 12);
+  assert.equal(explicit.waits.length, 12);
+  const totalExplicit = explicit.waits.reduce((a, b) => a + b, 0);
+  assert.ok(totalExplicit >= 55_000 && totalExplicit <= 60_000);
 });
 
 test('② confirmedSessionFacts：sessions.id 存在才回 facts，否则 null', () => {
@@ -153,7 +160,7 @@ test('② confirmedSessionFacts：sessions.id 存在才回 facts，否则 null',
   }
 });
 
-test('③ 超时同样 retire：只 INSERT 一行，全表恰好一行且已软删，真库不动', async () => {
+test('③ 超时返回 still_running 且不 retire：只 INSERT 一行，行保持未软删，真库不动', async () => {
   const before = realAutomationCount();
   const home = fixtureHome();
   const restore = useHome(home);
@@ -164,18 +171,20 @@ test('③ 超时同样 retire：只 INSERT 一行，全表恰好一行且已软�
       timeoutMs: 60_000, pollFirstMs: 50, pollRestMs: 50, maxPollRounds: 6,
     });
     const out = await run.done;
-    assert.equal(out.status, 'failed', '无调度器必须收敛为失败（否则本判据什么都没测到）');
+    assert.equal(out.status, 'still_running', '超时必须收敛为 still_running（严禁判定为 failed）');
+    assert.equal(out.exitCode, 0, 'still_running 退出码为 0');
     assert.ok(out.automation?.automationId, '必须真的建过 id');
-    assert.equal(out.automation.retired, true, '超时必须 retire（绝不留活行到 valid_until）');
+    assert.equal(out.automation.reason, 'still_running', '原因码必须为 STILL_RUNNING');
+    assert.equal(out.automation.retired, false, '超时不得 retire（严禁触发 retired: true 软删）');
     assert.equal(out.automation.sessionId, null, '没建会话时 sessionId 为 null');
     const db = new DatabaseSync(join(home, 'workbuddy.db'), { readOnly: true });
     try {
       const rows = db.prepare('SELECT id, deleted_at FROM automations').all();
       assert.equal(rows.length, 1, '一次下发只 INSERT 一行（轮询不重建）');
       assert.equal(rows[0].id, out.automation.automationId);
-      assert.notEqual(rows[0].deleted_at, null, '行必须已软删');
+      assert.equal(rows[0].deleted_at, null, '行在超时后不得软删（不调用 retireRow）');
       const live = db.prepare('SELECT COUNT(*) AS n FROM automations WHERE deleted_at IS NULL').get().n;
-      assert.equal(live, 0, '不留活行');
+      assert.equal(live, 1, '保持活行以供后续继续运行或 harvest');
     } finally {
       db.close();
     }

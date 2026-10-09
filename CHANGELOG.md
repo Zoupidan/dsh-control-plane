@@ -2,6 +2,51 @@
 
 本项目版本号遵循 [SemVer](https://semver.org/)，格式参照 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.3.0] - 2026-10-10
+
+### 本次更新的目的
+
+每天打开 WorkBuddy 点一次签到才能到账的积分，改成插件自动领。先查后领、领完复核，全程幂等——今天已经领过（不管是谁领的）就只读收尾，不会重复发放。
+
+同一轮还收口三件事：点火轮改为**零计划任务 INSERT** 的直接点火通道；任务权限真源改**直读 SQLite**（彻底废除 18488 端口与 sidecar 依赖）；以及 `workbuddy_status` 输出 schema 的违约修复。
+
+### 修复（Fixed）
+
+- **fix(status): `workbuddy_status` 输出 schema 违约**——补声明 `section` / `count` 等切片键；`models` 放宽为 `array | object` oneOf；顶层 required 收敛为 `balance` / `creditsRemain`；删除 ownKeys Proxy（原先把 properties 的键集钉死在 16 个传统键上，`balance` / `creditsRemain` 及今后任何新键都会被 schema 校验误判违约）。
+
+### 新增（Added）
+
+- **每日签到自动领取**（Buddy 加油站）：状态面读到"活动进行中且今日未签"时在后台顺手领掉；领到后刷新一次余额读数。开关 `enableAutoCheckin` **默认开**（关掉即停；总开关 `enabled` 关着时一次都不跑）。跨天按**北京时间**算（腾讯按北京时间记账，北京时间无夏令时）。
+- **直接点火通道（`enableDirectIgnition`）**：CDP 9222 直连桌面直接建对话并下发，**零计划任务 INSERT**；派发前失败回退自动化队列（回执带 `fallback` / `fallbackReason`），任务不丢。
+- **权限真源直读 SQLite**：任务权限改直读 `sessions.permission_mode`，**废除 18488 端口与 sidecar 依赖**。
+- **晚收获通道（`workbuddy_harvest`）**：按 `automation_id` 检索任何过去或正在运行的 WorkBuddy 任务结果、assistant 回复正文、生成产物列表与会话句柄（支持已完成 / 运行中 / 历史任务，`wait_ms` 可等待收尾）。
+- **状态面 +1**：本机状态接口 `/plugin-workbuddy/status` 与模型工具 `workbuddy_status` 各 +1 个顶层键 `checkin:{active, todayCheckedIn, streakDays, dailyCredit, todayCredit, totalCredits, endTime, autoEnabled, lastClaim}`；`workbuddy_run` 回执键集一字未动。
+- **设置卡片**：状态区 +1 行「每日签到：今日已领（今日 +N，连签 M 天）/ 今日未领，将自动领取 / 签到活动已结束」；配置组 +1 个开关「自动领取每日积分」。没读到就说"暂时读不到签到状态"，不猜已领/未领。
+- **落盘快照**（供离线显示）：`checkinLastAt` / `checkinLastResult`（claimed / already / inactive / failed-*）/ `checkinLastCredit` / `checkinStreakDays`，与积分四字段同一条 volatile 硬约束。
+
+### 维护（Chore）
+
+- `automationTimeoutMs` 默认改为 **15 分钟**（900000ms）。
+- 自动化下发 prompt 注入 **`READ_ONLY_PROMPT_GUARD`**（只读工作区守卫）。
+- 测试扩充：e2e tier1–4、adversarial/stress、late-harvest 等 **22 个新测试文件**。
+
+### 接口来由（不重复造轮子）
+
+- 签到协议（状态→领取→复核三段式、HTTP 400 + `code:10001` = 今日已签的幂等口径、北京时间跨天）复用公开仓库 [`88lin/workbuddy-auto-signin`](https://github.com/88lin/workbuddy-auto-signin)（1k star）与 [`SIMON-WORLD/workbuddy-daily-credit`](https://github.com/SIMON-WORLD/workbuddy-daily-credit) 的逆向结论；
+- **传输面不抄**：公开仓库是直连 HTTPS + 自读登录态文件（插件进程持有账号凭据，本仓红线 E3 禁止）；本插件走既有 `wbipc` 通道由桌面端代发，插件不读凭据文件、不组装鉴权头。真机双通路实测：状态 200 全字段、已签领取 400+10001。
+- **范围**：只动免费的每日签到；成长中心（旅行礼物/盲盒/补登/兑换）是另一套活动接口，不在本轮 scope。
+
+### 验证
+
+- **门禁**：`test:host` **617** 例 · `test:client` **83** 例 · CI 红线 4 项全绿（含 `check-no-credential-echo` 51 文件零凭据形状）。
+- **真机**（WorkBuddy 桌面端在跑且已登录，2026-10-09）：状态 200（`today_checked_in:true`，连签 2 天，日 100）；领取走已签分支（领取接口零调用）；余额直读 663.27。
+- 新增 `test/daily-checkin.test.js` 19 例（解析三态纪律、领取幂等、总闸/开关门禁、北京跨天、落盘 volatile、unhandled rejection 双半）。
+
+### 兼容性
+
+- 只增不减：`checkin` 缺省即 `null`（老 host 不传 ⇒ 卡片显示"读取中"）；`enableAutoCheckin` 缺省按开显示，与宿主默认值一致。
+- 无默认行为变化外的风险：非活动季静默收尾；桌面端没开如实报读不到，不代启动 WorkBuddy。
+
 ## [0.2.3] - 2026-10-08
 
 ### 本次更新的目的

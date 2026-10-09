@@ -23,10 +23,6 @@
  * 登录态、工具面、UI 同步全部原生继承（零补丁、零凭据、零 GUI 自动化——不走任何
  * 模拟点击/按键通路，只是让页面自己的 JS 桥执行它自己暴露的函数）。
  *
- * <p>★ 18488 预检**不判死** ★
- * `GET http://127.0.0.1:18488/workbuddy/probe`（桌面端 LocalProbeServer）只作**信息性**预检：
- * 它不可达**不**直接判死（可能只是版本差异），继续试 CDP —— 以 CDP 实测为准。
- *
  * <p>★ 端口 9222 是共享面，判别必须严格 ★
  * 该端口同时是外部 Chrome/Edge 用户开 `--remote-debugging-port` 的常用口 ⇒ 两级证据取 **AND**：
  * ① `/json/version` 响应的 `User-Agent` 含 `WorkBuddy/`（真机 Browser 字段只是 "Chrome/138…"，
@@ -98,8 +94,6 @@
 import { randomUUID } from 'node:crypto';
 import http from 'node:http';
 
-/** 桌面端 LocalProbeServer（信息性预检；不可达不判死）。 */
-const DESKTOP_PROBE_PORT = 18488;
 /** CDP 远程调试口默认值（桌面端须以 WORKBUDDY_REMOTE_DEBUGGING_PORT 启动才监听）。 */
 export const DEFAULT_CDP_PORT = 9222;
 /**
@@ -256,10 +250,9 @@ function looksLikeWorkBuddyTarget(t) {
 }
 
 /**
- * @param {{ log?: (message: string) => void, cdpPort?: unknown, timeoutMs?: unknown,
- *           desktopProbePort?: unknown }} [deps]
- *   `log` = 日志出口（调用方接 `ctx.logger`；缺省静默）。`cdpPort` / `timeoutMs` /
- *   `desktopProbePort` 为缺省值，可被单次调用的同名入参覆盖。
+ * @param {{ log?: (message: string) => void, cdpPort?: unknown, timeoutMs?: unknown }} [deps]
+ *   `log` = 日志出口（调用方接 `ctx.logger`；缺省静默）。`cdpPort` / `timeoutMs` 为缺省值，
+ *   可被单次调用的同名入参覆盖。
  * @returns {{ followUp: (req: {
  *   conversationId: string, prompt: Array<{type: string, text?: unknown}>, timeoutMs?: number,
  *   cdpPort?: number }) => Promise<{ok: true, channel: string, receipt: object} |
@@ -269,9 +262,6 @@ export function createFollowUpDispatcher(deps = {}) {
   const log = typeof deps.log === 'function' ? deps.log : () => {};
   const defaultCdpPort = Number.isFinite(deps.cdpPort) && Number(deps.cdpPort) > 0 ? Number(deps.cdpPort) : DEFAULT_CDP_PORT;
   const defaultTimeoutMs = Number.isFinite(deps.timeoutMs) && Number(deps.timeoutMs) > 0 ? Number(deps.timeoutMs) : DEFAULT_TIMEOUT_MS;
-  const defaultProbePort = Number.isFinite(deps.desktopProbePort) && Number(deps.desktopProbePort) > 0
-    ? Number(deps.desktopProbePort)
-    : DESKTOP_PROBE_PORT;
 
   /** 单请求 JSON GET（127.0.0.1 回环；有界，错误一律收敛为 {ok:false}，绝不抛）。 */
   const fetchJson = (port, path, timeoutMs) => new Promise((resolve) => {
@@ -289,17 +279,6 @@ export function createFollowUpDispatcher(deps = {}) {
     req.on('timeout', () => { req.destroy(); resolve({ ok: false, code: 'ETIMEDOUT' }); });
     req.on('error', (err) => resolve({ ok: false, code: err?.code ?? 'ECONNREFUSED' }));
   });
-
-  /** 桌面端预检：只作信息记录，结论不影响走向（CDP 实测才是判据）。 */
-  async function desktopPrecheck(port) {
-    const res = await fetchJson(port, '/workbuddy/probe', HTTP_PROBE_TIMEOUT_MS);
-    const healthy = res.ok === true
-      && res.data?.ok === true
-      && res.data?.app === 'workbuddy-desktop';
-    if (healthy) log(`followup precheck: desktop probe ok (version=${String(res.data?.version ?? '?')})`);
-    else log(`followup precheck: desktop probe not conclusive (${res.ok === true ? 'unexpected payload' : res.code}); continuing with CDP anyway`);
-    return healthy;
-  }
 
   /**
    * CDP 两级判别（/json/version + /json/list），**UA ∧ target 双证据 AND**（2026-10-03 真机校准）。
@@ -514,10 +493,7 @@ export function createFollowUpDispatcher(deps = {}) {
     const cdpPort = Number.isFinite(req.cdpPort) && Number(req.cdpPort) > 0 ? Number(req.cdpPort) : defaultCdpPort;
     const deadline = t0 + timeoutMs;
 
-    // ① 信息性预检（不可达不判死 —— 以 CDP 实测为准）。
-    await desktopPrecheck(defaultProbePort);
-
-    // ② UA ∧ target 双证据判别。
+    // ① UA ∧ target 双证据判别。
     const cdp = await detectLiveCdp(cdpPort, Math.max(1, deadline - Date.now()));
     if (!cdp.live) {
       return { ok: false, code: cdp.code, detail: cdp.detail };
@@ -667,8 +643,7 @@ ${args.map((a) => `    ${JSON.stringify(a)}`).join(',\n')}
       return fail(FOLLOWUP_CODES.INVALID_PROMPT, `ignite: prompt must be a non-empty ContentBlock[] (${check.error})`, 'validate');
     }
 
-    // ② 信息性预检 + UA ∧ target 双证据判别（与追发同路同判据）
-    await desktopPrecheck(defaultProbePort);
+    // ② UA ∧ target 双证据判别（与追发同路同判据）
     const cdp = await detectLiveCdp(cdpPort, Math.max(1, deadline - Date.now()));
     if (!cdp.live) return fail(cdp.code, cdp.detail, 'detect');
     const ws = String(cdp.target.webSocketDebuggerUrl);

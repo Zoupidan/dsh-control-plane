@@ -2,23 +2,17 @@
  * U6 只读探测：判定 WorkBuddy 桌面端是否可用（H-NO-EXEC-PROBE）。
  *
  * Implements: 02-design/DESIGN-v3.md §7.1（探测原则）/ §7.2（撤回 L3 的修正）
- * 约束（硬）：探测阶段不得启动任何目标程序 —— 只允许读文件系统 / 读环境变量 /
- *   做一次本地 TCP 可达性探测（`127.0.0.1:18488`，≤200ms 超时）。TCP 探测**不是**启动程序，
- *   只是判断"桌面端监听的本地端口在不在"——它不触碰进程、不触发身份握手。
+ * 约束（硬）：探测阶段不得启动任何目标程序 —— 只允许读文件系统 / 读环境变量。
+ *   完全废除 18488 端口与 TCP 探测（F7 / 2026-10-09）。
  *
  * 本文件位于 `packages/*​/src/host/probe/`（CI ③ H-NO-EXEC-PROBE 扫描范围），
  * 全文件不得出现任何进程执行形态（spawn / exec / fork / child_process / process.binding）
  * —— 由 CI ③ 拦截。
  *
- * ★ 探测源已从「WorkBuddy CLI 可执行文件」换成「WorkBuddy 桌面端」（2026-10-01 裁定）：
- *   真通路是桌面端（WorkBuddy.exe 监听 127.0.0.1:18488，并刷新产品配置缓存），
- *   而自 spawn 出来的 CLI 没有登录态、必然 auth_failed —— 既不能干活，也不是合法数据源。
- *
  * 判据优先级：
  *   L-D1  desktop-cache：`~/.workbuddy/cache/acc-product-config-v3.json` 存在**且可解析**
  *         —— 主判据（installed === true 的唯一依据）。
- *   L-D2  desktop-port：127.0.0.1:18488 可达（次要证据，**不可达不算致命** —— 不改变 installed）。
- *   L-D3  desktop-exe：桌面端可执行文件已知安装位（resolvedPath 的兜底来源）。
+ *   L-D2  desktop-exe：桌面端可执行文件已知安装位（resolvedPath 的兜底来源）。
  *
  * 产出 ProbeResult（§7.2 逐字字段）：
  *   { target, installed, reason, resolvedPath, evidence, at, method }
@@ -28,17 +22,10 @@
  * 可测试性：`env` 为可选第三参（默认 process.env）；apply() 按设计只传 (ctx, config)。
  */
 import { readFileSync, statSync } from 'node:fs';
-import net from 'node:net';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import { PROBE_TARGET } from '../config/constants.js';
-
-/** 桌面端本地监听端口（真机事实：WorkBuddy.exe 监听 127.0.0.1:18488）。 */
-const DESKTOP_HOST = '127.0.0.1';
-const DESKTOP_PORT = 18488;
-/** 端口可达性探测超时（任务要求 ≤200ms；不可达不算致命）。 */
-const PORT_TIMEOUT_MS = 200;
 
 /** 桌面产品配置缓存的相对路径段（`~/.workbuddy/cache/acc-product-config-v3.json`）。 */
 const DESKTOP_CACHE_SEGMENTS = ['.workbuddy', 'cache', 'acc-product-config-v3.json'];
@@ -72,31 +59,6 @@ function parseJson(text) {
   }
 }
 
-/**
- * 本地 TCP 可达性探测（纯网络 I/O，零进程执行）。
- * 永不 reject：超时/连接被拒/出错一律 resolve(false)。
- *
- * @param {string} host
- * @param {number} port
- * @param {number} timeoutMs
- * @returns {Promise<boolean>}
- */
-function tcpReachable(host, port, timeoutMs) {
-  return new Promise((resolve) => {
-    const socket = net.connect({ host, port });
-    let settled = false;
-    const finish = (ok) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve(ok);
-    };
-    socket.setTimeout(timeoutMs);
-    socket.once('connect', () => finish(true));
-    socket.once('timeout', () => finish(false));
-    socket.once('error', () => finish(false));
-  });
-}
 
 /**
  * 枚举桌面端可执行文件路径（纯读，不启动）。
@@ -127,7 +89,7 @@ function findDesktopExe(env) {
 /**
  * 只读探测 WorkBuddy 桌面端。永不抛：一切异常收敛为 reason:'error' 的结果对象。
  *
- * @param {object} _ctx 宿主 ctx（桌面端探测为纯只读 fs + TCP，不再需要 subprocess）
+ * @param {object} _ctx 宿主 ctx（桌面端探测为纯只读 fs，不再需要 TCP 或 subprocess）
  * @param {object} _config 生效配置（本探测不读取 config.cliPath —— 该字段已删除）
  * @param {Record<string, string | undefined>} [env]
  * @returns {Promise<import('../types/index.js').ProbeResult>}
@@ -169,13 +131,6 @@ export async function detectWorkBuddy(_ctx, _config, env = process.env) {
     evidence.push({ kind: 'desktop-cache', value: cachePath, found: cacheOk });
     if (!cacheOk) evidence.push({ kind: 'desktop-cache-state', value: cacheState, found: false });
 
-    // ── L-D2：桌面端本地端口可达（次要证据；不可达不算致命） ──────
-    const reachable = await tcpReachable(DESKTOP_HOST, DESKTOP_PORT, PORT_TIMEOUT_MS);
-    evidence.push({
-      kind: 'desktop-port',
-      value: `${DESKTOP_HOST}:${DESKTOP_PORT}`,
-      found: reachable,
-    });
 
     // ── L-D3：桌面可执行文件（resolvedPath 兜底） ─────────────────
     const exe = findDesktopExe(env);

@@ -97,3 +97,6 @@ RC-*
 
 # 多智能体协作交接现场（本地过程资产，不进开源仓库）
 .agents/
+
+# WorkBuddy watchdog 运行期文件（本地 watchdog 脚本与日志，不进仓库）
+tools/workbuddy-watchdog.*

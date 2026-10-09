@@ -1657,8 +1657,8 @@ test('收纳：默认展开 —— 标题/徽标/描述可见，内容区即渲�
   );
   assert.equal(
     findAll(tree, (n) => n.type === 'input' && n.props.className === 'dsh-wb-switch').length,
-    1,
-    '默认展开 ⇒ 开关必须已渲染（否则用户打开设置页看到的是空壳）',
+    2,
+    '默认展开 ⇒ 两个开关必须已渲染（总开关 + 自动领取每日积分），否则用户打开设置页看到的是空壳',
   );
 });
 
@@ -2140,6 +2140,96 @@ test('积分⑦：与状态路由不可达共存 ⇒ 两行都在（积分说"�
   const tree = app.expand();
   assert.equal(creditsLine(tree), '剩余积分：读取中', '★ 路由挂了 ⇒ 积分无从得知，仍是"加载中"');
   assert.ok(mainText(tree).includes('状态读取失败：status HTTP 500'), '★ 路由失败仍须显式上屏');
+});
+
+// ───────────── 「每日签到」行（payload.checkin）+ 自动领取开关 ─────────────
+// 立场与积分组同款：**没读到不得说成"未领/已领"**。`0` 在这里不是风险项
+// （签到行不印余额），风险项是"把未知说成一种结论" —— 用户会据此干等或白跑一趟。
+
+/** 从树里取签到行（key='checkin' 的那个 div）。 */
+function checkinLine(tree) {
+  const node = findAll(
+    tree,
+    (n) => n.type === 'div' && n.props && n.props.className === 'dsh-wb-status__line' && n.props.key === 'checkin',
+  )[0];
+  assert.ok(node !== undefined, '签到行必须渲染（key=checkin）');
+  return labelText(node);
+}
+
+test('签到①：老宿主无 checkin 字段 ⇒ "读取中"（不消失、不猜结论）', async () => {
+  const app = await bootFromStatus({});
+  assert.equal(checkinLine(app.expand()), '每日签到：读取中');
+  const hits = findAll(
+    app.expand(),
+    (n) => n.type === 'div' && String(n.props.className).includes('dsh-wb-status__line') && labelText(n).startsWith('每日签到'),
+  );
+  assert.equal(hits.length, 1, '★ 签到行必须恰好一条');
+});
+
+test('签到②：已领 ⇒ `今日已领，今日 +100，连签 2 天`（缺数就略过该半句，不编数）', async () => {
+  const app = await bootFromStatus({
+    checkin: { ok: true, source: 'live', active: true, todayCheckedIn: true, streakDays: 2, dailyCredit: 100, todayCredit: 100, totalCredits: 200, endTime: '2026-10-15 23:59:59', autoEnabled: true, lastClaim: null, at: 1, ageMs: 1_000, stale: false, error: null },
+  });
+  assert.equal(checkinLine(app.expand()), '每日签到：今日已领，今日 +100，连签 2 天');
+  const thin = await bootFromStatus({
+    checkin: { ok: true, source: 'live', active: true, todayCheckedIn: true, streakDays: null, dailyCredit: null, todayCredit: null, totalCredits: null, endTime: null, autoEnabled: true, lastClaim: null, at: 1, ageMs: 1_000, stale: false, error: null },
+  });
+  assert.equal(checkinLine(thin.expand()), '每日签到：今日已领', '★ 数缺失 ⇒ 只说已领，不编数');
+});
+
+test('签到③：未领 ⇒ 按自动领取开关说"将自动领取"还是"已关闭"（不让用户干等）', async () => {
+  const auto = await bootFromStatus({
+    checkin: { ok: true, source: 'live', active: true, todayCheckedIn: false, streakDays: 1, dailyCredit: 100, todayCredit: null, totalCredits: 100, endTime: null, autoEnabled: true, lastClaim: null, at: 1, ageMs: 1_000, stale: false, error: null },
+  });
+  assert.equal(checkinLine(auto.expand()), '每日签到：今日未领，将自动领取');
+  const manual = await bootFromStatus({
+    checkin: { ok: true, source: 'live', active: true, todayCheckedIn: false, streakDays: 1, dailyCredit: 100, todayCredit: null, totalCredits: 100, endTime: null, autoEnabled: false, lastClaim: null, at: 1, ageMs: 1_000, stale: false, error: null },
+  });
+  assert.equal(checkinLine(manual.expand()), '每日签到：今日未领（自动领取已关闭）');
+});
+
+test('签到④：active === false ⇒ "签到活动已结束"（正常状态，不是故障）', async () => {
+  const app = await bootFromStatus({
+    checkin: { ok: true, source: 'live', active: false, todayCheckedIn: null, streakDays: null, dailyCredit: null, todayCredit: null, totalCredits: null, endTime: '2026-10-15 23:59:59', autoEnabled: true, lastClaim: null, at: 1, ageMs: 1_000, stale: false, error: null },
+  });
+  assert.equal(checkinLine(app.expand()), '每日签到：签到活动已结束');
+});
+
+test('签到⑤：ok === false ⇒ 说来由（带机器可读 code）；桌面端没开给可执行的话', async () => {
+  const app = await bootFromStatus({
+    checkin: { ok: false, source: 'unavailable', active: null, todayCheckedIn: null, streakDays: null, dailyCredit: null, todayCredit: null, totalCredits: null, endTime: null, autoEnabled: true, lastClaim: null, at: null, ageMs: null, stale: true, error: { code: 'unexpected_response', message: 'x' } },
+  });
+  const line = checkinLine(app.expand());
+  assert.ok(line.includes('暂时读不到签到状态'), '★ 必须给出明确来由');
+  assert.ok(line.includes('unexpected_response'), '★ 机器可读 code 随行');
+  const closed = await bootFromStatus({
+    checkin: { ok: false, source: 'workbuddy_desktop_closed', active: null, todayCheckedIn: null, streakDays: null, dailyCredit: null, todayCredit: null, totalCredits: null, endTime: null, autoEnabled: true, lastClaim: null, at: null, ageMs: null, stale: true, error: { code: 'workbuddy_desktop_closed', message: 'x' } },
+  });
+  const line2 = checkinLine(closed.expand());
+  assert.ok(line2.includes('WorkBuddy 桌面端未运行'), '★ 可执行的动作：把桌面端打开');
+  const thin = await bootFromStatus({
+    checkin: { ok: true, source: 'live', active: true, todayCheckedIn: null, streakDays: null, dailyCredit: null, todayCredit: null, totalCredits: null, endTime: null, autoEnabled: true, lastClaim: null, at: 1, ageMs: 1_000, stale: false, error: null },
+  });
+  assert.equal(checkinLine(thin.expand()), '每日签到：平台未返回签到状态', '★ 字段缺失 ⇒ 如实说"没给"，不猜已领/未领');
+});
+
+test('签到⑥：自动领取开关读写 —— 缺省按开显示；交互 → scope.set → 快照变更 → 重渲染', async () => {
+  const secondSwitch = (t) => findAll(t, (n) => n.type === 'input' && n.props.className === 'dsh-wb-switch')[1];
+  const app = await boot({ scopeValue: { enabled: false, model: '', effort: '' } });
+  app.expand();
+  app.flushEffects();
+  await settle();
+  let tree = app.expand();
+  assert.equal(secondSwitch(tree).props.checked, true, '★ 老快照无该键 ⇒ 按默认开显示（与宿主默认值一致）');
+  assert.equal(secondSwitch(tree).props.disabled, false);
+  secondSwitch(tree).props.onChange(); // 用户关闭
+  await settle();
+  assert.deepEqual(app.scope.commits[0], { op: 'set', field: 'enableAutoCheckin', value: false });
+  tree = app.expand();
+  assert.equal(secondSwitch(tree).props.checked, false, '写后 bridge 应反映新值');
+  secondSwitch(tree).props.onChange(); // 再打开
+  await settle();
+  assert.deepEqual(app.scope.commits[1], { op: 'set', field: 'enableAutoCheckin', value: true });
 });
 
 test('功能①（d）倍率回声剔除：真 payload 的 detail 本身就是倍率文本 ⇒ 只印一份（不得说两遍）', async () => {

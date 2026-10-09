@@ -47,11 +47,21 @@ const REAL_DB = join(homedir(), '.workbuddy', 'workbuddy.db');
  */
 function realAutomationCount() {
   if (!existsSync(REAL_DB)) return null;
-  const db = new DatabaseSync(REAL_DB, { readOnly: true });
-  try {
-    return db.prepare('SELECT COUNT(*) AS n FROM automations WHERE deleted_at IS NULL').get().n;
-  } finally {
-    db.close();
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const db = new DatabaseSync(REAL_DB, { readOnly: true });
+      try {
+        return db.prepare('SELECT COUNT(*) AS n FROM automations WHERE deleted_at IS NULL').get().n;
+      } finally {
+        db.close();
+      }
+    } catch (err) {
+      if (err?.code === 'ERR_SQLITE_ERROR' && String(err.message).includes('locked') && attempt < 4) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+        continue;
+      }
+      throw err;
+    }
   }
 }
 

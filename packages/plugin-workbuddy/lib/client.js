@@ -237,6 +237,27 @@ window.__ModuleLoader__.load({
               day: '天',
             },
           },
+          /** `payload.checkin` —— 「每日签到」行（判定见 checkinBody）。 */
+          checkin: {
+            label: '每日签到：',
+            loading: '读取中',
+            rowLabel: '自动领取每日积分',
+            /** 已领：今日实得 + 连签天数，任一缺失就略过该半句（不编数）。 */
+            claimed: '今日已领',
+            todayCredit: (n) => '今日 +' + n,
+            streak: (n) => '连签 ' + n + ' 天',
+            /** 未签且开着自动领取：后台会顺手领掉（幂等），用户不用做什么。 */
+            unclaimedAuto: '今日未领，将自动领取',
+            /** 未签但自动领取已关闭：说清"关了"（否则用户干等）。 */
+            unclaimedManual: '今日未领（自动领取已关闭）',
+            /** 非活动季：正常状态，不是故障。 */
+            inactive: '签到活动已结束',
+            /** 状态读不到：带机器可读码（与积分行同款纪律）。 */
+            unknown: (code) => '暂时读不到签到状态' + (typeof code === 'string' && code !== '' ? ' · ' + code : ''),
+            desktopClosed: 'WorkBuddy 桌面端未运行，暂时读不到签到状态',
+            /** `ok === true` 但关键字段缺失 ⇒ 未知，不猜"已领/未领"。 */
+            noValue: '平台未返回签到状态',
+          },
           /** 开关行。 */
           toggle: {
             rowLabel: '启用',
@@ -952,6 +973,60 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * `payload.checkin` → 人话（判定与措辞的**唯一**出处，与 `creditsText` 同款纪律）。
+     *
+     * ★ 四种状态必须分清，核心禁忌是**把"没读到"说成"未领/已领"**（U9）：
+     *   ① 载荷未到达（`checkin == null`，含老宿主无该字段）→ 「读取中」；
+     *   ② `ok !== true` → 说来由（带机器可读码），桌面端没开给一句可执行的话；
+     *   ③ `ok === true` 且 `active === false` → 「签到活动已结束」（正常状态，不是故障）；
+     *   ④ `todayCheckedIn === true` → 「今日已领（今日 +N，连签 M 天）」，缺数就略过该半句；
+     *   ⑤ `todayCheckedIn === false` → 按自动领取开关说"将自动领取"还是"已关闭"；
+     *   ⑥ 字段缺失 → 「平台未返回签到状态」，不猜。
+     *
+     * @param {object|null|undefined} checkin `payload.checkin`
+     * @returns {string} 行内正文（不含标签前缀）
+     */
+    function checkinBody(checkin) {
+      const text = L.checkin;
+      if (checkin === null || checkin === undefined) {
+        return text.loading;
+      }
+      if (checkin.ok !== true) {
+        const code = String((checkin.error && checkin.error.code) || checkin.source || '');
+        if (code === 'workbuddy_desktop_closed') return text.desktopClosed;
+        return text.unknown(code);
+      }
+      if (checkin.active === false) {
+        return text.inactive;
+      }
+      if (checkin.todayCheckedIn === true) {
+        const bits = [text.claimed];
+        const credit = checkin.todayCredit;
+        if (typeof credit === 'number' && Number.isFinite(credit)) bits.push(text.todayCredit(credit));
+        const streak = checkin.streakDays;
+        if (typeof streak === 'number' && Number.isFinite(streak)) bits.push(text.streak(streak));
+        return bits.join('，');
+      }
+      if (checkin.todayCheckedIn === false) {
+        return checkin.autoEnabled === false ? text.unclaimedManual : text.unclaimedAuto;
+      }
+      return text.noValue;
+    }
+
+    /**
+     * 每日签到行（`payload.checkin`，余额块之后）。
+     *
+     * ★ 普通状态行（非大字块）："已领/未领/已结束/读不到"都不是新闻，只占一行。
+     *   `key: 'checkin'` 单行单字符串（与 CreditsBlock 内行同款断言纪律）。
+     *
+     * @param {{checkin?: object|null}} props `props.checkin` = `payload.checkin`
+     */
+    function CheckinBlock(props) {
+      const checkin = props ? props.checkin : null;
+      return h('div', { className: 'dsh-wb-status__line', 'data-kv': '', key: 'checkin' }, L.checkin.label + checkinBody(checkin));
+    }
+
+    /**
      * 任务块（②）：对话标题 + 回执（人话）+ 在途；失败人话主视图，编号证据进折叠。
      *
      * ★ 折叠纪律（2026-10-02）：`--model` 这类旗标名 / 退出码 / 本机路径 / 会话与任务 id /
@@ -1309,6 +1384,11 @@ window.__ModuleLoader__.load({
           key: 'credits',
           credits: status === null || status === undefined ? null : status.credits,
         }),
+        // ①' 签到行：与余额块同款"载荷未到达也画"（老宿主无该字段 ⇒ 显示"读取中"，不消失）。
+        h(CheckinBlock, {
+          key: 'checkin',
+          checkin: status === null || status === undefined ? null : status.checkin,
+        }),
         ...lines,
         ...(diagnostics === null ? [] : [diagnostics]),
       ]);
@@ -1502,6 +1582,16 @@ window.__ModuleLoader__.load({
               disabled: !writable,
               warn: effortWarn,
               onChange: (next) => write('effort', next),
+            }),
+            // ★ 每日签到自动领取开关（默认开，见 schema `enableAutoCheckin`）。
+            //   老快照无该键（`undefined`）⇒ 按默认开显示（`!== false` 即开），与宿主默认值一致；
+            //   关掉后状态面的后台领取停掉，签到行如实显示"自动领取已关闭"。
+            h(SwitchRow, {
+              key: 'autocheckin',
+              label: L.checkin.rowLabel,
+              checked: value.enableAutoCheckin !== false,
+              disabled: !writable,
+              onChange: () => write('enableAutoCheckin', !(value.enableAutoCheckin !== false)),
             }),
           ]),
           h(StatusBlock, { key: 'status', snap, status, failure }),

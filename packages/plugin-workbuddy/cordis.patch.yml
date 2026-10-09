@@ -58,6 +58,8 @@
         # 等目标实例出现的窗口（毫秒）。30s 的依据：桌面端激活 prewarm sidecar 实测 1–3s，
         #   30s 覆盖"慢盘/杀软冷扫"；再大就是让用户对着一个本轮注定失败的作业干等。
         instanceTimeoutMs: 30000
+        # 自动化任务超时（毫秒）。默认 15 分钟（900000ms）。
+        automationTimeoutMs: 900000
         # ── 多轮追发（★ 2026-10-03 M2 新增；RFC-SESSION-RESUME-INTEGRATION）────────
         # Track A（CDP 直发既有对话）总闸，**默认 false**（opt-in）。开着时仅当调用方
         #   resume:true 且记性命中，workbuddy_run 才先尝试追发进既有对话；失败按 RFC §4.2
@@ -82,6 +84,12 @@
         # 回退红线：只有**派发前**失败才回退计划任务（回执 fallback/fallbackReason 如实）；
         #   **已派发**的失败一律不回退 —— 否则同一条 prompt 会被跑第二遍（双份积分）。
         enableDirectIgnition: false
+        # ── 每日签到自动领取（★ 2026-10-09 新增：Buddy 加油站）─────────────────
+        # 状态面读到"活动进行中且今日未签"时在后台顺手领掉（先查后领、领完复核，幂等）。
+        # **默认 true**：用户点名要自动完成；接口幂等（已签回 400+10001，不多发）；
+        # 非活动季静默收尾。仍受总闸约束（enabled 非 true ⇒ 一次都不跑）。
+        # 前置：桌面端在跑且已登录（走 wbipc 借登录态；没开就如实报读不到，不代启动）。
+        enableAutoCheckin: true
         # ── 传输面（★ 2026-10-02 切回 automation 为默认）──────────────
         # automation = 插件往桌面端自己的计划任务表（`~/.workbuddy/workbuddy.db` 的
         #   `automations`）写一条**一次性**任务，由**桌面端自己的调度器**开一个新会话并把
@@ -139,6 +147,13 @@
         creditsAt: 0         # 读取时刻（插件写）
         creditsConsumed: 0   # 累计扣减（插件写；仅参考，**不是**账单）
         creditsRuns: 0       # 运行次数（插件写）
+        # ── 每日签到（★ 2026-10-09）──────────────────────────────────────────
+        # 上一次签到动作的结论（插件写，供离线显示今日是否已领、连签几天）。
+        # checkinLastResult 取值：claimed / already / inactive / failed-* / unavailable。
+        checkinLastAt: 0        # 上次签到动作时刻（插件写）
+        checkinLastResult: ''   # 上次签到结论（插件写）
+        checkinLastCredit: 0    # 上次领到的积分（插件写）
+        checkinStreakDays: 0    # 上次读到的连签天数（插件写）
         launch:
           # ★★★ CLI 旗标表已整体删除（2026-10-02，删净 CLI 线）★★★
           #   原来这里声明 13 个 CLI 旗标（`--model` / `--effort` / `-p` / `--resume` /

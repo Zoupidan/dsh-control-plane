@@ -19,6 +19,27 @@ export const BILLING_PATHS = Object.freeze({
   paidPackages: '/billing/meter/get-user-resource-paid-packages',
 });
 
+/**
+ * 每日签到（Buddy 加油站）的两个端点。同样不带 `/v2` —— 与上面三条同源。
+ *
+ * <p>★★ 来由 ★★：签到接口系公开仓库从桌面端逆向所得（`88lin/workbuddy-auto-signin`，
+ * 直接 HTTPS 打 `https://copilot.tencent.com/v2/billing/meter/...`，Bearer 读本地登录态文件）。
+ * 本插件**不走那条路**：凭据绝不进插件进程（红线 E3），而是复用 `wbipc` 的 `http.fetch`
+ * —— 由已登录的桌面端代发，鉴权头由宿主填。真机实测（2026-10-09）：
+ * `/billing/meter/checkin-activity-status` 经 wbipc 回 HTTP 200 + `data.today_checked_in` 等全字段；
+ * `/billing/meter/daily-checkin` 在已签时回 HTTP 400 + `code:10001`（幂等，不会重复发放）。
+ * 带 `/v2` 的写法经 wbipc 同样 200，但按本文件惯例统一用无前缀形。
+ */
+export const CHECKIN_PATHS = Object.freeze({
+  status: '/billing/meter/checkin-activity-status',
+  claim: '/billing/meter/daily-checkin',
+});
+
+/** 签到活动已结束 / 不在签到季 —— 正常状态，不是故障，不重试、不打扰。 */
+export const CHECKIN_INACTIVE = 'checkin_inactive';
+/** 今日已签（幂等）：领取接口的 `code:10001` 或文案含"已签"。 */
+export const CHECKIN_ALREADY_CODE = 10001;
+
 /** 平台奖励积分的包名特征：这类包没有 `SubscriptionPackageCode`，是当前账户的主要余额来源。 */
 const PROMO_CODE = /^TCACA_/;
 
@@ -117,3 +138,95 @@ export function summarizeCredits(payload) {
  * 采样（`consumed` 字段是有意义的实测值），那属于计费对账，是另一件事 ——
  * 别拿倍率当乘数糊一个看起来能用的数上去。
  */
+
+/**
+ * 解析 `checkin-activity-status` 的响应（纯函数，零 I/O）。
+ *
+ * <p>真机形状（2026-10-09）：`{code:0, data:{active, today_checked_in, streak_days,
+ * daily_credit, today_credit, total_credits, end_time, ...}}`。
+ *
+ * @param {object} payload 接口返回的 JSON
+ * @returns {{ok: boolean, error: object|null, active: boolean|null,
+ *   todayCheckedIn: boolean|null, streakDays: number|null, dailyCredit: number|null,
+ *   todayCredit: number|null, totalCredits: number|null, endTime: string|null,
+ *   at: number}|null}
+ *   ★ 同 summarizeCredits 的三态纪律：`null` = 没拿到东西；`{ok:false}` = 拿到但报错/形状不对；
+ *   只有 `{ok:true}` 才携带读数。**任何失败都不得被读成"今日未签"** —— 读不到就说读不到，
+ *   绝不据此触发领取（领取的唯一依据是 `ok:true + todayCheckedIn:false`）。
+ */
+export function summarizeCheckin(payload) {
+  if (payload === null || typeof payload !== 'object') return null;
+  if (payload.code !== undefined && payload.code !== 0) {
+    return {
+      ok: false,
+      error: { code: 'billing_error', message: `${payload.msg ?? 'unknown'}${payload.requestId === undefined ? '' : ` (requestId ${payload.requestId})`}` },
+      active: null, todayCheckedIn: null, streakDays: null, dailyCredit: null,
+      todayCredit: null, totalCredits: null, endTime: null, at: Date.now(),
+    };
+  }
+  const data = payload.data;
+  // ★ 数组不是对象：`data:[]` 这类形状必须走"形状不对"，不能当成"全字段缺失但成功"。
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+    return { ok: false, error: { code: 'unexpected_shape', message: 'the response carried no data object' }, active: null, todayCheckedIn: null, streakDays: null, dailyCredit: null, todayCredit: null, totalCredits: null, endTime: null, at: Date.now() };
+  }
+  const bool = (v) => (typeof v === 'boolean' ? v : null);
+  const num = (v) => {
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+    if (typeof v === 'string' && v.trim() !== '') {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  };
+  const str = (v) => (typeof v === 'string' && v !== '' ? v : null);
+  return {
+    ok: true,
+    error: null,
+    active: bool(data.active),
+    todayCheckedIn: bool(data.today_checked_in),
+    streakDays: num(data.streak_days),
+    dailyCredit: num(data.daily_credit),
+    todayCredit: num(data.today_credit),
+    totalCredits: num(data.total_credits),
+    endTime: str(data.end_time),
+    at: Date.now(),
+  };
+}
+
+/**
+ * 归类 `daily-checkin` 的领取响应（纯函数，零 I/O）。
+ *
+ * <p>三种形态（真机 + 公开仓库交叉验证）：
+ * <ul>
+ *   <li>成功：`code:0`（`data.credit` 系实发积分，挖不到则为 null）；</li>
+ *   <li>已签（幂等）：HTTP 400 + `code:10001`，或文案含"已签" —— **不是失败**；</li>
+ *   <li>其他：失败，带回 `code/msg` 供上层如实显示。</li>
+ * </ul>
+ *
+ * @param {number|null} statusCode wbipc 回的 HTTP 状态
+ * @param {object|null} body 解析后的 JSON（wbipc 的 `json` 字段）
+ * @returns {{outcome: 'claimed'|'already'|'failed', credit: number|null, message: string}}
+ */
+export function classifyClaim(statusCode, body) {
+  const msg = body !== null && typeof body === 'object' ? String(body.msg ?? '') : '';
+  const code = body !== null && typeof body === 'object' ? body.code : undefined;
+  if (code === CHECKIN_ALREADY_CODE || msg.includes('已签')) {
+    return { outcome: 'already', credit: null, message: msg === '' ? 'today already checked in' : msg };
+  }
+  if (code === 0 || code === undefined) {
+    if (statusCode !== null && (statusCode < 200 || statusCode >= 300)) {
+      return { outcome: 'failed', credit: null, message: msg === '' ? `unexpected status ${String(statusCode)}` : msg };
+    }
+    let credit = null;
+    if (body !== null && typeof body === 'object') {
+      const data = typeof body.data === 'object' && body.data !== null ? body.data : body;
+      for (const k of ['credit', 'credits', 'today_credit']) {
+        const v = data[k];
+        if (typeof v === 'number' && Number.isFinite(v)) { credit = v; break; }
+        if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) { credit = Number(v); break; }
+      }
+    }
+    return { outcome: 'claimed', credit, message: msg === '' ? 'ok' : msg };
+  }
+  return { outcome: 'failed', credit: null, message: msg === '' ? `billing code ${String(code)}` : msg };
+}

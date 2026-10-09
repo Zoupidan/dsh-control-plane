@@ -75,6 +75,7 @@ export const REASON_CODES = Object.freeze({
   TASK_ERROR: 'task_error',
   ABORTED: 'aborted',
   UNKNOWN: 'unknown',
+  STILL_RUNNING: 'still_running',
   /**
    * 复用命中、未下发（★ 2026-10-02 诚实化；用户禁网关后恢复为现行口径）。
    *
@@ -87,7 +88,11 @@ export const REASON_CODES = Object.freeze({
    * 要跑请 `resume:false` 开新对话（INSERT 一行 once）或换新 key。
    */
   ALREADY_REMEMBERED_NO_DISPATCH: 'already_remembered_no_dispatch',
+  WORKSPACE_BUSY: 'ERR_WORKSPACE_BUSY',
 });
+
+/** 导出的工作区繁忙错误码常量（F11 / R4）。 */
+export const WORKSPACE_BUSY = 'ERR_WORKSPACE_BUSY';
 
 /**
  * "有具体证据支撑的失败"集合（SSOT）—— 三个消费点共用同一判据，避免三处各判一次而漂移：
@@ -113,6 +118,7 @@ export const FAILURE_CODES = Object.freeze(new Set([
   // ★ 复用命中未下发是有具体证据的终态（记住的 id + 无追问入口），不是"未知"也不是"取消" ⇒ 进失败集合，
   //   availability 的 lastFailureHint 才配 failed 语义（与 completed/OK 的谎报划清界线）。
   REASON_CODES.ALREADY_REMEMBERED_NO_DISPATCH,
+  REASON_CODES.WORKSPACE_BUSY,
 ]));
 
 /**
@@ -162,6 +168,8 @@ export const REASON_TEXT = Object.freeze({
   // ★ 措辞纪律：`unknown` 是"**没归一出来**"，不是"失败"。旧文案"未能归一出失败原因"默认了失败，
   //   与"终态仍为 completed"矛盾（对抗审查 S1：同一个 lastRun 里两处结论打架）。此处只陈述"未能判定"。
   [REASON_CODES.UNKNOWN]: '未能判定本次下发是否失败（原始输出保留在下方供人工判断）。',
+  [REASON_CODES.STILL_RUNNING]: '任务仍在桌面端后台运行中（超时守望）。',
+  [REASON_CODES.WORKSPACE_BUSY]: 'WorkBuddy 工作区繁忙：该工作区已有任务正在执行中。',
 });
 
 /**

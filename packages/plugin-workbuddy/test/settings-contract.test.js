@@ -68,6 +68,18 @@ test('★ credits* 必须声明为 volatile（它们是 settings 落盘的字段
   }
 });
 
+test('★ checkin* 必须声明为 volatile（签到结论同样经 settings 落盘）', () => {
+  // ★ 2026-10-09 新增：与上面四行同一条硬约束（`launch/daily-checkin.js` 的 `persistClaim`）。
+  //   开关 `enableAutoCheckin` 虽由用户写、也必须 volatile —— 0.1.7 的设置面只投影 volatile 字段，
+  //   非 volatile 的开关在设置页根本不出现（见 schema.js 头注）。
+  for (const key of ['checkinLastAt', 'checkinLastResult', 'checkinLastCredit', 'checkinStreakDays', 'enableAutoCheckin']) {
+    const field = Config.dict[key];
+    assert.notEqual(field, undefined, `${key} 必须存在于 Config`);
+    assert.equal(field.meta?.volatile, true,
+      `${key} 经 settings.update 落盘/投影，非 volatile 会被宿主拒绝（打死 dsh / 设置页消失）`);
+  }
+});
+
 /**
  * 静态扫描：凡是"经 settings 落盘"的键，都必须声明为 volatile。
  *

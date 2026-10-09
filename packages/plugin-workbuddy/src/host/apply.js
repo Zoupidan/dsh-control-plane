@@ -18,12 +18,14 @@ import { Config } from './config/schema.js';
 import { createDispatcher } from './gateway/dispatch.js';
 import { sweepStartupAutomationRows } from './gateway/automation.js';
 import { createLiveCredits } from './launch/live-credits.js';
+import { createDailyCheckin } from './launch/daily-checkin.js';
 import { detectWorkBuddy } from './probe/detect.js';
 import { availabilityText } from './prompts/availability.js';
 import { makeRoutes } from './routes/index.js';
 import { loadSessionMap, sweepOwnSessions } from './session/map.js';
 import { reconcileSubagentProvider } from './subagent/index.js';
 import { reconcileTools } from './tools/index.js';
+import { makeHarvestTool, TOOL_HARVEST } from './tools/harvest.js';
 
 const name = PLUGIN_ID;
 // ★ ⑦ 子智能体面：`subagents` 进 inject 数组，只是让 cordis **知道**要等这个服务；
@@ -194,6 +196,14 @@ function apply(ctx, config) {
   // ②' 积分（★ 2026-09-28 改为**真值直读**）：走 wbipc 只读查询，借桌面端登录态，不持账号凭据。
   //     取代了旧的"主理人手填锚点 + 插件本地推算"账本（credit-ledger.js 已删）。
   const credits = createLiveCredits({ ns: NS, read: () => runtime.currentConfig() });
+  // ②'' 每日签到自动领取（★ 2026-10-09：Buddy 加油站，先查后领、领完复核，幂等）。
+  //     与积分同款传输面（wbipc 借桌面端登录态，插件不持有任何账号凭据）；
+  //     领到之后顺手刷新一次余额读数（回调里吞掉一切异常 —— 刷新失败不污染领取结论）。
+  const checkin = createDailyCheckin({
+    ns: NS,
+    read: () => runtime.currentConfig(),
+    onClaimed: () => { void Promise.resolve().then(() => credits.refresh()).catch(() => {}); },
+  });
   // ③ 只读探测（U6）：不启动任何程序（§7.2 H-NO-EXEC-PROBE）
   // ★ 0.1.7 修复：必须传 `runtime.currentConfig()`，不能直接传 `config`。
   //   cordis 把 `Config['~standard'].validate()` 的结果原样交给 apply（`cordis/lib/index.js:956-962`），
@@ -249,8 +259,24 @@ function apply(ctx, config) {
   });
   // ④ ★ U4 心脏：工具注册 + 开关心脏
   ctx.effect(() => reconcileTools(ctx, {
-    runtime, sessions, config, Config, NS, detect: detectWorkBuddy, credits, dispatch,
+    runtime, sessions, config, Config, NS, detect: detectWorkBuddy, credits, dispatch, checkin,
   }), `${PLUGIN_ID}: tools`);
+  // ④'' ★ Late-harvest channel tool on ctx.tools (§3.4.1 R2)
+  const harvestTool = makeHarvestTool(runtime, () => runtime.currentConfig(), ctx);
+  if (ctx.tools) {
+    ctx.tools[TOOL_HARVEST] = harvestTool;
+    ctx.tools.harvest = harvestTool;
+    ctx.tools.workbuddy_harvest = harvestTool;
+    if (typeof ctx.tools.get === 'function') {
+      const origGet = ctx.tools.get.bind(ctx.tools);
+      ctx.tools.get = (toolName) => {
+        if (toolName === TOOL_HARVEST || toolName === 'harvest' || toolName === 'workbuddy_harvest') {
+          return harvestTool;
+        }
+        return origGet(toolName);
+      };
+    }
+  }
   // ④' ★ 子智能体面：把 WorkBuddy 注册成**真的** provider（`workbuddy`），而不只是一次工具调用。
   //     收敛判据、失败面与 `reconcileTools` 同款（见 host/subagent/index.js 头注）：
   //     `enabled !== true` ⇒ 不注册；注册失败只落日志，不炸掉本行之后的 ⑤⑥ 装配。
@@ -265,10 +291,11 @@ function apply(ctx, config) {
       ctx.inject(['webServer', 'settings'], (sctx) => {
         sctx.effect(() => {
           credits.attach(sctx.settings);
+          checkin.attach(sctx.settings);
           // 传入 sessions：状态载荷要回传"可续接会话"（T04 会话可见性）。
           // 传入 dispatch：`/plugin-workbuddy/diagnostics` 要用它做只读体检。此前整条下发链路
           // 的失败在日志里一个字都没有，路由层又拿不到 dispatch ⇒ inspect() 长期零调用点。
-          const ds = makeRoutes(sctx.settings, runtime, NS, sessions, credits, dispatch)
+          const ds = makeRoutes(sctx.settings, runtime, NS, sessions, credits, dispatch, checkin)
             .map((r) => sctx.webServer.register(r));
           return () => { for (const d of ds) d(); };
         }, `${PLUGIN_ID}: status bridge`);

@@ -30,6 +30,7 @@
  *
  * 约束：本文件属于 packages/*​/src（CI ② 扫描范围）—— 不得出现裸进程出口字样。
  */
+import { randomUUID } from 'node:crypto';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
 import { EFFORT_LEVELS, PLUGIN_ID, TOOL_RUN } from '../../shared/constants.js';
@@ -298,6 +299,14 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
         + '(off/minimal/low/medium/high/xhigh/max; this desktop supports minimal/low/medium/high/xhigh/max). '
         + 'Omit it to use the plugin setting.',
     },
+    wait: {
+      type: 'boolean',
+      description: 'Whether to await task completion before returning (echoes reply and artifacts directly).',
+    },
+    wait_ms: {
+      type: 'number',
+      description: 'Maximum milliseconds to wait when wait is true.',
+    },
   },
   output: {
     schema: {
@@ -355,6 +364,15 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
           description: 'Canonical error fingerprint (RFC §4.2, e.g. ERR_WORKBUDDY_CDP_UNAVAILABLE) ' +
             'that triggered the fallback; present only alongside fallback:true.',
         },
+        reply: {
+          oneOf: [{ type: 'string' }, { type: 'null' }],
+          description: 'Assistant reply text (if available upon completion).',
+        },
+        artifacts: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Artifact paths generated during run (if available).',
+        },
       },
     },
     render: (_args, value) => [{
@@ -371,10 +389,16 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
         `\nargv: ${value.argv_preview}` +
         (Array.isArray(value.not_sent) && value.not_sent.length > 0
           ? `\n${value.not_sent.join('\n')}`
+          : '') +
+        (typeof value.reply === 'string' && value.reply !== ''
+          ? `\nreply: ${value.reply}`
+          : '') +
+        (Array.isArray(value.artifacts) && value.artifacts.length > 0
+          ? `\nartifacts:\n${value.artifacts.map((a) => `  - ${a}`).join('\n')}`
           : ''),
     }],
   },
-  async execute(args, exec) {
+  async execute(args, exec = {}) {
     // 最外层短路（§4.4.2 A4）：即便工具被误注册，也再判一次。
     // ★ 下发健康 C 组：**三条分支各说各的成因**（关掉 / 没探到桌面端 / 还没探出来）。
     const c = cfg();
@@ -402,39 +426,72 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
     if (args.prompt.trimStart().startsWith('-')) {
       throw new Error("prompt must not start with '-' (it would be parsed as a flag)");
     }
-    // §7.4 M2：一平台并发上限 = 1（真机 ctx.jobs 默认 10/owner，须本工具自守）。
-    if (runtime.inFlightCount() > 0) {
-      throw new Error('workbuddy is busy: another job is in flight (concurrency cap = 1)');
+    const autoCwd = typeof args.cwd === 'string' && args.cwd !== '' ? args.cwd : (typeof c.cwdRoot === 'string' ? c.cwdRoot : '');
+    const lockJobId = `run-${randomUUID()}`;
+    const acquired = typeof runtime?.acquireWorkspaceLock === 'function'
+      ? runtime.acquireWorkspaceLock(autoCwd, lockJobId)
+      : (typeof runtime?.inFlightCount === 'function' ? runtime.inFlightCount() === 0 : true);
+    if (!acquired) {
+      const busyDetail = 'WorkBuddy workspace is busy: another job is in flight in this workspace.';
+      if (args?.throwOnBusy === false || exec?.throwOnBusy === false) {
+        return {
+          ok: false,
+          error: 'ERR_WORKSPACE_BUSY',
+          status: 'busy',
+          reasonCode: 'ERR_WORKSPACE_BUSY',
+          detail: busyDetail,
+        };
+      }
+      const busyErr = new Error(busyDetail);
+      busyErr.code = 'ERR_WORKSPACE_BUSY';
+      busyErr.reasonCode = 'ERR_WORKSPACE_BUSY';
+      busyErr.status = 'busy';
+      busyErr.ok = false;
+      busyErr.error = 'ERR_WORKSPACE_BUSY';
+      busyErr.detail = busyDetail;
+      throw busyErr;
     }
 
-    const hasKey = typeof args.session_key === 'string' && args.session_key !== '';
-    // ★ 缺省 key 必须是**确定性的**，不能是随机的（2026-10-02 改）★★
-    //   旧写法 `sessions.createKey()` 每次生成随机 key ⇒ 不传 session_key 的每一次下发
-    //   都会新建一条 WorkBuddy 对话 ⇒ 用户自己的对话列表被插件撑爆，而且**互相不认识**：
-    //   模型看不到上一轮说过什么，"一个任务 = 一条对话"这个产品语义直接作废。
-    //
-    //   现在的规则（也是我们要的语义）：
-    //     · 调用方给了 `session_key` ⇒ 逐字用它（并行/分话题时由人决定）
-    //     · 没给 ⇒ **按工作区派生一个稳定 key**：同一项目里的活自然落在同一条对话上，
-    //       不再是"每个任务一条"
-    //     · 确实要另开一条 ⇒ 显式 `new_conversation: true`（唯一的逃生口，不靠默认）
-    //   为什么用 cwd 派生而不是模型自己起名：模型起名不可靠（今天实测它每个任务都新起一个），
-    //   而 cwd 是调用方给的**真事实**，同一个项目的活本来就该在一条对话里。
-    const sessionKey = hasKey
-      ? args.session_key
-      : deriveSessionKey(typeof args.cwd === 'string' && args.cwd !== '' ? args.cwd : (typeof c.cwdRoot === 'string' ? c.cwdRoot : ''));
-    // 会话意图：省略 ⇒ 自动（每轮新开）；resume=true ⇒ **要求**有可查记性
-    //   （无记录就报错，不静默开新）；resume=false ⇒ 强制新会话。`new_conversation:true`
-    //   同视为强制新会话（与 resume:false 同义）。可二次下发：有无记住都走点火
-    //   INSERT 一行 once（resumed:false，真下发），成功 adopt 覆盖新 id，失败 forget。
-    const intent = args.resume === true ? true : args.resume === false ? false : null;
-    if (intent === true && !hasKey) {
-      throw new Error('workbuddy: resume:true requires session_key (a brand-new key has nothing to continue)');
-    }
-    const recorded = hasKey && typeof sessions?.resumable === 'function'
+    const releaseLock = () => {
+      try {
+        if (typeof runtime?.releaseWorkspaceLock === 'function') {
+          runtime.releaseWorkspaceLock(autoCwd, lockJobId);
+        }
+      } catch { /* 忽略释放异常 */ }
+    };
+
+    let dispatched = false;
+    try {
+      const hasKey = typeof args.session_key === 'string' && args.session_key !== '';
+      // ★ 缺省 key 必须是**确定性的**，不能是随机的（2026-10-02 改）★★
+      //   旧写法 `sessions.createKey()` 每次生成随机 key ⇒ 不传 session_key 的每一次下发
+      //   都会新建一条 WorkBuddy 对话 ⇒ 用户自己的对话列表被插件撑爆，而且**互相不认识**：
+      //   模型看不到上一轮说过什么，"一个任务 = 一条对话"这个产品语义直接作废。
+      //
+      //   现在的规则（也是我们要的语义）：
+      //     · 调用方给了 `session_key` ⇒ 逐字用它（并行/分话题时由人决定）
+      //     · 没给 ⇒ **按工作区派生一个稳定 key**：同一项目里的活自然落在同一条对话上，
+      //       不再是"每个任务一条"
+      //     · 确实要另开一条 ⇒ 显式 `new_conversation: true`（唯一的逃生口，不靠默认）
+      //   为什么用 cwd 派生而不是模型自己起名：模型起名不可靠（今天实测它每个任务都新起一个），
+      //   而 cwd 是调用方给的**真事实**，同一个项目的活本来就该在一条对话里。
+      const sessionKey = hasKey
+        ? args.session_key
+        : deriveSessionKey(typeof args.cwd === 'string' && args.cwd !== '' ? args.cwd : (typeof c.cwdRoot === 'string' ? c.cwdRoot : ''));
+      // 会话意图：省略 ⇒ 自动（每轮新开）；resume=true ⇒ **要求**有可查记性
+      //   （无记录就报错，不静默开新）；resume=false ⇒ 强制新会话。`new_conversation:true`
+      //   同视为强制新会话（与 resume:false 同义）。可二次下发：有无记住都走点火
+      //   INSERT 一行 once（resumed:false，真下发），成功 adopt 覆盖新 id，失败 forget。
+      const intent = args.resume === true ? true : args.resume === false ? false : null;
+      if (intent === true && !hasKey) {
+        releaseLock();
+        throw new Error('workbuddy: resume:true requires session_key (a brand-new key has nothing to continue)');
+      }
+      const recorded = hasKey && typeof sessions?.resumable === 'function'
       ? sessions.resumable(sessionKey)
       : null;
     if (intent === true && recorded === null) {
+      releaseLock();
       throw new Error(
         `workbuddy: resume:true but no resumable session is recorded for session_key "${sessionKey}" `
         + '(use workbuddy_status to list resumable sessions, or omit resume to start a new one)',
@@ -533,8 +590,6 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
     //   启动期扫遗留活行全软删 —— 止损就靠删行（软删 `deleted_at`）。
     const transport = 'automation';
     void transport;
-
-    const autoCwd = typeof args.cwd === 'string' && args.cwd !== '' ? args.cwd : c.cwdRoot;
     const requestedPerm = (typeof args.permission_mode === 'string' && args.permission_mode !== ''
       ? args.permission_mode
       : (typeof c.sessionMode === 'string' && c.sessionMode !== ''
@@ -751,7 +806,8 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
           reasoningEffort: requestedEffort,
           sessionKey,
           ...(automationSessionStore !== null ? { sessionStore: automationSessionStore } : {}),
-          signal: exec.signal,
+          timeoutMs: typeof c.automationTimeoutMs === 'number' && c.automationTimeoutMs > 0 ? c.automationTimeoutMs : AUTOMATION_DEFAULTS.timeoutMs,
+          signal: exec?.signal,
         });
     const aJobId = ctx.jobs.start({
       kind: 'workbuddy',
@@ -769,8 +825,10 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
         };
         const settleAutomation = (out) => {
           const au = out.automation ?? {};
-          const status = out.status === 'completed' ? 'completed' : 'failed';
-          if (status !== 'completed') forgetOnFail();
+          const isCompleted = out.status === 'completed';
+          const isStillRunning = out.status === 'still_running';
+          const status = isCompleted ? 'completed' : (isStillRunning ? 'still_running' : 'failed');
+          if (!isCompleted && !isStillRunning) forgetOnFail();
           // ★ 倍率按实记模型查实时目录（见 `multiplierOfUsedModel`）：免费 x0.00 记 freeRuns，
           //   查不到 ⇒ null ⇒ unknownRuns（未知，不猜）。此前这里硬编码 null，免费轮也被记成未知。
           const usedId = au.usedModelId ?? au.model ?? null;
@@ -784,8 +842,12 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
           } catch {
             mult = null;   // 目录读不到 ⇒ 未知，不改判成败
           }
-          credits?.recordRun?.({ ok: status === 'completed', multiplier: mult });
-          if (status === 'completed' && runtime.registry() === REGISTRY_STATES.DEGRADED) {
+          if (isCompleted) {
+            credits?.recordRun?.({ ok: true, multiplier: mult });
+          } else if (!isStillRunning) {
+            credits?.recordRun?.({ ok: false, multiplier: mult });
+          }
+          if (isCompleted && runtime.registry() === REGISTRY_STATES.DEGRADED) {
             runtime.setRegistry(REGISTRY_STATES.REGISTERED);
           }
           const reqPerm = typeof requestedPerm === 'string' ? requestedPerm : '';
@@ -803,8 +865,8 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
               ? 'followup'
               : ((directMeta !== null || directFail !== null) ? 'direct' : 'automation'),
             at: Date.now(),
-            exitCode: typeof out.exitCode === 'number' ? out.exitCode : null,
-            reasonCode: status === 'completed' ? REASON_CODES.OK : (au.reason ?? REASON_CODES.TASK_ERROR),
+            exitCode: typeof out.exitCode === 'number' ? out.exitCode : (isStillRunning ? 0 : null),
+            reasonCode: isCompleted ? REASON_CODES.OK : (isStillRunning ? REASON_CODES.STILL_RUNNING : (au.reason ?? REASON_CODES.TASK_ERROR)),
             receipt: null,
             model: au.usedModelId ?? au.model ?? null,
             permission: {
@@ -835,7 +897,7 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
               : (typeof au.createdAt === 'number' ? au.createdAt : null),
             sessionRenewed: '',
             sessionPersist: au.sessionPersist ?? null,
-            retired: au.retired === true,
+            retired: isStillRunning ? false : (au.retired === true),
             sessionKey,
             // ★ M2：resumed 不再写死 false —— 追发成功为 true；点火轮（含追发失败回退）仍为 false。
             resumed: followUpMeta !== null,
@@ -860,14 +922,22 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
             toolCalls: { count: 0, names: [] },
             phases: Array.isArray(au.phases) ? au.phases : [],
             stdoutText: out.detail ?? (typeof au.reply === 'string' ? au.reply : ''),
+            reply: typeof au.reply === 'string' ? au.reply : null,
+            artifacts: Array.isArray(au.artifacts) ? au.artifacts : [],
             argv: [],
             flags: {}, notSent: [],
             usage: null,
             flagVerdict: null,
           });
-          runtime.finish(aJobId, status === 'completed' ? 0 : -1);
+          runtime.finish(aJobId, isCompleted || isStillRunning ? 0 : -1);
           runtime.forget(aJobId);
-          return { status, detail: out.detail ?? (typeof au.reply === 'string' ? au.reply : '') };
+          releaseLock();
+          return {
+            status,
+            detail: out.detail ?? (typeof au.reply === 'string' ? au.reply : ''),
+            reply: typeof au.reply === 'string' ? au.reply : null,
+            artifacts: Array.isArray(au.artifacts) ? au.artifacts : [],
+          };
         };
         return {
           cancel: a.cancel,
@@ -882,12 +952,13 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
       },
     });
     runtime.start(aJobId, { terminate: a.cancel });
+    dispatched = true;
     // ★ M2 追发回执：走向**两分支**，字段名/取值与既有契约逐字对齐 ——
     //   · 追发成功：resumed:true + 续用的对话 id + follow_up 元数据（channel/elapsedMs）；
     //   · 点火/回退轮：既有逐字形状（resumed:false、resumed_session_id 空串），仅追发失败时
     //     追加 fallback 两键（指纹码可见，不静默）。开关关闭时不含任何新键（hardening 键集契约）。
-    if (followUpMeta !== null) {
-      return {
+    let finalStarted = followUpMeta !== null
+      ? {
         job_id: aJobId,
         session_key: sessionKey,
         argv_preview: automationHeader({ model: typeof args.model === 'string' ? args.model : c.model, cwd: autoCwd }),
@@ -901,18 +972,42 @@ export const makeRunTool = (runtime, sessions, cfg, ctx, credits = null, dispatc
           conversationModel: followUpMeta.conversationModel,
           conversationEffort: followUpMeta.conversationEffort,
         },
+      }
+      : {
+        job_id: aJobId,
+        session_key: sessionKey,
+        argv_preview: automationHeader({ model: typeof args.model === 'string' ? args.model : c.model, cwd: autoCwd }),
+        // ★ 点火轮（含追发失败回退轮）恒为新对话（INSERT 一行 once）：`resumed:false` 逐字保留。
+        resumed: false,
+        resumed_session_id: '',
+        not_sent: buildNotSent(args, c),
+        ...(fallbackReason !== null ? { fallback: true, fallbackReason } : {}),
       };
+
+    if (args.wait === true || (typeof args.wait_ms === 'number' && args.wait_ms > 0)) {
+      const waitBudget = typeof args.wait_ms === 'number' && args.wait_ms > 0 ? args.wait_ms : 30000;
+      let timer;
+      const timeoutPromise = new Promise((resolve) => { timer = setTimeout(() => resolve(null), waitBudget); });
+      const settled = await Promise.race([a.done, timeoutPromise]);
+      clearTimeout(timer);
+      if (settled && typeof settled === 'object') {
+        const au = settled.automation ?? {};
+        const reply = typeof settled.reply === 'string' ? settled.reply : (typeof au.reply === 'string' ? au.reply : null);
+        const artifacts = Array.isArray(settled.artifacts) ? settled.artifacts : (Array.isArray(au.artifacts) ? au.artifacts : []);
+        finalStarted = {
+          ...finalStarted,
+          reply,
+          artifacts,
+        };
+      }
     }
-    return {
-      job_id: aJobId,
-      session_key: sessionKey,
-      argv_preview: automationHeader({ model: typeof args.model === 'string' ? args.model : c.model, cwd: autoCwd }),
-      // ★ 点火轮（含追发失败回退轮）恒为新对话（INSERT 一行 once）：`resumed:false` 逐字保留。
-      resumed: false,
-      resumed_session_id: '',
-      not_sent: buildNotSent(args, c),
-      ...(fallbackReason !== null ? { fallback: true, fallbackReason } : {}),
-    };
+    return finalStarted;
+  } catch (err) {
+    if (!dispatched) {
+      releaseLock();
+    }
+    throw err;
+  }
   },
   presentCall: (a) => ({ card: 'generic', title: `Delegate to WorkBuddy: ${a.prompt.slice(0, 60)}`, kind: 'execute' }),
 });

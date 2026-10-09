@@ -37,7 +37,7 @@ import { makeStatusTool } from './status.js';
  *     否则探测函数就有了两个来源，将来必然漂移）。
  * @returns {() => void} 卸载收敛器（注销工具 + 退订探测订阅 + dispose settings fiber）
  */
-export function reconcileTools(ctx, { runtime, sessions, config, Config, NS, detect, credits = null, dispatch = null }) {
+export function reconcileTools(ctx, { runtime, sessions, config, Config, NS, detect, credits = null, dispatch = null, checkin = null }) {
   // ★ H-REACTIVE：读响应式源，不是快照。若读快照，用户拨开关不会触发注销 ⇒ 假开关。
   // 走 runtime.currentConfig()（内含 0.1.7 volatile 包装器解包，见 plugin-cli-core/src/runtime.js）。
   const read = () => {
@@ -82,7 +82,7 @@ export function reconcileTools(ctx, { runtime, sessions, config, Config, NS, det
       try {
         next.push(ctx.tools.register(makeRunTool(runtime, sessions, read, ctx, credits ?? null, dispatch)));
         // sessions：状态工具要回传"可续接会话"（与状态路由同源）。
-        next.push(ctx.tools.register(makeStatusTool(runtime, read, ctx, sessions, dispatch)));
+        next.push(ctx.tools.register(makeStatusTool(runtime, read, ctx, sessions, dispatch, checkin ?? null, credits ?? null)));
       } catch (err) {
         for (const d of next) d();
         runtime.setRegistrationError(err instanceof Error ? err.message : String(err));

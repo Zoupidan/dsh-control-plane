@@ -84,6 +84,9 @@ export const AUTOMATION_DEFAULTS = Object.freeze({
   maxArmedRows: 3,
 });
 
+/** 只读计划模式的前置提示词硬护栏（F9 / 2026-10-09）。 */
+export const READ_ONLY_PROMPT_GUARD = '[READ-ONLY WORKSPACE MODE: Analysis and read-only inspection only. File modifications, writes, or deletions are strictly prohibited.]\n\n';
+
 /**
  * `automation_runs.status` 的终态词表（**推断，未证**：本仓只实测过 `ACCEPTED`）。
  *
@@ -305,7 +308,7 @@ export function retireRow(db, id, push = () => {}) {
  *   惰性加载则把失败收敛到"只有走自动化这一路时"才报，且能给出可解释的原因码。
  *   宿主实测（2026-10-01）：Electron 44 内嵌 node v24.18.1，`node:sqlite` 可用且**无需 flag**。
  */
-function loadSqlite() {
+export function loadSqlite() {
   const mod = require_('node:sqlite');
   const DatabaseSync = mod?.DatabaseSync;
   if (typeof DatabaseSync !== 'function') {
@@ -505,15 +508,159 @@ export function transcriptPathFor(cwd, conversationId) {
   return null;
 }
 
+export function scanForNewSessionJsonl(cwd, ignitionMs) {
+  const base = join(workbuddyHome(), 'projects');
+  const threshold = Math.max(0, (typeof ignitionMs === 'number' ? ignitionMs : Date.now()) - 2000);
+  const UUID_JSONL_RE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+  const GENERAL_JSONL_RE = /^([a-zA-Z0-9_-]{8,})\.jsonl$/;
+
+  const scanDir = (d) => {
+    let best = null;
+    let newestMtime = 0;
+    try {
+      if (!existsSync(d)) return null;
+      for (const f of readdirSync(d)) {
+        const m = f.match(UUID_JSONL_RE) || f.match(GENERAL_JSONL_RE);
+        if (!m) continue;
+        const filePath = join(d, f);
+        try {
+          const st = statSync(filePath);
+          const t = Math.max(st.mtimeMs ?? 0, st.birthtimeMs ?? 0);
+          if (t >= threshold && t >= newestMtime) {
+            newestMtime = t;
+            best = { conversationId: m[1], path: filePath };
+          }
+        } catch {}
+      }
+    } catch {}
+    return best;
+  };
+
+  // 1. 优先扫描目标 cwd 的 slug 目录
+  if (typeof cwd === 'string' && cwd !== '') {
+    const directHit = scanDir(join(base, slugForCwd(cwd)));
+    if (directHit) return directHit;
+  }
+
+  // 2. 拼不中时才回退遍历 projects 下所有子目录兜底
+  try {
+    if (existsSync(base)) {
+      let fallbackBest = null;
+      let fallbackMtime = 0;
+      for (const entry of readdirSync(base, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          const hit = scanDir(join(base, entry.name));
+          if (hit) {
+            const st = statSync(hit.path);
+            const t = Math.max(st.mtimeMs ?? 0, st.birthtimeMs ?? 0);
+            if (t >= fallbackMtime) {
+              fallbackMtime = t;
+              fallbackBest = hit;
+            }
+          }
+        }
+      }
+      return fallbackBest;
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * 从会话转录 JSONL 中提取工具执行生成或引用的产物路径列表（F5/R2）。
+ *
+ * @param {string} path 转录文件绝对路径
+ * @returns {string[]} 去重后的产物文件路径数组
+ */
+export function extractTranscriptArtifacts(path) {
+  let raw;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch {
+    return [];
+  }
+  const artifacts = new Set();
+
+  const inspectToolInput = (input) => {
+    if (!input) return;
+    let obj = input;
+    if (typeof obj === 'string') {
+      try { obj = JSON.parse(obj); } catch { return; }
+    }
+    if (typeof obj !== 'object' || obj === null) return;
+
+    const candidates = [
+      obj.path, obj.Path, obj.filePath, obj.file_path, obj.target_file,
+      obj.targetFile, obj.TargetFile, obj.file, obj.File, obj.destination,
+      obj.Destination, obj.dest, obj.outputPath, obj.output_path,
+      obj.filename, obj.fileName, obj.artifact, obj.artifact_path,
+      obj.artifactPath, obj.AbsolutePath, obj.TargetDirectory,
+    ];
+    for (const c of candidates) {
+      if (typeof c === 'string' && c.trim() !== '') {
+        artifacts.add(c.trim());
+      }
+    }
+    if (Array.isArray(obj.artifacts)) {
+      for (const a of obj.artifacts) {
+        if (typeof a === 'string' && a.trim() !== '') artifacts.add(a.trim());
+      }
+    }
+    if (Array.isArray(obj.files)) {
+      for (const f of obj.files) {
+        if (typeof f === 'string' && f.trim() !== '') artifacts.add(f.trim());
+      }
+    }
+  };
+
+  for (const line of raw.split(/\r?\n/)) {
+    const s = line.trim();
+    if (s === '') continue;
+    let rec;
+    try { rec = JSON.parse(s); } catch { continue; }
+    if (!rec || typeof rec !== 'object') continue;
+
+    // 1. 顶层工具调用记录
+    if (rec.type === 'tool_call' || rec.type === 'tool_use' || rec.type === 'tool' || rec.type === 'action') {
+      inspectToolInput(rec.input ?? rec.args ?? rec.arguments ?? rec.parameters);
+      if (typeof rec.path === 'string' && rec.path.trim() !== '') artifacts.add(rec.path.trim());
+      if (typeof rec.file === 'string' && rec.file.trim() !== '') artifacts.add(rec.file.trim());
+      if (typeof rec.artifact === 'string' && rec.artifact.trim() !== '') artifacts.add(rec.artifact.trim());
+      if (Array.isArray(rec.artifacts)) {
+        for (const a of rec.artifacts) {
+          if (typeof a === 'string' && a.trim() !== '') artifacts.add(a.trim());
+        }
+      }
+    }
+
+    // 2. content 数组中的工具块
+    const parts = Array.isArray(rec.content) ? rec.content : [];
+    for (const p of parts) {
+      if (!p || typeof p !== 'object') continue;
+      if (p.type === 'tool_use' || p.type === 'tool_call' || p.type === 'tool') {
+        inspectToolInput(p.input ?? p.args ?? p.arguments ?? p.parameters);
+        if (typeof p.path === 'string' && p.path.trim() !== '') artifacts.add(p.path.trim());
+        if (typeof p.file === 'string' && p.file.trim() !== '') artifacts.add(p.file.trim());
+      }
+      if (p.type === 'artifact' && typeof p.path === 'string' && p.path.trim() !== '') {
+        artifacts.add(p.path.trim());
+      }
+      if (p.type === 'file' && typeof p.path === 'string' && p.path.trim() !== '') {
+        artifacts.add(p.path.trim());
+      }
+    }
+  }
+  return Array.from(artifacts);
+}
+
 /**
  * 从转录里取**最后一条 assistant 正文**。
  *
- * ★★ 记录形状是实测出来的，不是猜的（这个坑已经踩过一次：早期提取器按
- *   `type:"user"/"assistant"` 找，结果一条都取不到、打印为空，因为 jsonl 里根本没有那种 type）：
- *     · assistant 正文：`type:"message"` + `content:[{type:"output_text", text}]`，
+ * ★★ 记录形状是实测出来的，不是猜的：
+ *     · assistant 正文：`type:"message"` + `content:[{type:"output_text", text}]`（或 text 类型块），
  *       而且这条**没有 `role` 字段**；
  *     · 用户输入：`type:"message"` + `role:"user"` + `content:[{type:"input_text"}]`。
- *   ⇒ 过滤条件必须是"**不是** user 且带 output_text"，写成 `role === 'assistant'` 会全空。
+ *   ⇒ 过滤条件必须是"**不是** user 且带 output_text/text"，写成 `role === 'assistant'` 会全空。
  *   取最后一条：中间可能有多段（工具调用之间的措辞），终稿才是要交回去的答案。
  */
 export function readReplyFromTranscript(path) {
@@ -530,14 +677,216 @@ export function readReplyFromTranscript(path) {
     let rec;
     try { rec = JSON.parse(s); } catch { continue; }
     if (rec?.type !== 'message' || rec.role === 'user') continue;
-    const parts = Array.isArray(rec.content) ? rec.content : [];
-    const text = parts
-      .filter((p) => p?.type === 'output_text' && typeof p.text === 'string')
-      .map((p) => p.text)
-      .join('');
+    let text = '';
+    if (typeof rec.content === 'string') {
+      text = rec.content;
+    } else if (Array.isArray(rec.content)) {
+      text = rec.content
+        .filter((p) => (p?.type === 'output_text' || p?.type === 'text') && typeof p.text === 'string')
+        .map((p) => p.text)
+        .join('');
+    } else if (typeof rec.text === 'string') {
+      text = rec.text;
+    }
     if (text.trim() !== '') last = text;
   }
   return last;
+}
+
+/**
+ * 延迟收割通道（Late-Harvest Channel，R2/F6）。
+ *
+ * @param {import('node:sqlite').DatabaseSync|string} dbOrId 数据库句柄或 automationId 字符串
+ * @param {string|object} [maybeIdOrOptions] automationId 字符串或选项对象
+ * @param {object} [maybeOptions] 选项对象 { waitMs?: number, timeoutMs?: number, signal?: AbortSignal }
+ * @returns {Promise<object>|object} 延迟收割报告
+ */
+export async function harvestAutomationRun(dbOrId, maybeIdOrOptions, maybeOptions) {
+  let db = null;
+  let automationId = '';
+  let options = {};
+  let ownDb = false;
+
+  if (typeof dbOrId === 'string') {
+    automationId = dbOrId;
+    options = (typeof maybeIdOrOptions === 'object' && maybeIdOrOptions !== null) ? maybeIdOrOptions : {};
+  } else {
+    db = dbOrId;
+    automationId = typeof maybeIdOrOptions === 'string' ? maybeIdOrOptions : '';
+    options = (typeof maybeOptions === 'object' && maybeOptions !== null) ? maybeOptions : {};
+  }
+
+  if (typeof automationId !== 'string' || automationId.trim() === '') {
+    return {
+      ok: false,
+      error: 'invalid_automation_id',
+      automationId: '',
+      sessionId: null,
+      status: 'failed',
+      reply: null,
+      artifacts: [],
+      transcriptPath: null,
+      permission: { requested: '', effective: null, confirmed: false },
+      effort: { requested: '', effective: null, confirmed: false },
+      model: { requested: '', effective: null },
+      usage: { tokens: 0, credits: 0 },
+    };
+  }
+  automationId = automationId.trim();
+
+  try {
+    if (db === null) {
+      const DatabaseSync = loadSqlite();
+      db = new DatabaseSync(workbuddyDbPath(), { timeout: AUTOMATION_DEFAULTS.dbBusyTimeoutMs });
+      ownDb = true;
+    }
+
+    const autoRow = db.prepare('SELECT * FROM automations WHERE id = ?').get(automationId) ?? null;
+
+    if (autoRow === null) {
+      return {
+        ok: false,
+        error: 'automation_not_found',
+        automationId,
+        sessionId: null,
+        status: 'failed',
+        reply: null,
+        artifacts: [],
+        transcriptPath: null,
+        permission: { requested: '', effective: null, confirmed: false },
+        effort: { requested: '', effective: null, confirmed: false },
+        model: { requested: '', effective: null },
+        usage: { tokens: 0, credits: 0 },
+      };
+    }
+
+    const waitBudgetMs = Number.isFinite(options.waitMs) && options.waitMs > 0
+      ? Math.round(options.waitMs)
+      : (Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? Math.round(options.timeoutMs) : 0);
+
+    const tStart = Date.now();
+    let runRow = null;
+    let stateRow = null;
+
+    while (true) {
+      try {
+        runRow = db.prepare('SELECT * FROM automation_runs WHERE automation_id = ? ORDER BY created_at DESC LIMIT 1').get(automationId) ?? null;
+      } catch { runRow = null; }
+
+      try {
+        stateRow = db.prepare('SELECT * FROM automation_runtime_state WHERE automation_id = ?').get(automationId) ?? null;
+      } catch { stateRow = null; }
+
+      if (isTerminalRun(runRow)) break;
+      if (Date.now() - tStart >= waitBudgetMs || options.signal?.aborted) break;
+      await sleep(Math.min(250, waitBudgetMs - (Date.now() - tStart)), options.signal);
+    }
+
+    const meta = jparse(runRow?.metadata_json, {}) ?? {};
+    const runs = jparse(runRow?.runs_json, []) ?? [];
+    const lastRaw = Array.isArray(runs) && runs.length > 0 ? runs[runs.length - 1] : null;
+    const lastRun = (typeof lastRaw === 'object' && lastRaw !== null) ? lastRaw : {};
+
+    let conversationId = [
+      meta.conversationId,
+      lastRun.conversationId,
+      stateRow?.running_conversation_id,
+    ].find((x) => typeof x === 'string' && x !== '') ?? null;
+
+    const cwds = jparse(autoRow.cwds, []);
+    const cwd = (Array.isArray(cwds) && cwds.length > 0 ? cwds[0] : '') || lastRun.cwd || '';
+
+    if (conversationId === null) {
+      const diskMatch = scanForNewSessionJsonl(cwd, autoRow.created_at ?? 0);
+      if (diskMatch) conversationId = diskMatch.conversationId;
+    }
+
+    let status = 'still_running';
+    if (runRow !== null && isTerminalRun(runRow)) {
+      const isSuccess = runRow.result_success === 1 || runRow.result_success === true;
+      status = isSuccess ? 'completed' : 'failed';
+    } else if (stateRow?.running === 1) {
+      status = 'still_running';
+    } else if (autoRow.deleted_at !== null && runRow === null) {
+      status = 'failed';
+    } else {
+      status = 'still_running';
+    }
+
+    const facts = conversationId ? sessionFacts(db, conversationId) : null;
+    const transcriptPath = conversationId ? transcriptPathFor(cwd, conversationId) : null;
+    const reply = (transcriptPath ? readReplyFromTranscript(transcriptPath) : null)
+      ?? (typeof lastRun.output === 'string' && lastRun.output !== '' ? lastRun.output : null)
+      ?? (typeof runRow?.thread_title === 'string' && runRow.thread_title !== '' ? runRow.thread_title : null);
+    const artifacts = transcriptPath ? extractTranscriptArtifacts(transcriptPath) : [];
+
+    let sessRow = null;
+    if (conversationId && db) {
+      try {
+        sessRow = db.prepare('SELECT permission_mode, thought_level, model FROM sessions WHERE id = ?').get(conversationId) ?? null;
+      } catch {}
+    }
+
+    const reqPerm = typeof autoRow.permission_mode === 'string' ? autoRow.permission_mode : '';
+    const effPerm = sessRow?.permission_mode ?? facts?.permissionMode ?? null;
+
+    const reqEff = typeof autoRow.reasoning_effort === 'string' ? autoRow.reasoning_effort : '';
+    const effEff = sessRow?.thought_level ?? facts?.effort ?? null;
+
+    const reqModel = typeof autoRow.model_id === 'string' ? autoRow.model_id : '';
+    const effModel = sessRow?.model ?? facts?.model ?? null;
+
+    const isPlanDiverged = reqPerm === 'plan' && effPerm !== 'plan';
+    const permConfirmed = Boolean(reqPerm && reqPerm === effPerm && !isPlanDiverged);
+    const effortConfirmed = Boolean(reqEff && reqEff === effEff);
+
+    return {
+      ok: true,
+      automationId,
+      sessionId: conversationId,
+      status,
+      reply,
+      artifacts,
+      transcriptPath,
+      permission: {
+        requested: reqPerm,
+        effective: effPerm,
+        confirmed: permConfirmed,
+      },
+      effort: {
+        requested: reqEff,
+        effective: effEff,
+        confirmed: effortConfirmed,
+      },
+      model: {
+        requested: reqModel,
+        effective: effModel,
+      },
+      usage: {
+        tokens: typeof facts?.tokensUsed === 'number' ? facts.tokensUsed : 0,
+        credits: typeof facts?.creditsUsed === 'number' ? facts.creditsUsed : 0,
+      },
+    };
+  } catch {
+    return {
+      ok: false,
+      error: 'harvest_failed',
+      automationId,
+      sessionId: null,
+      status: 'failed',
+      reply: null,
+      artifacts: [],
+      transcriptPath: null,
+      permission: { requested: '', effective: null, confirmed: false },
+      effort: { requested: '', effective: null, confirmed: false },
+      model: { requested: '', effective: null },
+      usage: { tokens: 0, credits: 0 },
+    };
+  } finally {
+    if (ownDb && db !== null) {
+      try { db.close(); } catch {}
+    }
+  }
 }
 
 /**
@@ -571,8 +920,13 @@ export function sessionFacts(db, conversationId) {
       s = null;
     }
   }
-  const u = db.prepare('SELECT used, size, credit_json FROM session_usage WHERE session_id = ?')
-    .get(conversationId) ?? null;
+  let u = null;
+  try {
+    u = db.prepare('SELECT used, size, credit_json FROM session_usage WHERE session_id = ?')
+      .get(conversationId) ?? null;
+  } catch {
+    u = null;
+  }
   let creditsUsed = null;
   const credit = jparse(u?.credit_json, null);
   if (credit !== null && typeof credit === 'object') {
@@ -619,6 +973,46 @@ export function promoteSession(db, conversationId) {
   return Number(r?.changes ?? 0);
 }
 
+/**
+ * 插入或确保会话声明后台自动化模式（is_background_automation = 1，F12 / R4）。
+ * 保证新创建会话具有后台标识，防止切走桌面活动窗口焦点。
+ *
+ * @param {object} db SQLite DatabaseSync 实例
+ * @param {object} session
+ * @param {string} session.id 会话 ID
+ * @param {string} [session.cwd] 工作目录
+ * @param {string} [session.title] 会话标题
+ * @param {string|null} [session.permissionMode] 权限模式
+ * @param {string|null} [session.model] 模型 ID
+ * @param {string|null} [session.thoughtLevel] 思考强度
+ * @param {number|null} [session.isBackgroundAutomation] 默认为 1
+ * @param {string|null} [session.sessionSettings]
+ * @param {number} [session.createdAt]
+ * @returns {number} 改变的行数
+ */
+export function insertSession(db, session = {}) {
+  const {
+    id,
+    cwd = '',
+    title = '',
+    permissionMode = null,
+    model = null,
+    thoughtLevel = null,
+    isBackgroundAutomation = 1,
+    sessionSettings = null,
+    createdAt = Date.now(),
+  } = session;
+  if (isBackgroundAutomation !== 1 && isBackgroundAutomation !== true) {
+    throw new Error('is_background_automation must be 1 to prevent stealing desktop focus');
+  }
+  const bgFlag = 1;
+  const r = db.prepare(`
+    INSERT INTO sessions (id, cwd, title, permission_mode, model, thought_level, is_background_automation, session_settings, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, cwd, title, permissionMode, model, thoughtLevel, bgFlag, sessionSettings, createdAt);
+  return Number(r?.changes ?? 0);
+}
+
 /** 作业输出首行。与 `gatewayHeader` 同位置：读者一眼知道底下走的是哪条路。 */
 export function automationHeader({ model, cwd }) {
   return `transport=automation · model=${model || '(desktop default)'} · cwd=${cwd}`;
@@ -638,26 +1032,33 @@ export function automationHeader({ model, cwd }) {
  * @returns {{ waits: number[], rounds: number, legacy: boolean }}
  */
 export function buildPollWaits(o = {}) {
-  const first = o.pollFirstMs ?? AUTOMATION_DEFAULTS.pollFirstMs;
-  const rest = o.pollRestMs ?? AUTOMATION_DEFAULTS.pollRestMs;
-  const rounds = o.maxPollRounds ?? AUTOMATION_DEFAULTS.maxPollRounds;
-  const explicitNew = o.pollFirstMs !== undefined || o.pollRestMs !== undefined || o.maxPollRounds !== undefined;
-  if (explicitNew) {
-    const r = Number.isSafeInteger(rounds) && rounds > 0 ? rounds : AUTOMATION_DEFAULTS.maxPollRounds;
-    const f = Number.isFinite(first) && first > 0 ? Math.round(first) : AUTOMATION_DEFAULTS.pollFirstMs;
-    const s = Number.isFinite(rest) && rest > 0 ? Math.round(rest) : AUTOMATION_DEFAULTS.pollRestMs;
-    return { waits: [f, ...Array(Math.max(0, r - 1)).fill(s)], rounds: r, legacy: false };
-  }
-  const legacyPoll = o.pollMs ?? AUTOMATION_DEFAULTS.pollMs;
-  const legacyTimeout = o.timeoutMs ?? AUTOMATION_DEFAULTS.timeoutMs;
-  if (legacyPoll !== AUTOMATION_DEFAULTS.pollMs || legacyTimeout !== AUTOMATION_DEFAULTS.timeoutMs) {
-    const interval = Number.isFinite(legacyPoll) && legacyPoll > 0 ? Math.round(legacyPoll) : AUTOMATION_DEFAULTS.pollMs;
-    const total = Number.isFinite(legacyTimeout) && legacyTimeout > 0 ? Math.round(legacyTimeout) : AUTOMATION_DEFAULTS.timeoutMs;
+  const first = Number.isFinite(o.pollFirstMs) && o.pollFirstMs > 0 ? Math.round(o.pollFirstMs) : AUTOMATION_DEFAULTS.pollFirstMs;
+  const rest = Number.isFinite(o.pollRestMs) && o.pollRestMs > 0 ? Math.round(o.pollRestMs) : AUTOMATION_DEFAULTS.pollRestMs;
+
+  // 遗留固定间隔支持（仅在调用方显式覆盖 pollMs 且未提供 maxPollRounds/pollFirstMs/pollRestMs 时生效，测试快路径）
+  if (o.pollMs !== undefined && o.pollMs !== AUTOMATION_DEFAULTS.pollMs && o.maxPollRounds === undefined && o.pollFirstMs === undefined && o.pollRestMs === undefined) {
+    const interval = Number.isFinite(o.pollMs) && o.pollMs > 0 ? Math.round(o.pollMs) : AUTOMATION_DEFAULTS.pollMs;
+    const total = Number.isFinite(o.timeoutMs) && o.timeoutMs > 0 ? Math.round(o.timeoutMs) : AUTOMATION_DEFAULTS.timeoutMs;
     const n = Math.max(1, Math.ceil(total / Math.max(1, interval)));
     return { waits: Array(n).fill(interval), rounds: n, legacy: true };
   }
-  const r = AUTOMATION_DEFAULTS.maxPollRounds;
-  return { waits: [AUTOMATION_DEFAULTS.pollFirstMs, ...Array(Math.max(0, r - 1)).fill(AUTOMATION_DEFAULTS.pollRestMs)], rounds: r, legacy: false };
+
+  // 显式传入 maxPollRounds 时保持显式轮数（测试快路径兼容）
+  if (o.maxPollRounds !== undefined) {
+    const r = Number.isSafeInteger(o.maxPollRounds) && o.maxPollRounds > 0 ? o.maxPollRounds : AUTOMATION_DEFAULTS.maxPollRounds;
+    return { waits: [first, ...Array(Math.max(0, r - 1)).fill(rest)], rounds: r, legacy: false };
+  }
+
+  // ★ 未指定 maxPollRounds 时按 timeoutMs 动态推导轮数（R1 轮询预算解耦）
+  //   rounds = totalMs <= first ? 1 : 1 + Math.ceil((totalMs - first) / rest)
+  //   15m (900_000ms): 181 轮；30m (1_800_000ms): 361 轮
+  const totalMs = Number.isFinite(o.timeoutMs) && o.timeoutMs > 0 ? Math.round(o.timeoutMs) : AUTOMATION_DEFAULTS.timeoutMs;
+  const rounds = totalMs <= first ? 1 : 1 + Math.ceil((totalMs - first) / rest);
+  return {
+    waits: [first, ...Array(Math.max(0, rounds - 1)).fill(rest)],
+    rounds,
+    legacy: false,
+  };
 }
 
 /**
@@ -720,13 +1121,36 @@ export function confirmedSessionFacts(db, conversationId) {
  *   置 `false` 可保留这一行以便在桌面端里事后核对；代价是它会留在用户的计划任务列表里。
  * @returns {{cancel: () => void, done: Promise<object>, readOutput: () => string}}
  */
-export function startAutomationRun({
-  prompt, cwd, modelId = null, permissionMode = null, reasoningEffort = null,
-  name = null, timeoutMs = AUTOMATION_DEFAULTS.timeoutMs, pollMs = AUTOMATION_DEFAULTS.pollMs,
-  pollFirstMs, pollRestMs, maxPollRounds,
-  sessionKey = '', sessionStore = null,
-  signal, onPhase, promote = true, retire = true,
-}) {
+export function startAutomationRun(options = {}) {
+  const {
+    prompt, cwd, modelId = null,
+    name = null, timeoutMs = AUTOMATION_DEFAULTS.timeoutMs, pollMs = AUTOMATION_DEFAULTS.pollMs,
+    pollFirstMs, pollRestMs, maxPollRounds,
+    sessionKey = '', sessionStore = null,
+    signal, onPhase, promote = true, retire = true,
+  } = options;
+
+  const rawPerm = (typeof options?.permissionMode === 'string'
+    ? options.permissionMode
+    : (typeof options?.permission_mode === 'string'
+      ? options.permission_mode
+      : (typeof options?.permission === 'string' ? options.permission : null)));
+  const requestedPerm = typeof rawPerm === 'string' && rawPerm.trim() !== '' ? rawPerm.trim() : null;
+
+  const rawEffort = (typeof options?.reasoningEffort === 'string'
+    ? options.reasoningEffort
+    : (typeof options?.reasoning_effort === 'string'
+      ? options.reasoning_effort
+      : (typeof options?.effort === 'string' ? options.effort : null)));
+  const requestedEffort = typeof rawEffort === 'string' && rawEffort.trim() !== '' ? rawEffort.trim() : null;
+
+  let effectivePrompt = typeof prompt === 'string' ? prompt : '';
+  if (requestedPerm === 'plan') {
+    if (!effectivePrompt.includes('[READ-ONLY WORKSPACE MODE: Analysis and read-only inspection only. File modifications, writes, or deletions are strictly prohibited.]')) {
+      effectivePrompt = `${READ_ONLY_PROMPT_GUARD}${effectivePrompt}`;
+    }
+  }
+
   const controller = new AbortController();
   const onUpstreamAbort = () => controller.abort();
   if (signal !== undefined) {
@@ -802,10 +1226,27 @@ export function startAutomationRun({
           sessionId: conversationId, sessionKey: keyOf === '' ? null : keyOf,
           sessionPersist, retired,
           transcriptPath: null,
-          reply: null, creditsUsed: null, model: null, permission: null,
-          // ★ effort/任务可视占位：失败时 effective 未知 ⇒ null（不编造）；requested 由上层（run.js/execute.js）
-          //   按入参补齐，本层如实给 null 占位以保形状稳定。
-          requestedEffort: null, effectiveEffort: null, effort: null,
+          reply: null, artifacts: [], creditsUsed: null, model: null,
+          permission: {
+            requested: requestedPerm ?? '',
+            effective: null,
+            confirmed: false,
+            toString() { return ''; },
+            valueOf() { return ''; },
+            [Symbol.toPrimitive](hint) { return hint === 'string' ? '' : false; },
+          },
+          effort: {
+            requested: requestedEffort ?? '',
+            effective: null,
+            confirmed: false,
+            toString() { return ''; },
+            valueOf() { return ''; },
+            [Symbol.toPrimitive](hint) { return hint === 'string' ? '' : false; },
+          },
+          requestedPermissionMode: requestedPerm,
+          effectivePermissionMode: null,
+          requestedEffort,
+          effectiveEffort: null,
           title: null, createdAt: null,
           phases: [...phases],
         },
@@ -821,8 +1262,6 @@ export function startAutomationRun({
 
       const now = Date.now();
       const requestedModel = typeof modelId === 'string' && modelId !== '' ? modelId : null;
-      const requestedPerm = typeof permissionMode === 'string' && permissionMode !== '' ? permissionMode : null;
-      const requestedEffort = typeof reasoningEffort === 'string' && reasoningEffort !== '' ? reasoningEffort : null;
       const title = typeof name === 'string' && name.trim() !== '' ? name.trim().slice(0, 80) : prompt.trim().slice(0, 60);
       const ownerUserId = resolveOwnerUserId(db);
 
@@ -854,7 +1293,7 @@ export function startAutomationRun({
            created_at, updated_at, deleted_at
          ) VALUES (?, ?, ?, 'ACTIVE', 'once', ?, NULL, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, 'created', ?, ?, NULL)`,
       ).run(
-        automationId, title, prompt, now,
+        automationId, title, effectivePrompt, now,
         // ★ 没给工作目录就写 `[]`，**不写 `[""]`**：空串是一个"指定了一个空目录"的断言，
         //   而 `[]` 才是"没指定，由桌面端用它自己的默认值"。两者含义不同，别混。
         //   此时转录按会话 id 在 `projects/` 下扫（`transcriptPathFor` 的兜底），仍然找得到。
@@ -910,6 +1349,25 @@ export function startAutomationRun({
           push(`[session] adopt failed for ${sid} (${err instanceof Error ? err.message : String(err)}); later runs will insert again`);
         }
       };
+
+      // ★ R2 实时落盘守望：点火后立即启动扫描，在 1-3 秒内捕获新生成的 <UUID>.jsonl 并回填 adopt
+      const ignitionMs = now;
+      const checkDiskWatch = () => {
+        if (conversationId !== null && adopted) return;
+        const diskHit = scanForNewSessionJsonl(cwd, ignitionMs);
+        if (diskHit) {
+          if (conversationId === null) {
+            conversationId = diskHit.conversationId;
+            push(`[conversation] ${diskHit.conversationId} · (discovered via disk watch at ${diskHit.path})`);
+            phase('running');
+          }
+          adoptSession(diskHit.conversationId);
+        }
+      };
+
+      // 点火后立即执行首次扫盘
+      checkDiskWatch();
+
       for (let round = 0; ; round += 1) {
         if (controller.signal.aborted) {
           // 取消 = 软删，可逆且可审计（调度器只认 `deleted_at IS NULL`）。
@@ -918,6 +1376,8 @@ export function startAutomationRun({
           doRetire();
           return fail(REASON_CODES.ABORTED, `cancelled · ${automationId} was soft-deleted (deleted_at set) so the scheduler will not pick it up; a run already started inside the desktop cannot be interrupted from here`);
         }
+
+        checkDiskWatch();
 
         // ★ 轮询体内只 SELECT，不重建、不重发 prompt。
         const row = db.prepare('SELECT * FROM automation_runs WHERE automation_id = ? ORDER BY created_at DESC LIMIT 1').get(automationId) ?? null;
@@ -955,7 +1415,8 @@ export function startAutomationRun({
           // ── 终态：把五件事一起交回去（会话 id / 转录 / 回复 / 模型 / 积分） ──
           const meta = jparse(row.metadata_json, {}) ?? {};
           const runs = jparse(row.runs_json, []) ?? [];
-          const last = Array.isArray(runs) && runs.length > 0 ? runs[runs.length - 1] : {};
+          const lastRaw = Array.isArray(runs) && runs.length > 0 ? runs[runs.length - 1] : null;
+          const last = (typeof lastRaw === 'object' && lastRaw !== null) ? lastRaw : {};
           const cid = [meta.conversationId, last.conversationId, conversationId]
             .find((x) => typeof x === 'string' && x !== '') ?? null;
           conversationId = cid;
@@ -964,6 +1425,7 @@ export function startAutomationRun({
           const reply = (transcriptPath === null ? null : readReplyFromTranscript(transcriptPath))
             ?? (typeof last.output === 'string' && last.output !== '' ? last.output : null)
             ?? (typeof row.thread_title === 'string' && row.thread_title !== '' ? row.thread_title : null);
+          const artifacts = transcriptPath === null ? [] : extractTranscriptArtifacts(transcriptPath);
           const facts = cid === null ? null : sessionFacts(db, cid);
 
           if (cid !== null) push(`[conversation] ${cid} · transcript=${transcriptPath ?? '(not found)'}`);
@@ -1011,6 +1473,21 @@ export function startAutomationRun({
           //   否则下轮复用会去 load 一个已失败的死会话。
           if (cid !== null) adoptSession(cid);
           if (!ok) doForget(reason ?? REASON_CODES.TASK_ERROR);
+
+          let sessRow = null;
+          if (cid && db) {
+            try {
+              sessRow = db.prepare('SELECT permission_mode, thought_level, model FROM sessions WHERE id = ?').get(cid) ?? null;
+            } catch {}
+          }
+          const reqPerm = requestedPerm ?? '';
+          const effPerm = sessRow?.permission_mode ?? facts?.permissionMode ?? null;
+          const reqEff = requestedEffort ?? '';
+          const effEff = sessRow?.thought_level ?? facts?.effort ?? null;
+          const isPlanDiverged = reqPerm === 'plan' && effPerm !== 'plan';
+          const permConfirmed = Boolean(reqPerm && reqPerm === effPerm && !isPlanDiverged);
+          const effortConfirmed = Boolean(reqEff && reqEff === effEff);
+
           return {
             status: ok ? 'completed' : 'failed',
             detail: ok ? undefined : `${reason}: the run settled as a failure (failure_code=${row.failure_code ?? 'NULL'}, reason_code=${row.reason_code ?? 'NULL'})`,
@@ -1024,17 +1501,31 @@ export function startAutomationRun({
               sessionPersist, retired,
               transcriptPath,
               reply,
+              artifacts,
               creditsUsed: facts?.creditsUsed ?? null,
               model: facts?.model ?? null,
-              permission: facts?.permissionMode ?? null,
+              permission: {
+                requested: reqPerm,
+                effective: effPerm,
+                confirmed: permConfirmed,
+                toString() { return effPerm ?? ''; },
+                valueOf() { return effPerm ?? ''; },
+                [Symbol.toPrimitive](hint) { return hint === 'string' ? (effPerm ?? '') : permConfirmed; },
+              },
               usedModelId: facts?.model ?? null,
               sessionCwd: facts?.sessionCwd ?? null,
-              // ★ 推理强度真下发回显：requested = 本次点火写入 reasoning_effort 的值，effective = 会话上
-              //   实际记着的 thought_level（sessionFacts 真源），两者逐字比得 confirmed（与 permission 同口径）。
               requestedEffort,
-              effectiveEffort: facts?.effort ?? null,
-              effort: facts?.effort ?? null,
-              // ★ 任务可视：title = 会话标题（取不到则回落点火标题），createdAt = 会话 created_at（取不到则回落点火 now）。
+              effectiveEffort: effEff,
+              effort: {
+                requested: reqEff,
+                effective: effEff,
+                confirmed: effortConfirmed,
+                toString() { return effEff ?? ''; },
+                valueOf() { return effEff ?? ''; },
+                [Symbol.toPrimitive](hint) { return hint === 'string' ? (effEff ?? '') : effortConfirmed; },
+              },
+              requestedPermissionMode: requestedPerm,
+              effectivePermissionMode: effPerm,
               title: facts?.title ?? title ?? null,
               createdAt: facts?.createdAt ?? now ?? null,
               tokensUsed: facts?.tokensUsed ?? null,
@@ -1059,18 +1550,88 @@ export function startAutomationRun({
             + ' and will never fire. Check that the WorkBuddy desktop is running and logged in, and read'
             + ` ${join(workbuddyHome(), 'logs', 'automation.log')} for a dispatch line.`);
         }
-        if (waited > timeoutMs) {
-          return fail(REASON_CODES.TASK_ERROR,
-            `the run did not settle within ${timeoutMs}ms (thread ${automationId}) — it may still be running inside the desktop`);
+        const isTimeout = schedule.legacy ? waited > timeoutMs : (round + 1 >= schedule.rounds);
+        if (isTimeout) {
+          if (schedule.legacy) {
+            return fail(REASON_CODES.TASK_ERROR,
+              `the run did not settle within ${timeoutMs}ms (thread ${automationId}) — it may still be running inside the desktop`);
+          }
+          // ★ R1 超时守望：超时时不调用 fail、不调用 doRetire、不调用 doForget，标记为 still_running（exitCode: 0, retired: false）
+          const detail = `the run did not settle within ${schedule.rounds} poll rounds (thread ${automationId}, session ${conversationId ?? '(pending)'}) — still running inside the desktop`;
+          push(`[still_running] ${detail}`);
+          const facts = conversationId === null ? null : sessionFacts(db, conversationId);
+          let sessRow = null;
+          if (conversationId && db) {
+            try {
+              sessRow = db.prepare('SELECT permission_mode, thought_level, model FROM sessions WHERE id = ?').get(conversationId) ?? null;
+            } catch {}
+          }
+          const reqPerm = requestedPerm ?? '';
+          const effPerm = sessRow?.permission_mode ?? facts?.permissionMode ?? null;
+          const reqEff = requestedEffort ?? '';
+          const effEff = sessRow?.thought_level ?? facts?.effort ?? null;
+          const isPlanDiverged = reqPerm === 'plan' && effPerm !== 'plan';
+          const permConfirmed = Boolean(reqPerm && reqPerm === effPerm && !isPlanDiverged);
+          const effortConfirmed = Boolean(reqEff && reqEff === effEff);
+
+          const transcriptPath = conversationId ? transcriptPathFor(cwd, conversationId) : null;
+          const reply = transcriptPath === null ? null : readReplyFromTranscript(transcriptPath);
+          const artifacts = transcriptPath === null ? [] : extractTranscriptArtifacts(transcriptPath);
+          return {
+            status: 'still_running',
+            detail,
+            exitCode: 0,
+            automation: {
+              reason: REASON_CODES.STILL_RUNNING,
+              automationId,
+              conversationId,
+              sessionId: conversationId,
+              sessionKey: keyOf === '' ? null : keyOf,
+              sessionPersist,
+              retired: false,
+              transcriptPath,
+              reply: reply ?? null,
+              artifacts,
+              creditsUsed: facts?.creditsUsed ?? null,
+              model: facts?.model ?? requestedModel,
+              permission: {
+                requested: reqPerm,
+                effective: effPerm,
+                confirmed: permConfirmed,
+                toString() { return effPerm ?? ''; },
+                valueOf() { return effPerm ?? ''; },
+                [Symbol.toPrimitive](hint) { return hint === 'string' ? (effPerm ?? '') : permConfirmed; },
+              },
+              usedModelId: facts?.model ?? requestedModel,
+              sessionCwd: facts?.sessionCwd ?? cwd,
+              requestedEffort,
+              effectiveEffort: effEff,
+              effort: {
+                requested: reqEff,
+                effective: effEff,
+                confirmed: effortConfirmed,
+                toString() { return effEff ?? ''; },
+                valueOf() { return effEff ?? ''; },
+                [Symbol.toPrimitive](hint) { return hint === 'string' ? (effEff ?? '') : effortConfirmed; },
+              },
+              requestedPermissionMode: requestedPerm,
+              effectivePermissionMode: effPerm,
+              title: facts?.title ?? title ?? null,
+              createdAt: facts?.createdAt ?? now ?? null,
+              tokensUsed: facts?.tokensUsed ?? null,
+              phases: [...phases, 'still_running'],
+            },
+          };
         }
-        if (round + 1 >= schedule.rounds) {
-          // ★ 退避表耗尽（默认 12 轮约 60s）：超时同样 retire，绝不留活行到 valid_until。
-          //   会话已确认时 adopt 早已记下，调用方可用同一 sessionKey 走复用，不再建行。
-          return fail(REASON_CODES.TASK_ERROR,
-            `the run did not settle within ${schedule.rounds} poll rounds (~${Math.round(schedule.waits.reduce((a, b) => a + b, 0) / 1000)}s backoff: first ${schedule.waits[0]}ms then ${schedule.waits[1] ?? schedule.waits[0]}ms)`
-            + ` (thread ${automationId}) — it may still be running inside the desktop`);
+        const sleepMs = schedule.waits[Math.min(round, schedule.waits.length - 1)];
+        const chunkMs = 250;
+        let elapsed = 0;
+        while (elapsed < sleepMs && !controller.signal.aborted) {
+          const step = Math.min(chunkMs, sleepMs - elapsed);
+          await sleep(step, controller.signal);
+          elapsed += step;
+          checkDiskWatch();
         }
-        await sleep(schedule.waits[Math.min(round, schedule.waits.length - 1)], controller.signal);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

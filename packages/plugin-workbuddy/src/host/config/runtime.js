@@ -15,7 +15,127 @@
  * ★ 本文件不许出现厂商字面值（准入判据见 `../package.json`）：它承载的是"任何一家 CLI 都需要
  *   的那套记账"，一旦掺进 `'workbuddy'` 这类常量，下一个消费者就只能整份 copy —— 那正是抽包要消灭的东西。
  */
+import path from 'node:path';
 import { REGISTRY_STATES, RUN_STATES, PROBE_TARGET } from './constants.js';
+
+/** 插件总并发上限（默认 3）。 */
+export const DEFAULT_CONCURRENCY_CAP = 3;
+
+/**
+ * 归一化工作区键（处理 Windows 盘符大小写、斜杠/反斜杠、末尾斜杠）。
+ * @param {unknown} cwd
+ * @returns {string}
+ */
+export function normalizeWorkspaceKey(cwd) {
+  if (typeof cwd !== 'string' || cwd.trim() === '') return '__default__';
+  const trimmed = cwd.trim();
+  let resolved;
+  try {
+    resolved = path.resolve(trimmed);
+  } catch {
+    resolved = trimmed;
+  }
+  let s = resolved.replace(/\\/g, '/');
+  while (s.length > 1 && s.endsWith('/')) {
+    s = s.slice(0, -1);
+  }
+  return s.toLowerCase();
+}
+
+/** @type {Map<string, { jobId: string, lockedAt: number }>} */
+const sharedWorkspaceLocks = new Map();
+/** @type {Map<string, string>} */
+const sharedJobToWorkspace = new Map();
+
+/**
+ * 获取工作区互斥锁（F10 / R4）。
+ * 同一工作区只允许一个在途作业；不同工作区可并发运行至上限 DEFAULT_CONCURRENCY_CAP (3)。
+ *
+ * @param {string} cwd 工作区路径
+ * @param {string} [jobId] 作业唯一标识
+ * @param {number} [concurrencyCap] 并发上限，默认 DEFAULT_CONCURRENCY_CAP (3)
+ * @returns {boolean} true 表示成功获取锁，false 表示工作区已被锁定或超过并发上限
+ */
+export function acquireWorkspaceLock(cwd, jobId, concurrencyCap = DEFAULT_CONCURRENCY_CAP) {
+  const key = normalizeWorkspaceKey(cwd);
+  const id = typeof jobId === 'string' && jobId !== '' ? jobId : `job-${Date.now()}`;
+
+  const existing = sharedWorkspaceLocks.get(key);
+  if (existing) {
+    if (existing.jobId === id) return true; // 同一作业幂等重入
+    return false; // 该工作区已被其他作业占用
+  }
+
+  const cap = Number.isFinite(concurrencyCap) && concurrencyCap > 0 ? concurrencyCap : DEFAULT_CONCURRENCY_CAP;
+  if (sharedWorkspaceLocks.size >= cap) {
+    return false; // 已达插件总并发上限
+  }
+
+  sharedWorkspaceLocks.set(key, { jobId: id, lockedAt: Date.now() });
+  sharedJobToWorkspace.set(id, key);
+  return true;
+}
+
+/**
+ * 释放工作区互斥锁（F10 / R4）。
+ *
+ * @param {string} [cwd] 工作区路径
+ * @param {string} [jobId] 作业唯一标识
+ * @returns {boolean}
+ */
+export function releaseWorkspaceLock(cwd, jobId) {
+  let key = (typeof cwd === 'string' && cwd !== '') ? normalizeWorkspaceKey(cwd) : null;
+  if (!key && typeof jobId === 'string' && jobId !== '') {
+    key = sharedJobToWorkspace.get(jobId) ?? null;
+  }
+  if (!key) return false;
+
+  const existing = sharedWorkspaceLocks.get(key);
+  if (!existing) {
+    if (typeof jobId === 'string') sharedJobToWorkspace.delete(jobId);
+    return false;
+  }
+
+  if (typeof jobId === 'string' && jobId !== '' && existing.jobId !== jobId) {
+    return false;
+  }
+
+  sharedWorkspaceLocks.delete(key);
+  sharedJobToWorkspace.delete(existing.jobId);
+  if (typeof jobId === 'string') sharedJobToWorkspace.delete(jobId);
+  return true;
+}
+
+/**
+ * 检查工作区是否处于忙碌状态（F10 / R4）。
+ *
+ * @param {string} cwd 工作区路径
+ * @returns {boolean}
+ */
+export function isWorkspaceBusy(cwd) {
+  const key = normalizeWorkspaceKey(cwd);
+  return sharedWorkspaceLocks.has(key);
+}
+
+/**
+ * 获取当前被锁定的所有工作区快照。
+ * @returns {Record<string, { jobId: string, lockedAt: number }>}
+ */
+export function inFlightByWorkspace() {
+  const result = {};
+  for (const [k, v] of sharedWorkspaceLocks.entries()) {
+    result[k] = { ...v };
+  }
+  return result;
+}
+
+/**
+ * 清除所有工作区锁（仅供测试或环境重置）。
+ */
+export function clearWorkspaceLocks() {
+  sharedWorkspaceLocks.clear();
+  sharedJobToWorkspace.clear();
+}
 
 /**
  * 本插件用的 runtime —— 在通用实现上**注入** `target`。
@@ -35,10 +155,15 @@ export function createRuntime(init) {
 /**
  * 通用实现（不含任何厂商字面值）。
  *
- * @param {{ pluginId: string, config: unknown, ns: string, target: string }} init
- *   `target` = 探测异常兜底时写进 `ProbeResult.target` 的厂商标识。**无缺省值**（U9：不猜）。
+ * @param {{ pluginId?: string, config?: unknown, ns?: string, target?: string, concurrencyCap?: number }} [init]
  */
-function createRuntimeBase({ pluginId, config, ns, target }) {
+export function createRuntimeBase({
+  pluginId = 'workbuddy',
+  config = {},
+  ns = 'workbuddy',
+  target = PROBE_TARGET,
+  concurrencyCap = DEFAULT_CONCURRENCY_CAP,
+} = {}) {
   /** @type {Set<(probe: import('./types.js').ProbeResult) => void>} */
   const listeners = new Set();
   /** @type {Map<string, {jobId: string, state: string, startedAt: number, exitCode?: number}>} */
@@ -214,12 +339,33 @@ function createRuntimeBase({ pluginId, config, ns, target }) {
     /** 从在途表移除（finish 之后调用）。 */
     forget(jobId) {
       runs.delete(jobId);
+      releaseWorkspaceLock(null, jobId);
     },
     /** 在途作业数（§4.4.3：UI 显示"◐ 已关闭 · 仍有 N 个任务在运行"的数据源）。 */
     inFlightCount: () => runs.size,
     /** 在途作业明细（status 工具展示用；不含句柄）。 */
     inFlight() {
       return [...runs.values()].map((r) => ({ jobId: r.jobId, state: r.state, startedAt: r.startedAt }));
+    },
+
+    // ── ③ 工作区并发互斥（F10 / R4） ─────────────────────────────
+    normalizeWorkspaceKey(cwd) {
+      return normalizeWorkspaceKey(cwd);
+    },
+    acquireWorkspaceLock(cwd, jobId, cap) {
+      return acquireWorkspaceLock(cwd, jobId, cap ?? concurrencyCap);
+    },
+    releaseWorkspaceLock(cwd, jobId) {
+      return releaseWorkspaceLock(cwd, jobId);
+    },
+    isWorkspaceBusy(cwd) {
+      return isWorkspaceBusy(cwd);
+    },
+    inFlightByWorkspace() {
+      return inFlightByWorkspace();
+    },
+    clearWorkspaceLocks() {
+      clearWorkspaceLocks();
     },
 
     // ── 参数接受度记录（§4.5；写入方 = 发起的 run 收敛路径，判定逻辑属 T04） ──

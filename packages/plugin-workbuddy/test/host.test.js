@@ -713,18 +713,32 @@ test('判据① + ⑤：ON（已装）⇒ 注册两工具；每定义含 output.
       // ★ 2026-10-08 新增 `account`：切号排障要能**读到**插件识别到的现役账号 uid 与识别来源
       //   （`epoch-marker-align` / `security-holder-mtime` / `none`）。缺它 ⇒ 模型与用户都不知道
       //   "行写的 owner 和桌面端现役账号是不是同一个"，而这正是 owner 静默过滤的唯一成因。
-      'account', 'cdp', 'config', 'cost', 'effort', 'ignition', 'inFlight', 'lastRun',
-      // ★ 2026-09-28 新增 `permission`：它是 `workbuddy_run` 的 `permission_mode` 参数的**唯一真源**
-      //   （那张下拉表来自服务端 `config_option_update`，不是本地常量）。少了它，模型在
-      //   第一次调用前就不知道有哪些合法值，只能瞎填。
-      'models', 'modelsSource', 'permission', 'probe', 'registrationError', 'registry', 'sessions',
+      // ★ 2026-10-09 新增 `checkin`：每日签到自动领取（Buddy 加油站）—— 今日是否已领 /
+      //   连签几天 / 自动领取开关。`json` 型同 lastRun，结构由 projection() 单处承载；
+      //   模型据此回答"今天领了没"，而不是猜。
+      // ★ 2026-10-10 schema 违约修复：补齐切片/兜底分支实际会出现的键 —— `section` /
+      //   `count` / `credits` / `checkinCredits` / `distinction`（五个 section 切片）与
+      //   `error` / `message` / `supportedSections`（invalid_section 兜底）。同时**删除**
+      //   曾把键集钉在 16 键上的 ownKeys Proxy（它让 balance/creditsRemain 对宿主校验器
+      //   不可见）。键集 = 实际会出现的全部键，additionalProperties:false 继续成立。
+      'account', 'balance', 'cdp', 'checkin', 'checkinCredits', 'config', 'cost', 'count',
+      'credits', 'creditsRemain', 'distinction', 'effort', 'error', 'ignition', 'inFlight',
+      'lastRun', 'message', 'models', 'modelsSource', 'permission', 'probe',
+      'registrationError', 'registry', 'section', 'sessions', 'supportedSections',
     ],
     '★ C 组登记：`registrationError` —— DEGRADED 的注册期成因必须可读出（与状态路由面同字段）',
   );
-  // ★ `permission` 必须是 required：不声明的话，探针不可用时字段直接消失，
-  //   而"没这个字段"和"权限表是空的"在模型眼里是一回事（都读成"没这回事"）。
-  //   空表 + `known:false` + `error` 才是"我查了，查不到"，这两种必须可区分。
-  assert.ok(statusDef.output.schema.required.includes('permission'), 'permission 不得缺席（空表也必须出现）');
+  // ★ 2026-10-10 schema 违约修复：切片（section=overview/models/credits/sessions/checkin）
+  //   只回传子集 ⇒ 顶层 required 不能再钉 permission/checkin（否则合法切片必被宿主校验
+  //   打回 "missing required property"）。改为钉**每个返回分支都会携带**的两个顶层安全
+  //   周边字段 balance / creditsRemain（sessions 切片已补齐）。permission / checkin 在
+  //   'all' 形状下必然在场，由 status-anti-prune.test.js 的 execute({}) 16 键断言 +
+  //   全分支零违约校验钉住。
+  assert.deepEqual(
+    [...statusDef.output.schema.required].sort(),
+    ['balance', 'creditsRemain'],
+    '顶层 required 只保留跨分支不变量 balance / creditsRemain',
+  );
   assert.equal(runDef.presentCall({ prompt: 'x' }).kind, 'execute');
   assert.equal(statusDef.presentCall({}).kind, 'read');
 

@@ -115,8 +115,10 @@ export function effortCapability(config) {
  * @param {string} ns settings namespace
  * @param {Record<string, string | undefined>} [env]
  * @param {{ list?: () => any[] }|null} [sessions] 会话映射（缺省 ⇒ `sessions: []`；位置参数追加、向后兼容）
+ * @param {{ projection?: () => any }|null} [credits] 积分账（缺省 ⇒ 载荷里 credits:null）
+ * @param {{ projection?: () => any }|null} [checkin] 每日签到（★ 2026-10-09；缺省 ⇒ 载荷里 checkin:null）
  */
-export function makeStatusRoute(settings, runtime, ns, env = process.env, sessions = null, credits = null) {
+export function makeStatusRoute(settings, runtime, ns, env = process.env, sessions = null, credits = null, checkin = null) {
   return {
     kind: 'exact',
     path: ROUTE_STATUS,
@@ -202,6 +204,12 @@ export function makeStatusRoute(settings, runtime, ns, env = process.env, sessio
         credits: credits === null || typeof credits.projection !== 'function'
           ? null
           : credits.projection(),
+        // ★★ 每日签到（2026-10-09 起：Buddy 加油站自动领取）。
+        //   同样同步投影 + 后台兜底：未签且开着自动领取时，后台顺手领掉（幂等）；
+        //   状态路由本身**不等**领取完成（GET 保持只读语义，领取发生在后台）。
+        checkin: checkin === null || typeof checkin.projection !== 'function'
+          ? null
+          : checkin.projection(),
         // ★ 本次运行的 token 用量（积分扣减的唯一可观测输入；`total_cost_usd` 在 CLI 侧写死 0）
         usage: lastRunUsage(runtime.lastRun()),
       });

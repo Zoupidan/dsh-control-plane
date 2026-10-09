@@ -67,6 +67,8 @@ export const Config = z.object({
   // 取 30s 的依据：桌面端激活 prewarm sidecar 实测 1–3s；30s 是"慢盘/杀软冷扫"的量级，
   // 再大就等于让用户对着一个转圈的作业干等，而那条作业本来也不会成功。
   instanceTimeoutMs: z.number().default(30_000).volatile(),
+  // 自动化任务超时（毫秒）。默认 15 分钟（900_000ms）。
+  automationTimeoutMs: z.number().default(900_000).volatile(),
   // ═══ 多轮追发（★ 2026-10-03 M2 新增；RFC-SESSION-RESUME-INTEGRATION §6 Phase 2/3）═══
   // `enableMultiTurnFollowUp` = Track A（CDP 直发既有对话）的**总闸，默认 false**（opt-in）：
   //   开着时，仅当调用方 `resume:true` 且记性命中可续接会话，`workbuddy_run` 才先尝试把
@@ -103,6 +105,16 @@ export const Config = z.object({
   // ★ 复用 `followupCdpPort`（不新增端口 knob）；超时复用计划任务 15min 口径
   //   （`AUTOMATION_DEFAULTS.timeoutMs`，不新增超时 knob）。
   enableDirectIgnition: z.boolean().default(false).volatile(),
+  // ═══ 每日签到自动领取（★ 2026-10-09 新增：Buddy 加油站）══════════════════════
+  // `enableAutoCheckin` = 签到自动领取**总闸，默认 true**（与上面两个 CDP 开关相反）：
+  //   开着时，状态面读到"活动进行中且今日未签"会**在后台顺手领掉**（先查后领、领完复核，
+  //   见 `launch/daily-checkin.js`）；幂等（已签时只是一次只读查询，不会重复发放），
+  //   非活动季静默收尾。默认开的依据：① 用户点名要"自动完成"；② 接口幂等可证伪风险低
+  //   （真机 2026-10-09：已签时领取回 400+10001，不多发一分）；③ 关掉只需拨一次开关。
+  //   它仍然受总闸约束：`enabled !== true` ⇒ 一次都不跑（①硬闸优先）。
+  //   ★ 前置条件：桌面端在跑且已登录（走 wbipc 借登录态；桌面端没开 ⇒ 如实报读不到，
+  //     不弹窗、不代启动 WorkBuddy —— 启动桌面端是 `autoStartDesktop` 那条路的事，不借用）。
+  enableAutoCheckin: z.boolean().default(true).volatile(),
   // ═══ 传输面（★ 2026-10-02 起只有 `automation`）════════════════════
   // `automation` = 往计划任务表写一行 `once`（`startAutomationRun` 唯一写入点），
   // 等桌面端调度器建会话。`schedule_type='once'`、`next_run_at=now`、`valid_until=+25min`，
@@ -193,6 +205,15 @@ export const Config = z.object({
   // 自锚点起的累计扣减（插件写；仅作参考，**不是**账单 —— 折算已被 315 条样本证伪，见 credit-anchor.js）
   creditsConsumed: z.number().default(0).volatile(),
   creditsRuns: z.number().default(0).volatile(),
+  // ── 每日签到（★ 2026-10-09）───────────────────────────────────────────────
+  // ★ 同样是**插件写**、同样必须 volatile（与上面四行同一条硬约束，见文件头）。
+  //   存"上一次签到动作"的结论，供离线时显示今日是否已领、连签几天（北京时间记）。
+  //   `checkinLastResult` 取值域：claimed / already / inactive / failed-query /
+  //   failed-claim / failed-verify / unavailable（见 launch/daily-checkin.js `claim()`）。
+  checkinLastAt: z.number().default(0).volatile(),
+  checkinLastResult: z.string().default('').volatile(),
+  checkinLastCredit: z.number().default(0).volatile(),
+  checkinStreakDays: z.number().default(0).volatile(),
   // ★★★ `launch` 里的**旗标表已整体删除**（2026-10-02，删净 CLI 线）★★★
   //   原来这里声明 `--model` / `--effort` / `-p` / `--resume` / `--session-id` /
   //   `--output-format` / `--input-format` / `--permission-mode` 等 13 个 CLI 旗标。

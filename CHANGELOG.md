@@ -17,6 +17,12 @@
   本次新建）：工具用法、智能团队用法（`spawn_teammate(name="workbuddy",
   description="WorkBuddy · …")` → 成员调 `workbuddy_run` 下发）、硬约束（唯一桌面端通道 /
   零 CLI / 零反代）与状态查看方式。
+### 变更（Changed）
+- **发布策略：不再提供打包发布版**（Owner 决策 2026-10-10）。GitHub 三个 Release 与版本
+  tag（v0.2.1/0.2.2/0.2.3）已删除，本地 release zip 已清；仓库无打包/发布工作流。部署
+  唯一路径 = junction 指向本仓库 + 重启 DSH。README「发布」节同步改写。
+### 维护（Chore）
+- `test:host` 清单对齐磁盘：移除已删的 `gateway-portmap.test.js`、补入 `status-anti-prune.test.js`（38 个文件全在盘）。
 
 ## [0.3.0] - 2026-10-10
 

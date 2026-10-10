@@ -141,9 +141,17 @@ $s = (Invoke-WebRequest -UseBasicParsing -Uri "$DSH_WEB/plugin-workbuddy/status"
 
 ## 发布
 
-当前版本 `0.3.0`（见 `package.json`）。版本号遵循 SemVer；验收以回执与桌面端对话为准：交代的事在 WorkBuddy 里是一条对话，在 DshAgentHub 里是一条回执。
+**2026-10-10 起：不再提供打包发布版，本仓库只提供源码。**
 
-本次更新（0.3.0）：每日签到自动领取与晚收获通道（`workbuddy_harvest`）、直接点火改零计划任务 INSERT、权限真源直读 SQLite `sessions.permission_mode`（废除 18488/sidecar）、`workbuddy_status` 输出 schema 违约修复，详见 [CHANGELOG.md](./CHANGELOG.md)。
+- GitHub Releases 与版本 tag（v0.2.1 / v0.2.2 / v0.2.3）已于 2026-10-10 全部删除；
+- 本地 `tmp/release-pack/` 下的历史 zip 已清除；仓库内无打包 / 发布工作流（`ci.yml` 只跑红线与测试）；
+- 误建的发布仓库 `Zoupidan/dsh-plugin-workbuddy` 已 archive 只读封存。
+
+部署方式只有一条：profile 的 `node_modules/dsh-plugin-workbuddy` 以 **junction 指向本仓库的
+`packages/plugin-workbuddy`**，改仓库即改所有 profile，**重启 DSH 生效**。更新 = 拉源码 + 重启。
+
+验收以回执与桌面端对话为准：交代的事在 WorkBuddy 里是一条对话，在 DshAgentHub 里是一条回执。
+版本记录见 [CHANGELOG.md](./CHANGELOG.md)。
 
 ---
 

@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { discoverSidecars, isPidAlive, parseSessionEntry, probeStatus, selectSidecar, sessionsDirs, summarizePool } from '../src/host/gateway/sidecar.js';
+import { discoverSidecars, isPidAlive, parseSessionEntry, probeEntry, probeStatus, selectSidecar, sessionsDirs, summarizePool } from '../src/host/gateway/sidecar.js';
 
 // 真机原文（逐字取自 ~/.workbuddy/sessions/*.json）
 const RAW_HOST = {
@@ -237,9 +237,9 @@ test('★ 探不到 busy（status 返回 null）算不可用，不算空闲', as
   assert.equal(await selectSidecar([host], { status: async () => ({}) }), null, '缺 busy 字段 ⇒ 不可用');
 });
 
-test('★ 端点已知的才算候选（解析不出端点的，一个都探不了）', async () => {
+test('★ 端点已知的才算候选（缺 url 的条目现在一个都探不了）', async () => {
   const noUrl = parseSessionEntry({ pid: 26080, kind: 'interactive', cwd: 'D:\\Box\\x' }, NOW);
-  assert.equal(noUrl.url, null, '缺 url 时条目仍保留，交端点反查去补');
+  assert.equal(noUrl.url, null, '缺 url ⇒ 没有端点（端口反查已随进程出口清理删除）');
   assert.equal(await selectSidecar([noUrl], { status: async () => ({ busy: false }) }), null,
     '★ 反查不出端点 ⇒ 不可用');
 });
@@ -386,6 +386,30 @@ test('probeStatus：busy 从 data 或顶层都能取；失败一律 null', async
   assert.equal(await probeStatus('http://127.0.0.1:1', async () => { throw new Error('ECONNREFUSED'); }), null);
   assert.equal(await probeStatus('http://127.0.0.1:1', async () => ({ ok: false })), null);
   assert.equal(await probeStatus('http://127.0.0.1:1', ok({ data: { busy: 'yes' } })), null, 'busy 不是布尔 ⇒ 不可用');
+});
+
+// ★★ 2026-10-10：`gateway-portmap.test.js`（netstat/lsof 解析 + `resolveSidecarEndpoints`
+//   + 这两个探活用例）随 `portmap.js` 一起删除。两个探活用例与 sidecar 的发现/选择
+//   同属一层，搬到这里继续跑；断言逐字未改。
+test('probeEntry：第一个端点探不通就试下一个，探通就停', async () => {
+  const seen = [];
+  const fetchImpl = async (url) => {
+    seen.push(url);
+    // ★ 注意 URL 后面还挂着 `/api/v1/status`，所以判端口要带斜杠，
+    //   `endsWith(':53350')` 会恒为 false —— 写这个夹具时真踩过。
+    return { ok: url.includes(':53350/'), json: async () => ({ data: { busy: false } }) };
+  };
+  const st = await probeEntry({ url: 'http://127.0.0.1:53349', altUrls: ['http://127.0.0.1:53350'] },
+    fetchImpl, 'tok');
+  assert.deepEqual(st, { busy: false, runStatus: null });
+  assert.deepEqual(seen, ['http://127.0.0.1:53349/api/v1/status', 'http://127.0.0.1:53350/api/v1/status'],
+    '★ 必须真的往后试，不能第一个不通就判死');
+
+  // 负控：第一个就通时**不**多打一次（那是对着本机服务白刷一轮）。
+  const first = [];
+  const okFirst = async (url) => { first.push(url); return { ok: true, json: async () => ({ data: { busy: false } }) }; };
+  await probeEntry({ url: 'http://127.0.0.1:1', altUrls: ['http://127.0.0.1:2'] }, okFirst, 'tok');
+  assert.equal(first.length, 1);
 });
 
 test('★ probeStatus：透出 runStatus（等授权 vs 在跑，处置完全不同）', async () => {

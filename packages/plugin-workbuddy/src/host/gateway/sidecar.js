@@ -10,7 +10,9 @@
  * 且必须 `busy === false`。找不到就报"没有空闲 sidecar"，**绝不退而求其次去碰用户的会话**。
  *
  * <p>★ session 文件里**没有口令**（真机核对：只有 pid/url/sessionId/cwd/heartbeat），
- * 所以发现与取口令是两件事，见 `token.js`。
+ * 所以发现与取口令是两件事，见 `token.js`。注意 2026-10-10 起端点**只能来自 session
+ * 文件自己写的 `url`**：按 pid 反查 OS 端口表要起 `netstat` / `lsof`（控制台进程），
+ * 那条路已随 P0 进程出口清理整体删除，缺 `url` 的条目直接落进 `no_endpoint`。
  *
  * @module host/gateway/sidecar
  */
@@ -111,8 +113,10 @@ export function parseSessionEntry(raw, now) {
   if (raw === null || typeof raw !== 'object') return null;
   const { pid, url, startedAt, lastHeartbeat, cwd, sessionId, kind } = raw;
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  // ★ 5.6.2 起 url 字段可能整个不存在（见 portmap.js 的实测），所以缺 url **不再丢弃条目**：
-  //   老逻辑在这里就把它扔了，于是"桌面端明明活着、网关明明在监听"却报"一个可用 sidecar 都没有"。
+  // ★ 5.6.2 起 url 字段可能整个不存在，所以缺 url **不再丢弃条目**：老逻辑在这里就把它扔了，
+  //   于是"桌面端明明活着、网关明明在监听"却报"一个可用 sidecar 都没有"。
+  //   （端点反查已于 2026-10-10 随进程出口清理删除 ⇒ 缺 url 的条目一路带到底，
+  //    由 `selectSidecar` 判 `no_endpoint`，不再有机会被补上。）
   //   有 url 时仍按老规矩严查本机 loopback —— 那份文件是磁盘上的可写数据。
   let normalized = null;
   if (typeof url === 'string') {
@@ -137,30 +141,6 @@ export function parseSessionEntry(raw, now) {
     hostManaged: dir.toLowerCase().includes(HOST_SESSION_DIR),
     kind: typeof kind === 'string' ? kind : null,
   };
-}
-
-/**
- * 端点反查：给缺 `url` 的条目按 pid 补上 HTTP 端点。
- *
- * <p>★ 一个 pid 可能同时监听多个本机端口，所以第一个进 `url`、其余进 `altUrls`，
- *   探活时逐个试（`probeEntry`）而不是随便挑一个。挑错端口会探到别人的服务上，
- *   症状还长得极像"桌面端没启动"。
- *
- * @param {ReturnType<typeof parseSessionEntry>[]} entries
- * @param {{resolvePorts: (pid: number) => Promise<number[]>}} deps
- * @returns {Promise<ReturnType<typeof parseSessionEntry>[]>}
- */
-export async function resolveSidecarEndpoints(entries, { resolvePorts }) {
-  const out = [];
-  for (const e of entries) {
-    if (e === null) continue;
-    if (typeof e.url === 'string' && e.url !== '') { out.push(e); continue; }
-    let ports = [];
-    try { ports = await resolvePorts(e.pid); } catch { ports = []; }
-    const urls = (Array.isArray(ports) ? ports : []).map((p) => `http://127.0.0.1:${p}`);
-    out.push(urls.length === 0 ? { ...e, url: null, altUrls: [] } : { ...e, url: urls[0], altUrls: urls.slice(1) });
-  }
-  return out;
 }
 
 /**
@@ -209,7 +189,7 @@ export async function selectSidecar(entries, opts = {}) {
   //   症状还长得像"桌面端没启动"——把用户送去重启一个根本没坏的东西。
   //   活性交给 discoverSidecars 的 isPidAlive（进程在不在）和下面的 HTTP 探活（能不能用）。
   const alive = entries.filter((e) => e !== null);
-  // ★ 端点已知的才算候选（端点由 resolveSidecarEndpoints 补齐）。
+  // ★ 端点已知的才算候选（端点只能来自 session 文件自己写的 `url`）。
   const pool = alive.filter((e) => typeof e.url === 'string' && e.url !== '');
   if (pool.length === 0) {
     if (typeof onUnavailable === 'function') onUnavailable(summarizePool([], entries, poolOpts));
@@ -348,15 +328,12 @@ export function summarizePool(probed, all = [], opts = {}) {
     return {
       code: 'token_unavailable',
       detail: `取不到网关口令（${noToken} 个 sidecar 全部失败），所以一条都没探活、也没下发。`
-        + '口令只存在于 sidecar 进程的环境块里，插件靠只读助手进程去读。'
-        + '读失败有**两种成因**，助手按各自的 stderr 区分，不要混为一谈：'
-        + '「environment block unavailable（进程已退出或环境块读不到）」'
-        + '对「<键名> is not set in pid N（读到了，只是这个 sidecar 没被注入口令）」。'
-        + '★ 此前这条一律写成"需要与桌面端同等或更高的权限"，那是**没验证过的归因**：'
-        + '本机非提权 shell 对 WorkBuddy 各进程的环境块读取是成功的，返回的是第二种（键不存在）。'
+        + '口令只存在于 sidecar 进程的内存里，没有任何落盘位置。'
+        + '插件曾经用一个只读助手进程去读那段内存，该进程出口已按"零 Shell/控制台进程"'
+        + '约束删除 ⇒ 现在唯一的来源是插件设置里的 gatewayToken。'
+        + '把它填进设置即可（改完立刻生效，不必重启）。'
         + '另外——此刻这些 sidecar 确实是活着的（否则上面会先报 pid_gone / pid_recycled），'
-        + '所以把 gatewayToken 填进插件设置**在这台机器上帮不上忙**：'
-        + '要下发就得先有 sidecar，而不是先有口令。' + tail,
+        + '所以填 gatewayToken 是这一条路上唯一能推进的动作。' + tail,
     };
   }
   // ★ 顺序有讲究：**先**判"一个都没探到"，**后**判"探到了但都拿不到"。
@@ -425,7 +402,8 @@ export function summarizePool(probed, all = [], opts = {}) {
       return {
         code: 'no_endpoint',
         detail: `${live.length} 个 sidecar 进程还活着，但都解析不出 HTTP 端点：`
-          + 'session 文件里没有 url，OS 端口表里也查不到它们的监听端口。'
+          + 'session 文件里没有 url，而按 pid 反查 OS 端口表需要起 netstat / lsof，'
+          + '该进程出口已按"零 Shell/控制台进程"约束删除。'
           + '重启 WorkBuddy 桌面端会重新拉起带端点的 sidecar。',
       };
     }

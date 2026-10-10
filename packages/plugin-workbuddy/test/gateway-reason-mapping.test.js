@@ -66,8 +66,10 @@ test('★★ 读不到本机 IPC 口令 ⇒ auth_failed（该去登录/重启桌
   );
 });
 
-test('★★ 桌面端三种起不来 ⇒ start_failed', () => {
-  for (const code of ['desktop_not_ready', 'desktop_launch_failed', 'desktop_not_installed', 'desktop_probe_failed']) {
+test('★★ 桌面端起不来 ⇒ start_failed', () => {
+  // ★ 2026-10-10：`desktop_probe_failed` 已随 tasklist 进程出口清理删除 —— 没有进程枚举
+  //   就没有"枚举失败"这一态了。剩下的三个仍然成立。
+  for (const code of ['desktop_not_ready', 'desktop_launch_failed', 'desktop_not_installed']) {
     assert.equal(
       gatewayReasonForInstance(instance({ code })),
       REASON_CODES.START_FAILED,
@@ -103,6 +105,13 @@ test('★★ instance 缺席或形状不对时不得抛错，退回兜底码', (
   for (const bad of [undefined, null, {}, { code: null }, { code: 'no_sidecar_appeared' }]) {
     assert.equal(gatewayReasonForInstance(bad), REASON_CODES.TRANSPORT_UNREACHABLE);
   }
+  // ★ 2026-10-10：已删除的 `desktop_probe_failed` **不再是** start_failed ——
+  //   它现在落进兜底桶而不是静悄悄地继续映射到一个不存在的处置上。
+  //   这防止"删了码但映射留着"这种漂移：映射与 ENSURE_CODE 必须同步。
+  assert.equal(
+    gatewayReasonForInstance(instance({ code: 'desktop_probe_failed' })),
+    REASON_CODES.TRANSPORT_UNREACHABLE,
+  );
 });
 
 test('★★ 映射结果必须**全部**是既有枚举里的值（防止有人新造码）', () => {

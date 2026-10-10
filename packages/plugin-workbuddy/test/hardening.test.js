@@ -1057,160 +1057,35 @@ test('目标⑧：状态字母表冻结 + target 是参数不是常量', { skip:
   assert.equal((await bare.probe(boom, {})).target, 'workbuddy', '本包装层必须补上本包的 target');
 });
 
-// ──────────────────── 读进程环境块的助手必须有界（2026-09-28 真机事故）────────────────────
+// ──────────────────── 进程出口已按 Owner 硬约束清零（2026-10-10）────────────────────
+//
+// 这里原有四条 seam 用例（超时终止 / 非零退出 reject / exit 0 空输出 reject / drain 顺序），
+// 钉的是 `makeSeamRunner()` —— 一个等退出、拿 stdout、超时 terminate 的进程 runner。
+// 它服务的三条路（pwsh 读 sidecar PEB 口令 / netstat 反查端口 / PowerShell 列进程身份）
+// **全部是显隐 Shell 或控制台进程**，Owner 硬约束零容忍 ⇒ 三条路与 runner 一并删除
+// （见 apply.js 头注 2026-10-10 条、token.js 头注、desktop.js 的 broker 管道探针）。
+// runner 不在了，继续给一个不存在的函数写行为测试就是假测试 ⇒ 改钉**新不变量**：
+// seam 不得复辟，且代码里不得再出现任何 Shell/控制台进程字样。
 
-test('★ 助手卡死不落地 ⇒ 必须超时终止，绝不把下发挂成永远转圈', { skip: SKIP }, async () => {
+test('★★ seam runner 保持删除状态，不得复辟（Owner 硬约束：零显隐 Shell/控制台进程）', { skip: SKIP }, async () => {
   const { makeSeamRunner } = mods.apply;
-  assert.equal(typeof makeSeamRunner, 'function', 'seam 包装器必须可测（否则这条只是文档）');
-
-  let terminated = 0;
-  let resolveDone;
-  // ★ 负控：done 永不 resolve（复现"助手读受保护进程时挂住"）。若 runner 没有超时，
-  //   下面的 Promise.race 会和它一起悬着 —— 那正是真机上作业永远不收尾的形态。
-  const ctx = {
-    subprocess: {
-      spawn: () => ({
-        collected: { stdout: { text: '' } },
-        done: new Promise((r) => { resolveDone = r; }),
-        terminate: async () => { terminated += 1; resolveDone({ exitCode: 143 }); },
-      }),
-    },
-  };
-  const run = makeSeamRunner(ctx, { timeoutMs: 50 });
-  const out = await Promise.race([
-    run({ argv: ['pwsh.exe', '-NoProfile'] }).then(() => 'resolved', (e) => `rejected:${e.message}`),
-    new Promise((r) => setTimeout(() => r('HUNG'), 2_000)),
-  ]);
-  assert.notEqual(out, 'HUNG', '★ 助手永不退出时，runner 自己必须有界返回');
-  assert.match(String(out), /^rejected:.*timed out/, '超时必须是 reject —— 让 pwsh→powershell 的回落还能走');
-  assert.equal(terminated, 1, '★ 超时后必须 terminate（否则助手进程会一直挂着）');
+  assert.equal(typeof makeSeamRunner, 'undefined',
+    'makeSeamRunner（等退出/拿 stdout/超时 terminate 的进程 runner）必须保持删除');
 });
 
-test('★ 助手非零退出 ⇒ reject（回落依赖它），零退出才回文本', { skip: SKIP }, async () => {
-  const { makeSeamRunner } = mods.apply;
-  const mk = (exitCode, text) => {
-    let resolveDone;
-    const done = new Promise((r) => { resolveDone = r; });
-    queueMicrotask(() => resolveDone({ exitCode }));
-    return {
-      ctx: { subprocess: { spawn: () => ({ collected: { stdout: { readFrom: () => ({ text }) } }, done, terminate: async () => {} }) } },
-    };
-  };
-  await assert.rejects(() => makeSeamRunner(mk(1, 'x').ctx, { timeoutMs: 2_000 })({ argv: ['pwsh.exe'] }), /exited 1/);
-  const good = await makeSeamRunner(mk(0, '  mj_iXNmXM\n').ctx, { timeoutMs: 2_000 })({ argv: ['pwsh.exe'] });
-  assert.equal(good, '  mj_iXNmXM\n', '成功路径必须逐字回传，由归一化层收拾');
-
-  // ★ 负控：`.text` 形状也必须收（seam 的两种观察者拿到的形状并不一致）。
-  const viaText = await makeSeamRunner({
-    subprocess: {
-      spawn: () => ({
-        collected: { stdout: { text: 'mj_iXNmXM' } },
-        done: Promise.resolve({ exitCode: 0 }),
-        terminate: async () => {},
-      }),
-    },
-  }, { timeoutMs: 2_000 })({ argv: ['pwsh.exe'] });
-  assert.equal(viaText, 'mj_iXNmXM', '★ 只认 readFrom 就会在另一种形状下静默读空');
-});
-
-test('★★ seam 收不到 stdout（exit 0 + 空输出）⇒ 必须 reject，且**不得**说成"去启动桌面端"（真机 2026-09-28）', { skip: SKIP }, async () => {
-  const { makeSeamRunner } = mods.apply;
-  // ★ 真机形状：助手**真的跑成功了**（独立验证：exit 0、387ms、43 字符），
-  //   但宿主 seam 给的假件既没有 `collected` 也没有 `stdout` ⇒ 两条取形状的分支全落空。
-  //   旧行为：静默返回 '' ⇒ 一路走到 token.js 的
-  //   "cannot read … Start the WorkBuddy desktop and sign in"
-  //   —— 桌面端明明在跑（端点裸探 401 恰恰证明它在），却被说成"没启动"。
-  const noCapture = {
-    subprocess: {
-      spawn: () => ({ done: Promise.resolve({ exitCode: 0 }), terminate: async () => {} }),
-    },
-  };
-  await assert.rejects(
-    () => makeSeamRunner(noCapture, { timeoutMs: 2_000 })({ argv: ['powershell.exe'] }),
-    /capture\/drain fault/,
-    '★ exit 0 却没输出必须炸出来，不能静默返回空串',
-  );
-  // ★ 真正的防回归点：错误必须**指认接线/捕获**，不得复用"环境没准备好"的话术。
-  const err = await makeSeamRunner(noCapture, { timeoutMs: 2_000 })({ argv: ['powershell.exe'] })
-    .then(() => null, (e) => e);
-  assert.doesNotMatch(
-    String(err?.message ?? ''), /Start the WorkBuddy desktop|sign in/i,
-    '★★ 捕获失败不得被说成"桌面端没启动"——真机就是这样被带偏的',
-  );
-
-  // ★ 负控：输出**确实**收得到时不得受影响（否则这条守卫会把好路径也炸了）。
-  const captured = await makeSeamRunner({
-    subprocess: {
-      spawn: () => ({
-        collected: { stdout: { text: '  mj_iXNmXM\n' } },
-        done: Promise.resolve({ exitCode: 0 }),
-        terminate: async () => {},
-      }),
-    },
-  }, { timeoutMs: 2_000 })({ argv: ['powershell.exe'] });
-  assert.equal(captured, '  mj_iXNmXM\n', '★ 收到输出就必须照常通过');
-  // ★ 负控：空白（只有换行）同样视为没输出——归一化层本来也会把它当空。
-  await assert.rejects(
-    () => makeSeamRunner({
-      subprocess: {
-        spawn: () => ({
-          collected: { stdout: { text: ' \n\t ' } },
-          done: Promise.resolve({ exitCode: 0 }),
-          terminate: async () => {},
-        }),
-      },
-    }, { timeoutMs: 2_000 })({ argv: ['powershell.exe'] }),
-    /capture\/drain fault/,
-  );
-});
-
-test('★★★★ 读 collected 之前必须 await waitForExit（drain 顺序，真根因回归）', { skip: SKIP }, async () => {
-  const { makeSeamRunner } = mods.apply;
-  // ★ 真根因（2026-09-28）：`done` 是 Node 的 close 事件，进程一报告退出就 resolve；
-  //   collected 流此刻**还在 drain**（types.d.ts:77-82 graceMs 的原文就是这个意思）。
-  //   旧代码只等 `done` 就读 ⇒ 读到空 ⇒ 症状与"seam 不捕获"完全一样，把四轮排查带偏了。
-  //   官方写法：dsh-subprocess-local/lib/index.js:1311
-  //   `Promise.all([handle.done.catch(() => {}), handle.waitForExit()])`。
-  //
-  //   本测试模拟真机时序：done 先 resolve，drain 稍后才把内容放进 collected。
-  const order = [];
-  const runner = makeSeamRunner({
-    subprocess: {
-      spawn: () => ({
-        collected: {
-          get stdout() {
-            order.push('read');
-            return { readFrom: () => ({ text: 'mj_iXNmXM' }) };
-          },
-        },
-        done: Promise.resolve({ exitCode: 0 }),
-        waitForExit: async () => {
-          order.push('waitForExit');
-          // drain 与 waitForExit 同时完成——读必须发生在它之后
-          await new Promise((r) => setTimeout(r, 5));
-          return true;
-        },
-        terminate: async () => {},
-      }),
-    },
-  }, { timeoutMs: 2_000 });
-  const got = await runner({ argv: ['powershell.exe'] });
-  assert.equal(got, 'mj_iXNmXM', '★ drain 完成后必须读得到口令');
-  assert.ok(
-    order.indexOf('waitForExit') !== -1 && order.indexOf('waitForExit') < order.indexOf('read'),
-    `★ 必须先 await waitForExit 再读 collected，实际顺序：${JSON.stringify(order)}`,
-  );
-
-  // ★ 负控：waitForExit **缺席**时退化成旧行为（只等 done），不得整体崩掉。
-  const noWait = await makeSeamRunner({
-    subprocess: {
-      spawn: () => ({
-        collected: { stdout: { readFrom: () => ({ text: 'fallback' }) } },
-        done: Promise.resolve({ exitCode: 0 }),
-        terminate: async () => {},
-      }),
-    },
-  }, { timeoutMs: 2_000 })({ argv: ['powershell.exe'] });
-  assert.equal(noWait, 'fallback', '★ 缺 waitForExit 须退化为只等 done，而不是抛 TypeError');
+test('★★★ apply.js 代码里不得再出现任何 Shell/控制台进程字样', { skip: SKIP }, async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../src/host/apply.js', import.meta.url), 'utf8')
+    .split('\n')
+    .filter((l) => !l.trimStart().startsWith('*') && !l.trimStart().startsWith('//'))
+    .join('\n');
+  for (const needle of ['pwsh', 'powershell', 'netstat', 'lsof', 'tasklist', 'makeSeamRunner']) {
+    assert.equal(src.includes(needle), false, `★ apply.js 代码里不得再出现 ${needle}`);
+  }
+  // 仅剩的 subprocess 消费者 = makeLauncher（火枪式拉 WorkBuddy.exe GUI 本体，见 apply.js 头注）。
+  // 钉住两件事：它没被顺手删掉；且全文件只有这一处 spawn 调用点（多一处就是新的出口）。
+  assert.match(src, /makeLauncher\(ctx\)/, '★ 桌面端 GUI 启动器必须仍在位');
+  const spawnSites = src.match(/subprocess\.spawn\(/g) ?? [];
+  assert.equal(spawnSites.length, 1, `★ 全文件只允许 launcher 这一处进程出口，实际 ${spawnSites.length} 处`);
 });
 

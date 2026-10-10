@@ -6,16 +6,29 @@
  *   挑不到就报 `no_sidecar` + 一句"请打开 WorkBuddy 桌面端"。这在真机上是一句**错话**——
  *   2026-09-30 20:05 的证据：桌面端进程 7 个在跑（18:00:13 起），而插件报"没开"。
  *
- * <p>本模块把那一问拆成可回答的五步，每一步都留下**可复核的证据**：
+ * <p>本模块把那一问拆成可回答的几步，每一步都留下**可复核的证据**：
  * <pre>
  *   1. probe        挑一次可用 sidecar（复用 sidecar.js 的 discover + selectSidecar，零重复实现）
- *   2. desktop      桌面端在不在？（tasklist CSV 枚举，只读）
- *   2.5 cancel      调用方已取消 ⇒ 停在动手之前（不该由我们弹出一个窗口）
- *   3. launch       不在 ⇒ 找安装位 ⇒ 拉起 ⇒ 等**本轮**broker 端点落盘
- *                   （**只推进到这里，不宣称"能跑了"**；已在跑的那一支同样要验端点）
+ *   2. cancel      调用方已取消 ⇒ 停在动手之前（不该由我们弹出一个窗口）
+ *   3. broker      桌面端完成启动了没？判据 = `~/.workbuddy/wbipc/endpoint.json` 且**本轮新鲜**
+ *   3.5 launch     没就绪 ⇒ 要不要起、能不能起、起了没、等到了没
  *   4. wait         等 sidecar 出现（轮询 1；sidecar 是**桌面端按对话拉起**的，它不来我们无能为力）
- *   5. report       把上面四步的结论落成 report，交给调用方进回执
+ *   5. report       把上面几步的结论落成 report，交给调用方进回执
  * </pre>
+ *
+ * <p>★★★★ 2026-10-10 P0 进程出口清理：`tasklist` 枚举已删，换成 broker 管道探针 ★★★★
+ * 第 2 步原先是 `isDesktopRunning()`：起 `tasklist /FI "IMAGENAME eq WorkBuddy.exe" /NH /FO CSV`
+ * 枚举进程。那是**控制台进程**，Owner 硬约束下删除，连带 `parseTasklistPids` 一并删除。
+ * 换成的判据见 `desktop.js` 的 {@link isDesktopRunning}：连 `endpoint.json` 里那个
+ * 命名管道并完成 HMAC 握手 —— 走的是 Owner 认可的唯一合法通信通道，不是进程。
+ * <pre>
+ *   删除前：running 三态（在跑 / 没跑 / 枚举失败）；枚举失败 ⇒ DESKTOP_PROBE_FAILED，不拉起。
+ *   删除后：running 二态（管道连上 / 连不上）；连不上的原因进 desktop.probeError。
+ * </pre>
+ * 三条纪律**原样保留**：
+ *   ① `desktop.running` 仍然与 `desktop.ready` 是两个布尔（F2：进程/管道在 ≠ broker 端点就绪）；
+ *   ② 管道探不出"没在跑"时**仍然不去拉起**（`NO_USABLE_SIDECAR`），多开实例是模块头记的头号禁忌；
+ *   ③ `desktop.pids` 恒为空数组 —— 拿不到进程号了，`projectInstance` 的白名单里本来就没有它。
  *
  * <p>★★★ 2026-09-30 对抗审查：三条"看起来像结论、其实没验过"的地方 ★★★
  * <pre>
@@ -68,9 +81,9 @@ import {
 export const ENSURE_STAGE = Object.freeze({
   /** 一开始就有可用 sidecar。 */
   REUSED: 'reused',
-  /** 桌面端原本没在跑，本轮把它拉起来了（**不代表任务一定能跑**，见 `no_sidecar`）。 */
+  /** 桌面端原本没就绪，本轮把它拉起来了（**不代表任务一定能跑**，见 `no_sidecar`）。 */
   STARTED: 'started',
-  /** 桌面端在跑，本轮轮询等到了 sidecar 出现。 */
+  /** 桌面端已就绪，本轮轮询等到了 sidecar 出现。 */
   WAITED: 'waited',
   /** 没拿到可用 sidecar。 */
   FAILED: 'failed',
@@ -78,9 +91,16 @@ export const ENSURE_STAGE = Object.freeze({
 
 /** 失败归因码。每一码对应**一个处置动作**，不允许出现"再看看"这种无处置的码。 */
 export const ENSURE_CODE = Object.freeze({
-  /** 桌面上有 sidecar，但全都不可用（忙 / 端点解析不出 / 口令读不出）。 */
+  /** 桌面上有 sidecar，但全都不可用（忙 / 端点解析不出 / 口令拿不到）。 */
   NO_USABLE_SIDECAR: 'no_usable_sidecar',
-  /** 进程枚举失败：分不清"没开"和"开不了"，此时**不**去拉起（避免多开实例抢凭据运行时）。 */
+  /**
+   * 桌面端活性判不出来（broker 管道连不上，但原因不是"桌面端没开"这么单纯）。
+   *
+   * <p>★ 2026-10-10：原判据是 `tasklist` 枚举失败；换成 broker 管道握手后，这个码的
+   *   触发面收窄成"连不上且原因不是 ENDPOINT_GONE / DESKTOP_CLOSED"——
+   *   也就是协议不信赖、超时一类**说不清**的局面。此时**不**去拉起：
+   *   多开一个实例会和已开的那一个抢同一个凭据运行时（头号禁忌）。
+   */
   DESKTOP_PROBE_FAILED: 'desktop_probe_failed',
   /** 本机找不到 WorkBuddy.exe 安装位。 */
   DESKTOP_NOT_INSTALLED: 'desktop_not_installed',
@@ -172,7 +192,6 @@ const sleepDefault = (ms) => new Promise((resolve) => { setTimeout(resolve, ms);
  * @param {object} deps
  * @param {() => Promise<{picked: object|null, why: {code: string, detail: string}|null, scanned: number}>} deps.probe
  *   挑一个可用 sidecar；由 `dispatch.js` 注入（它已经持有 discover/selectSidecar 闭包）。
- * @param {(spec: {argv: string[]}) => Promise<string>} [deps.run] 进程枚举用（`tasklist`）
  * @param {(spec: {argv: string[]}) => object} [deps.launcher] 拉起用（`apply.js` 接官方 seam）
  * @param {() => boolean} [deps.autoStart] 拉起开关（`autoStartDesktop` 设置）
  * @param {number|(() => number)} [deps.waitMs] 等 sidecar 的**第一**窗口
@@ -185,12 +204,18 @@ const sleepDefault = (ms) => new Promise((resolve) => { setTimeout(resolve, ms);
  *   在单测里可观测——续等期间确实让出了，而且确实换了更长的节拍。
  * @param {() => {path: string, source: string}|null} [deps.findExe] 安装位查找（默认 `findDesktopExe`）
  * @param {string} [deps.endpointFile] broker 端点文件（测试夹具位）
+ * @param {typeof import('node:net').connect} [deps.brokerConnect]
+ *   broker 管道探针的注入点（`isDesktopRunning` 用）—— 测试注入假客户端，绝不碰真机管道。
+ *   与 {@link isDesktopRunning} 的 `opts.connect` 是同一个东西。
+ * @param {(opts: {endpointFile?: string, connect?: Function}) => Promise<{running: boolean|null, error: string|null}>} [deps.brokerProbe]
+ *   **整个**活性探针的替换点（默认 `isDesktopRunning`）。只为"装配被裁剪、连 brokerConnect
+ *   都没接"那种现场可测而开 —— 它是唯一能让 `DESKTOP_PROBE_FAILED` 在单测里确定出现的形式。
  * @param {() => number} [deps.now]
  * @param {(ms: number) => Promise<void>} [deps.sleep]
  */
 export function createEnsurer(deps = {}) {
   const {
-    probe, run, launcher, autoStart, now = Date.now, sleep = sleepDefault,
+    probe, launcher, autoStart, now = Date.now, sleep = sleepDefault,
   } = deps;
   const findExe = typeof deps.findExe === 'function' ? deps.findExe : findDesktopExe;
   // ★ 就绪判定复用 `desktop.js` 的 broker 读法，只在这里把**端点文件位**透传出去 ——
@@ -295,18 +320,19 @@ export function createEnsurer(deps = {}) {
     }
     note('probe', `no usable sidecar (${first?.why?.code ?? 'unknown'})`);
 
-    // ── 2. 桌面端在不在 ────────────────────────────────────────────────────
-    //   没有 `run`（单测/裁剪装配）时**不猜**：直接落到 failed，`code` 如实写明缺什么。
-    if (typeof run !== 'function') {
-      return finish(ENSURE_STAGE.FAILED, ENSURE_CODE.NO_USABLE_SIDECAR, null, null, {
-        scanned: first?.scanned ?? 0, why: first?.why?.code ?? 'no_probe',
-      });
-    }
-    const proc = await isDesktopRunning({ run }, { image: DESKTOP_IMAGE });
+    // ── 2. 桌面端在不在（broker 命名管道握手，不枚举进程）──────────────────
+    //   ★★ 2026-10-10：这里原先是 `tasklist` CSV 枚举（控制台进程，已删）。
+    //      换成 `isDesktopRunning()`：连 `endpoint.json` 里那个命名管道 + HMAC 握手。
+    //      走的是 Owner 认可的唯一合法通信通道，一个进程都不起。
+    const proc = typeof deps.brokerProbe === 'function'
+      ? await deps.brokerProbe({ ...readyOpts(), connect: deps.brokerConnect })
+      : await isDesktopRunning({ ...readyOpts(), connect: deps.brokerConnect });
     const desktop = {
       image: DESKTOP_IMAGE,
       running: proc.running,
-      pids: proc.pids,
+      // ★ 恒为空：进程号拿不到了（枚举进程的那条路已删）。`projectInstance` 的
+      //   白名单里本来就没有它 ⇒ 出插件的形状不变。
+      pids: [],
       probeError: proc.error,
       exe: null,
       launched: false,
@@ -320,9 +346,10 @@ export function createEnsurer(deps = {}) {
       brokerStale: false,
     };
 
-    // ★ 枚举失败 ≠ 没在跑。这两种情况下**都不**去拉起：多开一个桌面端实例会和已开的那一个
-    //   抢同一个凭据运行时（`WorkBuddy__a85776a06….log:68` 那种 transport-error 的高发场景）。
-    if (proc.error !== null) {
+    // ★ 管道连不上 **≠ 没在跑**，也 **≠ 该去拉起**。原代码在这里把"枚举失败"与
+    //   "确实没在跑"分开；新判据下同样要分开——连不上的原因可能只是
+    //   "协议不信赖 / 超时"，此时拉起就是拿用户的桌面端冒险（多开实例抢凭据运行时）。
+    if (proc.running === null) {
       desktop.probeError = proc.error;
       note('desktop', `probe failed: ${proc.error}`);
       return finish(ENSURE_STAGE.FAILED, ENSURE_CODE.DESKTOP_PROBE_FAILED, null, desktop, {
@@ -342,7 +369,7 @@ export function createEnsurer(deps = {}) {
 
     // ── 3. 不在 ⇒ 要不要起 ────────────────────────────────────────────────
     if (!proc.running) {
-      note('desktop', 'not running');
+      note('desktop', `not running (${proc.error ?? 'broker pipe unreachable'})`);
       if (!mayLaunch()) {
         return finish(ENSURE_STAGE.FAILED, ENSURE_CODE.NO_USABLE_SIDECAR, null, desktop, {
           scanned: first?.scanned ?? 0, why: first?.why?.code ?? null,
@@ -385,20 +412,12 @@ export function createEnsurer(deps = {}) {
       //   说的是"等 sidecar"，冷启动余量是另一笔账；取两者较大值，两个窗口各自干自己的事。
       //   最坏情况因此是 `readyTimeoutMs + waitMs()`，这个算术写在这里而不是藏在代码里。
       const readyTimeoutMs = Math.max(waitMs(), DEFAULT_READY_TIMEOUT_MS);
-      const ready = await waitForDesktop({ run, sleep, now }, {
+      const ready = await waitForDesktop({ sleep, now }, {
         ...readyOpts(), timeoutMs: readyTimeoutMs, notBeforeMs: launchT0, signal: opts.signal,
       });
       desktop.ready = ready.ready;
-      desktop.pids = ready.pids.length > 0 ? ready.pids : desktop.pids;
       desktop.brokerDetail = ready.lastDetail;
       desktop.brokerStale = ready.stale === true;
-      // ★ F6(b)：整个就绪窗口 tasklist 全程失败 ⇒ 归因是**枚举坏了**，不是"桌面端没起来"。
-      //   旧代码把 `ready.error` 丢在半路 ⇒ 回执里 `probeError:null, ready:false` 与真正的
-      //   超时**长得一模一样**，两种处置不同的局面被压成同一句话。
-      if (ready.error !== null && ready.error !== undefined) {
-        desktop.probeError = ready.error;
-        note('ready', `process enumeration kept failing: ${ready.error}`);
-      }
       // ★ F3：取消落在就绪等待里 ⇒ 回 `aborted`，不许报成"桌面端没起来"。
       if (ready.aborted) {
         note('ready', 'aborted while waiting for the broker endpoint');
@@ -407,7 +426,7 @@ export function createEnsurer(deps = {}) {
         });
       }
       if (!ready.ready) {
-        note('ready', `broker not ready: ${ready.lastDetail ?? ready.error ?? 'timeout'}`);
+        note('ready', `broker not ready: ${ready.lastDetail ?? 'timeout'}`);
         return finish(ENSURE_STAGE.FAILED, ENSURE_CODE.DESKTOP_NOT_READY, null, desktop, {
           scanned: first?.scanned ?? 0, why: first?.why?.code ?? null,
           // ★ F1 的回声：端点**陈旧**时不能说"桌面端没启动完"——盘上那份文件是**别的**运行留下的，
@@ -417,18 +436,18 @@ export function createEnsurer(deps = {}) {
       }
       note('ready', 'broker endpoint present');
     } else {
-      // ★★ F2：进程在 ≠ 就绪 ★★ 旧代码在这里直接 `ready = true`，**零校验**，
+      // ★★ F2：管道在/进程在 ≠ 就绪 ★★ 旧代码在这里直接 `ready = true`，**零校验**，
       //   于是"桌面端在跑但 broker 端点根本不存在"与"桌面端在跑且已就绪"在
       //   `desktop.ready` 这一个布尔上**完全同形**，而 `projectInstance` 把它直接送到用户眼前。
-      //   本模块头的验收标准写的就是 broker 端点 ⇒ 进程在跑时也要问那一句
+      //   本模块头的验收标准写的就是 broker 端点 ⇒ 桌面端已经活着时也要问那一句
       //   （一次 readFile，几 ms；真机上桌面端在跑时它答"ready"，不会变成假阴性）。
       const broker = await isBrokerReady(readyOpts());
       desktop.ready = broker.ready;
       desktop.brokerDetail = broker.detail;
-      // 这一支没传 `notBeforeMs`（进程本来就在跑，没有"本轮拉起"可言）⇒ 这里恒为 false。
+      // 这一支没传 `notBeforeMs`（桌面端本来就在跑，没有"本轮拉起"可言）⇒ 这里恒为 false。
       // 仍要如实抄：将来谁往这条路上加了新鲜度闸门，这一行不用再改。
       desktop.brokerStale = broker.stale === true;
-      note('desktop', `running pids=[${proc.pids.join(',')}] broker=${broker.ready ? 'ready' : (broker.detail ?? 'not ready')}`);
+      note('desktop', `broker pipe up · endpoint=${broker.ready ? 'ready' : (broker.detail ?? 'not ready')}`);
     }
 
     // ── 4. 桌面端就绪 ⇒ 等 sidecar 出现 ────────────────────────────────────
@@ -513,8 +532,11 @@ const HINTS = Object.freeze({
     'No usable WorkBuddy sidecar. Open the WorkBuddy desktop and start a conversation there — '
     + 'the gateway sidecar is started per conversation by the desktop, not by this plugin.',
   [ENSURE_CODE.DESKTOP_PROBE_FAILED]:
-    'Could not enumerate running processes, so the plugin cannot tell whether WorkBuddy is already '
-    + 'open. It did not launch a second copy on purpose. Start the desktop yourself, then retry.',
+    // ★ 2026-10-10：判据从 tasklist 换成 broker 命名管道握手。文案随之改成描述新判据，
+    //   但**纪律一字未变**："不擅自多开一个实例"仍然写在这句里。
+    'Could not reach the WorkBuddy desktop broker over its named pipe, so the plugin cannot tell '
+    + 'whether the desktop is already running. It did not launch a second copy on purpose. '
+    + 'Start the desktop yourself, then retry.',
   [ENSURE_CODE.DESKTOP_NOT_INSTALLED]:
     'WorkBuddy.exe was not found in any known install location. Point the plugin at the real path, '
     + 'or start the desktop yourself.',

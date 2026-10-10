@@ -2,6 +2,22 @@
 
 本项目版本号遵循 [SemVer](https://semver.org/)，格式参照 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [Unreleased] - 2026-10-10
+
+### 修复（Fixed）
+- **fix(team): dsh 智能团队界面整体消失的根因修复** —— `cordis.patch.yml` 的
+  `dsh-session-persistence-jsonl-team` 条目漏写 `config.root`，撞
+  `dsh-session-persistence-jsonl` 的 `root: z.string().required()`（boot 日志实锤
+  `ValidationError: $.root missing required value`）。team 栈依赖持久化会话存储才激活
+  ⇒「智能团队」UI 整个不见。补 `root: !!js dshHomePath('sessions')`（与 dsh-base 基础条目
+  同库，团队成员本就是 Lead 会话树下的子会话）。缺陷自初始提交即在场，DSH 升级后
+  schema 校验变严格才暴露。复现/验证：`04-docs/FIX-20261010-team-persistence-root.md`。
+### 新增（Added）
+- **插件使用说明 `packages/plugin-workbuddy/README.md`**（此前 `files` 声明了却从不存文件，
+  本次新建）：工具用法、智能团队用法（`spawn_teammate(name="workbuddy",
+  description="WorkBuddy · …")` → 成员调 `workbuddy_run` 下发）、硬约束（唯一桌面端通道 /
+  零 CLI / 零反代）与状态查看方式。
+
 ## [0.3.0] - 2026-10-10
 
 ### 本次更新的目的

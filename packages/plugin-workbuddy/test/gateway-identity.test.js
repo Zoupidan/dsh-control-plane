@@ -1,93 +1,27 @@
-// 进程身份核验：session 文件里的 pid **现在还是不是** WorkBuddy 自己的进程。
+// 进程身份核验（`src/host/gateway/identity.js`）已随 2026-10-10 P0 进程出口清理**整体删除**。
 //
-// ★ 这组 fixture 全部是 2026-09-29 真机逐字采集的，不是编的：
-//   - 4304  记在 ~/.workbuddy/sessions/4304.json 里的是 `kind: interactive`，
-//           但该 pid 实际已被 Windows 回收给 `TextInputHost.exe`（触摸键盘）。
-//   - 33368 / 13828 是真的 WorkBuddy 进程。
+// ★★ 为什么这个文件还在 ★★
+// 它原本一半的用例在钉 `createIdentityResolver()` 的接线契约：`['pwsh.exe', '-NoProfile',
+// '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', <query-process-list.ps1>,
+// '-ProcessIds', …]`，pwsh 不可用时回落到 `powershell.exe`。那是 **PowerShell 进程**，
+// Owner 硬约束（插件任何路径都不许拉起显/隐 Shell/控制台进程）下必须删除，连同
+// `assets/query-process-list.ps1` 与 `src/host/gateway/identity.js` 本体。
+//
+// ★ 另一半用例测的是 `summarizePool()` 的 pid 回收 / pid 消失文案。那是**纯函数**，
+// 与进程枚举无耦合，所以整组搬到这里继续跑 —— 它们钉的是"别把用户送回重启循环"。
+//
+// ★★ 既知退化（如实记账）★★
+// 删除之后插件**再也判不出**"pid 被回收给了别的程序"与"进程根本不存在"：
+// 那要枚举 `Win32_Process` 的命令行，纯 JS 没有这条路（`process.kill(pid, 0)` 只能
+// 回答"这个号有没有人占着"，回答不了"占着的是不是它"，而 EPERM 假阳性在真机上
+// 会把死进程也报成活着）。于是 `dispatch.discover()` 的 `recycled` / `gone`
+// 恒为空数组，`pid_recycled` / `pid_gone` 两个 code 在插件内不再产生。
+// `summarizePool` 的两个分支与其文案**保留**（纯函数，零 importer 损失），
+// 由下面这几条继续钉住 —— 它们不是"留着好玩"，是"谁再把它接回来时别写成那句假话"。
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createIdentityResolver, isSidecarProcess, parseProcessList } from '../src/host/gateway/identity.js';
-import { POWERSHELL_CANDIDATES } from '../src/host/gateway/token.js';
 import { summarizePool } from '../src/host/gateway/sidecar.js';
-
-// 真机 query-process-list.ps1 输出（逐字）
-const REAL_OUTPUT = [
-  '4304\tTextInputHost.exe\t"C:\\WINDOWS\\SystemApps\\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\\TextInputHost.exe" -ServerName:InputApp.AppXk0mrh4r2q0ct33a9wgbez0x7v9cz5y.mca',
-  '13828\tWorkBuddy.exe\t"C:\\Program Files\\WorkBuddy\\WorkBuddy.exe" ',
-  '33368\tWorkBuddy.exe\t"C:\\Program Files\\WorkBuddy\\WorkBuddy.exe" "C:\\Program Files\\WorkBuddy\\resources\\app.asar\\main\\daemon-app-server-entry.js" --stdio',
-].join('\n');
-
-// ── 必须判 false 的那一侧（这是本组测试存在的理由）─────────────────────────
-test('★ 被回收给系统程序的 pid 必须判 false（真机 TextInputHost）', () => {
-  const proc = parseProcessList(REAL_OUTPUT, 4304);
-  assert.notEqual(proc, null, 'fixture 自检：4304 应能解析出来');
-  assert.equal(proc.name, 'TextInputHost.exe');
-  assert.equal(isSidecarProcess(proc), false,
-    '这是本次修复的核心：旧逻辑只查 isPidAlive，而这个 pid 确实活着');
-});
-
-// ── 必须判 true 的那一侧（防止"过滤得太狠，把真的也滤掉"）─────────────────
-test('真的 WorkBuddy 进程必须判 true', () => {
-  assert.equal(isSidecarProcess(parseProcessList(REAL_OUTPUT, 33368)), true);
-  assert.equal(isSidecarProcess(parseProcessList(REAL_OUTPUT, 13828)), true);
-});
-
-test('node 跑 codebuddy 入口也算（sidecar 可能不是 WorkBuddy.exe）', () => {
-  assert.equal(isSidecarProcess({
-    name: 'node.exe',
-    commandLine: '"C:\\Program Files\\nodejs\\node.exe" C:\\...\\cli\\dist\\codebuddy-headless.js daemon start',
-  }), true);
-});
-
-test('空输入判 false', () => {
-  assert.equal(isSidecarProcess({ name: '', commandLine: '' }), false);
-  assert.equal(isSidecarProcess({}), false);
-  assert.equal(isSidecarProcess(null), false);
-});
-
-test('★ 不能只看可执行文件名——node.exe 满机器都是', () => {
-  assert.equal(isSidecarProcess({ name: 'node.exe', commandLine: 'node D:\\demo\\my-project\\server.js' }), false);
-});
-
-// ── 解析器 ────────────────────────────────────────────────────────────────
-test('parseProcessList：查不到的 pid 返回 null（⇒ 上层存疑 ⇒ fail-open）', () => {
-  assert.equal(parseProcessList(REAL_OUTPUT, 99999), null);
-  assert.equal(parseProcessList('', 13828), null);
-  assert.equal(parseProcessList(null, 13828), null);
-});
-
-test('parseProcessList：命令行里带 tab 也不能错位', () => {
-  const line = '77\tWorkBuddy.exe\tsome\tweird\tcommand';
-  const p = parseProcessList(line, 77);
-  assert.equal(p.name, 'WorkBuddy.exe');
-  assert.equal(p.commandLine, 'some\tweird\tcommand');
-  assert.equal(isSidecarProcess(p), true);
-});
-
-// ── 批量解析器 ────────────────────────────────────────────────────────────
-test('createIdentityResolver：一次查询覆盖多个 pid，缺的记为存疑', async () => {
-  const resolve = createIdentityResolver({ run: async () => REAL_OUTPUT });
-  const got = await resolve([4304, 33368, 99999]);
-  assert.equal(got.get(4304).isSidecar, false);
-  assert.equal(got.get(4304).name, 'TextInputHost.exe');
-  assert.equal(got.get(33368).isSidecar, true);
-  assert.equal(got.get(99999).isSidecar, null, '查不到必须存疑，不能当成 false');
-});
-
-test('createIdentityResolver：整个查询失败 ⇒ 全部存疑（不许静默丢候选）', async () => {
-  const resolve = createIdentityResolver({ run: async () => { throw new Error('EACCES'); } });
-  const got = await resolve([4304, 33368]);
-  assert.equal(got.get(4304).isSidecar, null);
-  assert.equal(got.get(33368).isSidecar, null);
-});
-
-test('createIdentityResolver：空输入不发起查询', async () => {
-  let called = 0;
-  const resolve = createIdentityResolver({ run: async () => { called += 1; return ''; } });
-  assert.equal((await resolve([])).size, 0);
-  assert.equal(called, 0);
-});
 
 // ── 结论文案（★ 这里防的是回归：别再把用户送进重启循环）───────────────────
 test('★ pid 回收要单开一个 code，且文案里不许出现"重启"能治好的暗示', () => {
@@ -109,62 +43,57 @@ test('没有回收条目时，行为与旧逻辑完全一致（不回归）', ()
   assert.equal(summarizePool([], [aliveNoUrl]).code, 'no_endpoint');
 });
 
-// ════════════════════════════════════════════════════════════════════════════
-// ★★ 接线契约：argv[0] 必须是**可执行程序**，不能是开关。
-//
-// 2026-09-30 真机发现。上面这一整组测试全都注入 `run: async () => REAL_OUTPUT`
-// —— 假 runner **根本不看 argv**，所以"argv 拼错"这条在单元测试里是不可见的。
-// 而真实 seam（`ctx.subprocess.spawn`，apply.js makeSeamRunner）把 `argv[0]` 当程序名：
-//     token.js    → ['pwsh.exe',  '-NoProfile', ...]
-//     portmap.js  → ['netstat',   '-ano', ...]
-//     hardening.test.js 的 seam 测试 → ['pwsh.exe', '-NoProfile']
-// 全仓 139 处 argv 里，只有本模块写成了 `['-NoProfile', ...]`。
-// ⇒ seam 去执行一个名叫 `-NoProfile` 的程序 ⇒ 必抛 ⇒ 下面 catch 里的 fail-open
-//   把**全部 pid 判成"存疑"** ⇒ pid 回收防线（本模块存在的唯一理由）在真机从未生效。
-// 症状不是"少一条候选"，而是结论被带歪成 `no_endpoint`（"去重启桌面端"），
-// 而真正该报的是 `pid_recycled`（"重启解决不了"）—— 用户因此被送进重启循环。
-test('★★ 身份查询的 argv[0] 必须是 shell 可执行程序（不是开关）', async () => {
-  const seen = [];
-  const resolve = createIdentityResolver({
-    run: async (spec) => { seen.push(spec.argv); return REAL_OUTPUT; },
-  });
-  const got = await resolve([4304]);
-  assert.equal(seen.length, 1, '一次查询只发起一次进程');
-  const argv = seen[0];
-  assert.ok(!String(argv[0]).startsWith('-'),
-    `argv[0]="${argv[0]}" 是开关不是程序 ⇒ seam ENOENT ⇒ 身份核验整轮塌成"存疑"`);
-  assert.match(String(argv[0]), /pwsh|powershell/i, '身份查询必须走 PowerShell');
-  assert.equal(argv[1], '-NoProfile', '开关要跟在程序名后面');
-  assert.ok(argv.includes('-File'), '仍以 -File 调 helper');
-  assert.ok(argv.some((a) => String(a).includes('query-process-list.ps1')),
-    '调的必须是进程清单 helper');
-  assert.equal(got.get(4304).isSidecar, false,
-    '★ 接线修好后必须真的判出 false —— 这正是 pid 4304 → TextInputHost 那条真机结论');
+test('★ pid_gone 的文案：不许出现"权限不够"，也不许叫用户去粘 gatewayToken', () => {
+  const r = summarizePool([], [], { gone: [{ pid: 20868 }] });
+  assert.equal(r.code, 'pid_gone');
+  assert.doesNotMatch(r.detail, /权限不够|同等或更高的权限|提权/);
+  assert.doesNotMatch(r.detail, /填进插件设置|粘/);
+  assert.match(r.detail, /20868/, '要把那个 pid 点出来，否则用户无从判断是不是真有事');
 });
 
-test('★★ pwsh 不可用时回落到 powershell.exe（与 token.js 同一套候选）', async () => {
-  const seen = [];
-  const resolve = createIdentityResolver({
-    run: async (spec) => {
-      seen.push(spec.argv[0]);
-      if (spec.argv[0] === POWERSHELL_CANDIDATES[0]) throw new Error('ENOENT');
-      return REAL_OUTPUT;
-    },
-  });
-  const got = await resolve([4304]);
-  assert.deepEqual(seen, [...POWERSHELL_CANDIDATES],
-    '必须先试 pwsh.exe 再回落 powershell.exe');
-  assert.equal(got.get(4304).isSidecar, false,
-    '回落成功后必须真的判出 false，不许停在"存疑"');
+test('★ token_unavailable 也不许把"权限不够"当成已证实的成因', () => {
+  const r = summarizePool(
+    [{ entry: { pid: 1 }, status: { busy: null, unavailable: 'token_unavailable' } }], [], {},
+  );
+  assert.equal(r.code, 'token_unavailable');
+  assert.doesNotMatch(r.detail, /需要与 WorkBuddy 桌面端同等或更高的权限/);
+  // ★ 2026-10-10 的新判据：自动读取 PowerShell 路已删 ⇒ 唯一管用的动作就是填 gatewayToken。
+  assert.match(r.detail, /gatewayToken/);
 });
 
-test('两个 shell 都起不来 ⇒ 仍然全部存疑（fail-open 不许退化成"全判 false"）', async () => {
-  let calls = 0;
-  const resolve = createIdentityResolver({
-    run: async () => { calls += 1; throw new Error('EACCES'); },
-  });
-  const got = await resolve([4304, 33368]);
-  assert.equal(got.get(4304).isSidecar, null);
-  assert.equal(got.get(33368).isSidecar, null);
-  assert.equal(calls, POWERSHELL_CANDIDATES.length, '每个候选 shell 各试一次');
+test('★ 两个 code 的处置不同：gone 说"打开一次对话"，别把用户送去重启', () => {
+  const gone = summarizePool([], [], { gone: [{ pid: 20868 }] });
+  const recycled = summarizePool([], [], { recycled: [{ pid: 4304, name: 'TextInputHost.exe' }] });
+  assert.notEqual(gone.code, recycled.code);
+  assert.notEqual(gone.detail, recycled.detail);
+});
+
+// ── ★★ 新不变量：进程身份枚举整条路已不存在 ────────────────────────────────
+
+test('★★ 进程身份枚举模块已删除，且不再有任何 importer', async () => {
+  const { existsSync } = await import('node:fs');
+  assert.equal(
+    existsSync(new URL('../src/host/gateway/identity.js', import.meta.url)), false,
+    '★ identity.js 必须已删除（它起 PowerShell 列进程）',
+  );
+  assert.equal(
+    existsSync(new URL('../assets/query-process-list.ps1', import.meta.url)), false,
+    '★ query-process-list.ps1 必须已删除',
+  );
+});
+
+test('★★ dispatch 不再持有进程出口（deps.run 已从形参删除）', async () => {
+  // 这不是装饰：`deps.run` 曾经是 PowerShell / netstat / tasklist 三条路的唯一入口。
+  // 谁再把它加回 createDispatcher 的形参，这条会转红。
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(
+    new URL('../src/host/gateway/dispatch.js', import.meta.url), 'utf8',
+  )
+    .split('\n')
+    .filter((l) => !l.trimStart().startsWith('*') && !l.trimStart().startsWith('//'))
+    .join('\n');
+  for (const needle of ['createPortResolver', 'createIdentityResolver', 'readGatewayPassword',
+    'pwsh', 'powershell', 'netstat', 'lsof', 'tasklist']) {
+    assert.equal(src.includes(needle), false, `★ dispatch.js 代码里不得再出现 ${needle}`);
+  }
 });

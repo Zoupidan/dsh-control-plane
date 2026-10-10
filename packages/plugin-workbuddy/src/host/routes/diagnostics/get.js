@@ -2,8 +2,8 @@
  * `GET /plugin-workbuddy/diagnostics` —— 下发链路的**只读**体检。
  *
  * <p>★★ 为什么单独开一个端点，而不是把结论塞进状态载荷：
- *   状态路由是 UI 的轮询路径，而 `inspect()` 每次都要**逐个候选读一次进程环境块**
- *   （本机实测 760–1310ms/次）再加 HTTP 探活。挂上去等于每轮轮询都拖一秒以上。
+ *   状态路由是 UI 的轮询路径，而 `inspect()` 每次都要逐个候选读一次口令
+ *   再加 HTTP 探活。挂上去等于每轮轮询都拖一秒以上。
  *   而这条链的失败在日志里**一个字都没有**（实测 2026-09-28：下发给桌面端两条空闲
  *   sidecar，dsh-web.log 里连 workbuddy 都没有），于是"为什么发不出去"只能靠猜。
  *   单独一个端点 = 需要时查一次，不拖 UI。
@@ -11,8 +11,14 @@
  * <p>★ 安全性：只做发现与探活，**不下发任何东西**（`inspect()` 语义即如此），
  *   且沿用 `isLoopback` + `isLoopbackHost` 双闸。
  *
- * <p>★ 缓存：`inspect()` 要读进程内存，**连续点会连着付 PEB 读的代价**，
- *   所以按 TTL 缓存（默认 15s，够用又不至于把跨进程读打满）。`?refresh=1` 强制重算。
+ * <p>★ 缓存：`inspect()` 要逐候选取口令 + 探活，**连续点会连着付代价**，
+ *   所以按 TTL 缓存（默认 15s，够用又不至于把探活打满）。`?refresh=1` 强制重算。
+ *
+ * <p>★★ 2026-10-10：**受插件 `enabled` 开关门控**。
+ * 此前本路由与 status 路由的唯一差别就是没有这道闸：`enabled !== true` 时它照样
+ * 调 `dispatch.inspect()`（扫 session 目录、逐个候选取口令、HTTP 探活）—— 那是
+ * PRD-v4 §3 ①硬闸明令禁止的"关闭状态下仍然发生的行为"。现在与状态路由同一口径：
+ * 关着就不做任何事，如实回 `{available:false, reason:'plugin-disabled'}`。
  */
 import { isLoopback, isLoopbackHost } from '../loopback.js';
 
@@ -77,9 +83,11 @@ function project(body) {
 
 /**
  * @param {{ inspect?: () => Promise<object> }|null} dispatch 下发器（缺省 ⇒ 该端点如实说不可用）
+ * @param {{ currentConfig?: () => any }|null} [runtime] host SSOT；用来读 `enabled` 开关
+ *   （★ 2026-10-10：本路由此前**不受** ① 硬闸门控，关着也照样跑 inspect —— 一并修掉）
  * @returns {{ kind: 'exact', path: string, handler: (req: any, res: any) => Promise<void> }}
  */
-export function makeDiagnosticsRoute(dispatch = null, { ttlMs = DIAGNOSTICS_TTL_MS, now = Date.now } = {}) {
+export function makeDiagnosticsRoute(dispatch = null, runtime = null, { ttlMs = DIAGNOSTICS_TTL_MS, now = Date.now } = {}) {
   let cached = null;      // { at: number, body: object }
   return {
     kind: 'exact',
@@ -93,6 +101,13 @@ export function makeDiagnosticsRoute(dispatch = null, { ttlMs = DIAGNOSTICS_TTL_
         res.statusCode = 405;
         res.setHeader('allow', 'GET');
         res.end();
+        return;
+      }
+      // ★ ① 硬闸：关着就不做任何发现/取口令/探活。与状态路由同一口径
+      //   （`makeStatusRoute` 在那个位置做的也是这件事）。
+      const cfg = typeof runtime?.currentConfig === 'function' ? runtime.currentConfig() : null;
+      if (cfg?.enabled !== true) {
+        sendJson(res, 200, { available: false, reason: 'plugin-disabled' });
         return;
       }
       if (dispatch === null || typeof dispatch.inspect !== 'function') {

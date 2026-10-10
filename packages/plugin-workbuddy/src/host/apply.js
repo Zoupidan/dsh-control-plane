@@ -38,115 +38,11 @@ const name = PLUGIN_ID;
 const inject = ['tools', 'subprocess', 'jobs', 'subagents']; // ⑤⑥ 的 webServer/settings/systemPrompt 走 deferred inject
 
 /**
- * 把官方进程出口 `ctx.subprocess` 包成 `readGatewayPassword` 要的 `({argv}) => Promise<string>`。
+ * 把官方进程出口包成 `launchDesktop` 要的**火枪式**启动器（★ 2026-09-30）。
  *
- * <p>★ 为什么不直接用 `node:child_process`：R3-7 ② 规定**唯一**合法的进程出口是 `ctx.subprocess`
- *   （本文件头部也写着这条约束）。走 seam 还白拿两样东西：父环境净化与输出截断。
- *
- * <p>★ 必须有超时。助手要读别的进程内存，遇到受保护进程 / 提权弹窗都可能**永久不返回**；
- *   没有边界的话整条下发会跟着挂死 —— 用户看到的是一个永远转圈的作业，而不是一次失败。
- *   超时后先 `terminate()` 再抛，让 pwsh(7.x) → powershell.exe(5.1) 的回落还能走。
- *
- * <p>★ 退出码非 0 时**抛**：`readGatewayPassword` 靠 catch 在两个 shell 之间回落；
- *   把它吞成空串会让回落逻辑永远走不到第一个分支。
- */
-const HELPER_TIMEOUT_MS = 10_000;
-
-/**
- * @param {{subprocess: {spawn: Function}}} ctx
- * @param {{timeoutMs?: number}} [opts] `timeoutMs` 只给测试用（真机边界的验证不该花掉 10 秒）
- */
-function makeSeamRunner(ctx, opts = {}) {
-  const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : HELPER_TIMEOUT_MS;
-  return async ({ argv }) => {
-    const handle = ctx.subprocess.spawn({
-      argv,
-      cwd: process.cwd(),
-      stdio: {
-        stdin: 'ignore',
-        stdout: { maxBytes: 64 * 1024 },
-        stderr: { maxBytes: 8 * 1024 },
-      },
-      graceMs: 5_000,
-    });
-    let timer;
-    const timeout = new Promise((_, reject) => {
-      // ★ 绝不能 unref：这个计时器是**正确性机制**，不是保洁用的。
-      //   unref 之后它在"没有别的句柄撑着"时不会被触发，超时就不再是边界，
-      //   反而变成"没有任何东西会醒来"的静默挂死（假宿主里就是这样暴露的）。
-      timer = setTimeout(() => reject(new Error(`helper timed out after ${timeoutMs}ms`)), timeoutMs);
-    });
-    let done;
-    try {
-      // ★★★★ 必须**两个都等**。`done` 是 Node 的 `close` 事件（types.d.ts:101），
-      //   它在进程报告退出的那一刻就 resolve；而 collected 流此时**还在被 drain**
-      //   —— SubprocessSpawnSpec.graceMs 的原文是 "used for draining still-open
-      //   collected pipes after the process exits"（types.d.ts:77-82）。
-      //   `waitForExit()` 等的是 managed range 清空（本地实现 `await this.exited`，
-      //   而 exited 依赖 managedOwner.waitForExit()），那才是 collected 可读的时点。
-      //
-      //   ★ 本条是 2026-09-28 "seam 收不到 stdout" 的**真根因**：只等 `done` 就去读，
-      //     读到的是还没 drain 完的空流。症状与"seam 没捕获"完全一致，所以此前四轮
-      //     一直在查捕获层。官方写法见 dsh-subprocess-local/lib/index.js:1311：
-      //     `Promise.all([handle.done.catch(() => {}), handle.waitForExit()])`。
-      //
-      //   waitForExit 的失败（"provider can no longer observe its managed range"）
-      //   不该盖掉真正的退出码，降级成 false 继续。
-      [done] = await Promise.race([
-        Promise.all([
-          handle.done,
-          // `?.` 是有意的：waitForExit 在 SubprocessHandle 上是必有的，但缺席时
-          //   应当**退化成旧行为**（只等 done），而不是让整条链路崩掉。
-          //   退化后若真是 drain 问题，下面那条 exit-0-空 guard 会响，不会静默。
-          typeof handle.waitForExit === 'function'
-            ? handle.waitForExit().catch(() => false)
-            : Promise.resolve(false),
-        ]),
-        timeout,
-      ]);
-    } catch (err) {
-      void handle.terminate();   // 幂等；失败也不该盖掉真正的超时原因
-      throw err;
-    } finally {
-      clearTimeout(timer);
-    }
-    // ★ `.text` 与 `readFrom(0)` 两种形状都收：seam 的两个观察者（run.js 的收口
-    //   与这里）拿到的假件形状并不一致，只认一种就是"另一种形状下静默读空"。
-    const stdout = handle.collected?.stdout;
-    const text = typeof stdout?.text === 'string'
-      ? stdout.text
-      : (typeof stdout?.readFrom === 'function' ? (stdout.readFrom(0)?.text ?? '') : '');
-    if (done?.exitCode !== 0) throw new Error(`helper exited ${done?.exitCode}`);
-    // ★★★ "exit 0 但没有 stdout" 是**异常**，不是"没读到"。
-    //
-    //   助手的契约是 exit 0 = 读到了并把值吐出来（拿不到走 2、用法错走 1，见脚本头注释）。
-    //   走到这里只有两种可能：(a) 上面那两条取形状的分支都没命中；
-    //   (b) 读的时候 collected 还没 drain 完。两者都是**接线问题**，不是环境问题。
-    //
-    //   静默返回 '' 会一路走到 token.js 那句
-    //   "…Start the WorkBuddy desktop and sign in…" —— 把一处接线问题
-    //   说成"桌面端没启动"。真机 2026-09-28 就是这么被带偏的：桌面端明明在跑，
-    //   两个端点裸探都是 HTTP 401（401 恰恰证明它在、只缺口令），而插件报"去启动桌面端"，
-    //   dsh-web.log 里还一个字都没有。宁可在这里炸，也不要把接线问题伪装成环境问题。
-    if (typeof text !== 'string' || text.trim() === '') {
-      // ★ 这条 guard 保留下来，但**归因已改**：真根因是"只等 done 就读，抢在 drain 之前"
-      //   （上面那段 `Promise.all([done, waitForExit()])` 已修），不是 seam 不捕获。
-      //   留着它是因为归因链一旦再断一次，这里必须是**响的**而不是静默返回 ''。
-      throw new Error('helper exited 0 but produced no stdout '
-        + '(subprocess seam returned no readable stdout even after waitForExit — '
-        + 'this is a capture/drain fault, not "the desktop is not running")');
-    }
-    return text;
-  };
-}
-
-/**
- * 把官方进程出口包成 `ensure` 阶段要的**火枪式**启动器（★ 2026-09-30）。
- *
- * <p>★ 为什么不能复用 `makeSeamRunner`：那份的契约是"跑完、拿 stdout、超时就终止"，
- *   而目标是 `WorkBuddy.exe` —— **常驻 GUI，永远不会退出**。拿等退出的 runner 去拉它，
- *   结果是每轮 `ensure` 都在 10s 超时后把它 `terminate()` 掉：不但没起来，
- *   还会把用户正在用的桌面端杀掉。所以这里**不设超时、不等退出、不挂 terminate**。
+ * <p>★ 为什么必须是火枪式（拉起来就不管）：目标是 `WorkBuddy.exe` —— **常驻 GUI，永不退出**。
+ *   任何"等退出 / 超时 terminate"的 runner 都会在超时后把它杀掉：不但没起来，
+ *   还会把用户正在用的桌面端关掉。
  *
  * <p>★ 会不会随 dsh 一起死：本地 seam 在 win32 上把 `detached` 写死为 false
  *   （`dsh-subprocess-local/lib/runner-launch-*.js:1037`），但**不建 Job Object**
@@ -154,7 +50,13 @@ function makeSeamRunner(ctx, opts = {}) {
  *   这正是"启动它"的语义。`done` 必须挂空 catch：GUI 最终退出时那是个 rejected promise，
  *   没人接就是 unhandled rejection。
  *
- * @param {{subprocess: {spawn: Function}}} ctx
+ * <p>★★★★ 2026-10-10：这是本插件**仅剩**的进程出口 ★★★★
+ * 原先还有 `makeSeamRunner()`（等退出、拿 stdout、超时 terminate），它服务于三条路：
+ * 读 sidecar PEB 的 `pwsh/powershell`、按 pid 反查端口的 `netstat/lsof`、
+ * 列进程判身份的又一条 PowerShell。三条全是显/隐 Shell 或控制台进程，
+ * Owner 硬约束零容忍 ⇒ 全部删除，runner 随之删除（零 importer）。
+ * 剩下这一条拉的是 WorkBuddy 桌面端 GUI 进程本身 —— Owner 认可的唯一通信通道宿主，
+ * 不是 Shell、不是控制台、不是 CLI。
  */
 function makeLauncher(ctx) {
   return ({ argv }) => {
@@ -217,11 +119,9 @@ function apply(ctx, config) {
     void runtime.probe(detectWorkBuddy, ctx, runtime.currentConfig());
   }
   // ③' 下发器（★ 2026-09-28）：**建一次，用到插件卸载**。它内部缓存 sidecar 口令
-  //     （按 pid+启动时刻分键），而读一次要 760–1310ms 的跨进程读内存 —— 每次下发现建会把
-  //     每轮都拖慢一秒以上。配置里的 `gatewayToken` 传**取值函数**而非字符串，
+  //     （按 pid+启动时刻分键）；配置里的 `gatewayToken` 传**取值函数**而非字符串，
   //     否则装配期就把设置值拍死，用户改了设置也不生效（.volatile() 字段的通用坑）。
   const dispatch = createDispatcher({
-    run: makeSeamRunner(ctx),
     gatewayToken: () => runtime.currentConfig()?.gatewayToken ?? '',
     // ★ 同理：**绑定的那条对话**也要现取。空串 = 没绑 = 插件一步都走不出去
     //   （dispatch.js 在 connect 之前就 early-return，所以没绑时连 sidecar 都碰不到）。
@@ -313,4 +213,4 @@ function apply(ctx, config) {
   }, `${PLUGIN_ID}: injects`);
 }
 
-export { name, inject, apply, Config, makeSeamRunner };
+export { name, inject, apply, Config };

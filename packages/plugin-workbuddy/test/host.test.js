@@ -1646,7 +1646,10 @@ test('诊断端点：只读 + loopback-only + **绝不回显凭据**（2026-09-2
     // ★ 就算 inspect 内部将来不小心带出了口令，这条断言也必须拦住它。
     leakedToken: SECRET,
   }) };
-  const route = mods.routes.makeRoutes({}, { currentConfig: () => ({}) }, 'ns', null, null, dispatch)[1];
+  // ★ 2026-10-10：`currentConfig` 必须回 `enabled:true` —— 诊断路由自此受插件 ① 硬闸
+  //   门控（关着时如实回 `plugin-disabled`，不做任何发现/取口令/探活）。给 `{}` 会
+  //   撞上新闸门拿到 `{available:false}`，测不到下面的 E3c 载荷断言。
+  const route = mods.routes.makeRoutes({}, { currentConfig: () => ({ enabled: true }) }, 'ns', null, null, dispatch)[1];
   assert.equal(route.path, ROUTE_DIAGNOSTICS);
 
   const seen = [];
@@ -1678,6 +1681,11 @@ test('下发链路的第 0 站：`run()` 的结果面必须带 `instance`（★ 
     sessionMode: () => '', workspace: () => '', createNewConversation: () => false,
     autoStartDesktop: () => false,
     instanceTimeoutMs: () => 1000,
+    // ★ 2026-10-10：注入假 broker 探针 + 不存在的端点文件。默认判据读
+    //   `os.homedir()/.workbuddy/…`（WORKBUDDY_HOME 守卫盖不住 homedir）⇒ 桌面端
+    //   正在运行的机器上会连真 broker 并挂死。注入后与机器状态无关。
+    brokerProbe: async () => ({ running: false, error: null }),
+    endpointFile: 'C:\\definitely-not-here\\endpoint.json',
   });
   const r = await d.run({ prompt: 'hello', cwd: 'C:\\x' });
   assert.equal(r.ok, false);

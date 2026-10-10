@@ -17,22 +17,13 @@
  * @module host/gateway/dispatch
  */
 
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
-
 import { createAcpClient } from './acp.js';
-import { createPortResolver } from './portmap.js';
-import { createIdentityResolver } from './identity.js';
 import { createEnsurer, ENSURE_CODE } from './ensure.js';
 import {
-  discoverSidecars, probeEntry, resolveSidecarEndpoints, selectSidecar,
+  discoverSidecars, probeEntry, selectSidecar,
 } from './sidecar.js';
 import { REASON_CODES } from '../launch/reason-codes.js';
-import { autoReadSupport, createTokenProvider, readGatewayPassword } from './token.js';
-
-const HERE = dirname(fileURLToPath(import.meta.url));
-/** 仓库里那个只读 PEB 助手的绝对路径（`assets/read-sidecar-env.ps1`）。 */
-export const HELPER_PATH = join(HERE, '..', '..', '..', 'assets', 'read-sidecar-env.ps1');
+import { autoReadSupport, createTokenProvider } from './token.js';
 
 /**
  * 网关层的失败码 → 插件既有的 reason code。★ 复用既有枚举，不另造一套。
@@ -76,10 +67,12 @@ export function gatewayReasonForInstance(instance) {
   const refused = instance?.sidecar?.refused ?? null;
   if (code === ENSURE_CODE.ABORTED) return REASON_CODES.ABORTED;
   if (refused === 'token_unavailable') return REASON_CODES.AUTH_FAILED;
+  // ★ `DESKTOP_PROBE_FAILED` 已于 2026-10-10 随 tasklist 进程出口清理删除（没有进程枚举
+  //   就没有"枚举失败"这一态）。这里刻意**不**再为它留一支：映射表必须与 ENSURE_CODE
+  //   同步，留着一个永不产生的分支只会让下一个人以为它还存在。
   if (code === ENSURE_CODE.DESKTOP_NOT_READY
     || code === ENSURE_CODE.DESKTOP_LAUNCH_FAILED
-    || code === ENSURE_CODE.DESKTOP_NOT_INSTALLED
-    || code === ENSURE_CODE.DESKTOP_PROBE_FAILED) {
+    || code === ENSURE_CODE.DESKTOP_NOT_INSTALLED) {
     return REASON_CODES.START_FAILED;
   }
   // ★ 其余（NO_USABLE_SIDECAR / NO_SIDECAR_APPEARED）维持旧行为，零回归。
@@ -125,14 +118,20 @@ async function verifyPermissionMode(sidecar, token, sessionId, requested, fetchI
 /**
  * 建一个下发器。所有副作用都可注入，所以整条链能在测试里跑完而不碰真实环境。
  *
- * @param {{run?: (spec: {argv: string[]}) => Promise<string>,
+ * <p>★ 2026-10-10 P0 清理：`deps.run`（进程出口）已从形参里删除。
+ *   本模块原先经它拉起 PowerShell（读 sidecar PEB 拿网关口令）、netstat/lsof
+ *   （按 pid 反查监听端口）、PowerShell（列进程名判身份）。三条全部是显/隐
+ *   Shell 或控制台进程，Owner 硬约束零容忍 ⇒ 一并删除，见 token.js / ensure.js
+ *   的模块头。现在本模块的副作用只剩：读文件、`process.kill(pid,0)`、fetch。
+ *   `launcher`（拉 WorkBuddy.exe）仍在，但那不是 Shell/控制台进程。
+ *
+ * @param {{
  *   fetchImpl?: typeof fetch, sessionsDir?: string,
  *   gatewayToken?: string|null|(() => string|null), boundSessionId?: string|(() => string),
  *   sessionMode?: string|(() => string), workspace?: string|(() => string),
  *   createNewConversation?: boolean|(() => boolean),
  *   isPidAlive?: (pid: number) => boolean,
- *   helperPath?: string, now?: () => number}} [deps]
- *   `run` 是**唯一**的进程出口，必须由调用方接到官方 seam `ctx.subprocess`（R3-7 ②）。
+ *   now?: () => number}} [deps]
  *   `gatewayToken` 收函数是为了让**配置**成为唯一真源：静态字符串会在装配期把设置值拍死，
  *   用户改了设置也不生效（这是本仓对 `.volatile()` 字段的通用坑，见 apply.js 的说明）。
  *   `boundSessionId` 同理。**它取代了原先的 `allowInteractive` 布尔开关**：
@@ -141,7 +140,7 @@ async function verifyPermissionMode(sidecar, token, sessionId, requested, fetchI
  *   `sessionMode` / `workspace` / `createNewConversation` 同样收函数，理由相同；
  *   三者是**每次调用可覆盖**的（`run()` 的入参优先），便于工具层做逐次下发。
  *   `launcher` 是**拉起目标实例**用的火枪式进程出口（`apply.js` 接 `ctx.subprocess` 后注入）：
- *   契约与 `run` 相反 —— `run` 等退出拿 stdout，`launcher` 拉起来就不管了
+ *   契约与 `run` 相反 —— 等退出拿 stdout vs 拉起来就不管了
  *   （WorkBuddy.exe 是常驻 GUI，等它退出等于永远等不到）。`autoStartDesktop` /
  *   `instanceTimeoutMs` 同样现取，理由见 `.volatile()` 的通用坑。
  */
@@ -172,7 +171,7 @@ export const NEW_SESSION_ATTEMPTS = 2;
 
 export function createDispatcher(deps = {}) {
   const {
-    fetchImpl = fetch, sessionsDir, gatewayToken = null, helperPath = HELPER_PATH, now = Date.now,
+    fetchImpl = fetch, sessionsDir, gatewayToken = null, now = Date.now,
   } = deps;
   /** 配置里的兜底口令。每轮现取，不缓存（用户改了设置要立刻生效）。 */
   const configuredToken = () => (typeof gatewayToken === 'function' ? gatewayToken() : gatewayToken);
@@ -277,25 +276,16 @@ export function createDispatcher(deps = {}) {
    */
   const interactiveAllowed = () => boundSession() !== '';
 
-  // ★ 跨进程读环境块很贵（实测 760–1310ms），所以令牌提供器要活过一次 dispatch
+  // ★ 令牌的唯一来源是插件设置里的 `gatewayToken`。
+  //   2026-10-10 P0 清理前这里还挂着一个 `readGatewayPassword(pid, …)`：走
+  //   `pwsh.exe` / `powershell.exe` 读 sidecar 的 PEB 环境块。那条进程出口已整体删除
+  //   （Owner 硬约束：任何路径都不许拉起显/隐 Shell 进程），`deps.run` 也随之从
+  //   本模块的形参里消失 —— 见 token.js 的模块头。
   const tokens = createTokenProvider({
     configured: configuredToken(),
-    read: (pid) => readGatewayPassword(pid, { helper: helperPath, run: deps.run }),
   });
 
-  // ★ 5.6.2 起 session 文件不再写 `url`（见 portmap.js），端点只能按 pid 从 OS 端口表反查。
-  //   这是**纯查询**（netstat / lsof），不读别的进程内存，杀软不会因此报警 ——
-  //   与上面 PEB 读口令是两种风险量级，别混为一谈。
-  const resolvePorts = createPortResolver({ run: deps.run });
-
-  /**
-   * ★ 身份核验：把"pid 还活着但已经不是我们的进程"的条目挑出去。
-   *   与上面同样是**纯查询**（列进程名与命令行），不读内存、不改任何东西。
-   *   一次查询覆盖全部候选 —— 逐个查在几十个候选上要十几秒。
-   */
-  const resolveIdentities = createIdentityResolver({ run: deps.run });
-
-  /** 发现 + 反查端点。`inspect` 与 `run` 共用，免得两条路给出不同的池子。 */
+  /** 发现。`inspect` 与 `run` 共用，免得两条路给出不同的池子。 */
   const discover = async () => {
     const entries = discoverSidecars({
       ...(sessionsDir === undefined ? {} : { dir: sessionsDir }),
@@ -305,29 +295,20 @@ export function createDispatcher(deps = {}) {
       //   在测试里第一步就判成"桌面端没启动"，后面全测不到。
       ...(typeof deps.isPidAlive === 'function' ? { isPidAlive: deps.isPidAlive } : {}),
     });
-    const withUrls = await resolveSidecarEndpoints(entries, { resolvePorts });
-    // ★ 注入点：测试里直接给一张表，省掉真的去列进程。
-    const identities = typeof deps.resolveIdentities === 'function'
-      ? await deps.resolveIdentities(withUrls.map((e) => e.pid))
-      : await resolveIdentities(withUrls.map((e) => e.pid));
+    // ★★ 端点**只能来自 session 文件自己写的 `url`**。
+    //   5.6.2 之后桌面端不再写 `url`，旧解法是按 pid 从 OS 端口表反查 —— 那要起
+    //   `netstat`（win32）/ `lsof`（其他），是控制台进程，2026-10-10 随进程出口
+    //   清理整体删除。缺 `url` 的条目不再被补端点，直接交给 `selectSidecar`
+    //   判 `no_endpoint`（处置文案已相应改写，见 sidecar.js）。
+    //
+    // ★★ `recycled` / `gone` 恒为空的**原因**：它们只能来自进程身份枚举
+    //   （`query-process-list.ps1`，同样是 PowerShell），那条路也已删除。
+    //   于是"pid 被回收 / 进程根本不存在"这两种痕迹**本插件再也判不出来** ——
+    //   这是本次清理的既知退化，如实记账而不是假装还能判。`summarizePool` 的
+    //   两个 code 与其文案保留（纯函数，零 importer 之外的调用方仍可注入）。
     const recycled = [];
-    // ★★ 进程**根本不存在**的条目（枚举成功、不在表里）。它们和"pid 被回收"必须分开：
-    //   回收 ⇒ 那个进程号现在归别的程序；不存在 ⇒ 什么也没有，只剩一个残留的 session 文件。
-    //   两者过去都被 fail-open 放进了候选池，于是插件去读一个不存在的进程的环境块，
-    //   读不到，再把这件事报成"口令取不到/权限不够"——**归因完全错了，处置也完全错了**。
-    //   实测（2026-09-30 22:0x）：被当成"1 个可用 sidecar"的 pid 20868，
-    //   tasklist / Get-CimInstance Win32_Process / GetProcessById 三者都不承认它存在。
     const gone = [];
-    const kept = withUrls.filter((e) => {
-      const id = identities.get(e.pid);
-      // ★ 顺序有讲究：`exists === false` 先判。`isSidecar === null`（查不到）依然放行 ——
-      //   把"没权限"当成"不是我们的进程"，会静默丢掉用户提权运行的 sidecar（同上）。
-      if (id?.exists === false) { gone.push({ pid: e.pid }); return false; }
-      if (id?.isSidecar !== false) return true;
-      recycled.push({ pid: e.pid, name: String(id.name ?? '') });
-      return false;
-    });
-    return { entries: kept, recycled, gone };
+    return { entries, recycled, gone };
   };
 
   /**
@@ -344,10 +325,11 @@ export function createDispatcher(deps = {}) {
     let token = null;
     // ★★ 这行 catch 是**本机下发链路的真凶**，2026-09-28 定位：它把"取不到口令"
     //   压成了和"端点探不通"完全一样的 `null`，于是 `selectSidecar` 只能报
-    //   `probe_unreachable`（"去重启桌面端"）——而桌面端好好的，坏的是权限。
-    //   真机：dsh 跑在**普通用户**上下文，读 sidecar 的 PEB 被 Windows 拒绝，
-    //   两个端点裸探都是 HTTP 401（端点健康、只缺口令），全池却被判成"探不通"。
+    //   `probe_unreachable`（"去重启桌面端"）——而桌面端好好的，缺口令而已。
     //   现在保留成因，别再让它冒充成"桌面端没起来"。
+    //   2026-10-10 之后这里多了一种完全正常的失败：用户没配 `gatewayToken`
+    //   （自动读取 PEB 的那条 PowerShell 路已删）⇒ 同样落 `token_unavailable`，
+    //   处置文案指向"填 gatewayToken"（见 sidecar.js summarizePool）。
     try {
       ({ token } = await tokens.get(entry));
     } catch (e) {
@@ -389,11 +371,16 @@ export function createDispatcher(deps = {}) {
    */
   const ensurer = createEnsurer({
     probe: pickUsable,
-    run: deps.run,
     launcher: deps.launcher,
     autoStart: () => setting('autoStartDesktop') === true,
     waitMs: () => setting('instanceTimeoutMs'),
     now,
+    // ★ 2026-10-10：broker 探针与端点文件也可注入。缺省 ⇒ 真实本机（**生产行为不变**：
+    //   `defaultEndpointFile()` 走 os.homedir()）。此前本模块不传这两个，
+    //   测试里构造的真 dispatcher 只能靠"先把 USERPROFILE 指走"的环境戏法隔离，
+    //   而那会随"桌面端开没开"漂 —— 本机 WorkBuddy 在跑时整条 run 会挂死在真管道握手上。
+    ...(typeof deps.brokerProbe === 'function' ? { brokerProbe: deps.brokerProbe } : {}),
+    ...(typeof deps.endpointFile === 'string' && deps.endpointFile !== '' ? { endpointFile: deps.endpointFile } : {}),
   });
 
   return {

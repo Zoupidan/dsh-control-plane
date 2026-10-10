@@ -229,8 +229,22 @@
     #     名字在界面上直接可见，工作真的落在 WorkBuddy 里。
     #
     #   依赖组合取自 Team README 的最小可用配置。
+    # ★ 2026-10-10 修复（智能团队界面整体消失的根因）：本条目漏写 `config.root`。
+    #   `dsh-session-persistence-jsonl` 的 schema 是 `root: z.string().required()`
+    #   （asar 内 lib/index.js 的 static Config）⇒ 缺 root 的条目在 boot 时激活失败：
+    #     dsh: warning: 2 entries did not activate
+    #     dsh-session-persistence-jsonl-team: ValidationError: $.root missing required value
+    #   team 栈（agent-team / tool-agent-team / ui-agent-team）依赖持久化会话存储才激活
+    #   （Team README 原话 "The team features need durable session storage to activate"）
+    #   ⇒ 界面上的「智能团队」整个不见。本缺陷自初始提交（9594ce5）即在场，DSH 升级后
+    #   schema 校验变严格才暴露 —— 表现为"之前有的，后面也没了"。
+    #   root 与 dsh-base 的基础条目同值（`dshHomePath('sessions')`）：团队成员本就是
+    #   Lead 会话树下的子会话（header.origin==='subagent'），同库存储保持血缘可查；
+    #   服务键不随实例变（SessionPersistence）⇒ 同 root 的第二实例无冲突。
     - id: dsh-session-persistence-jsonl-team
       name: '@deepseek-ai/dsh-session-persistence-jsonl'
+      config:
+        root: !!js dshHomePath('sessions')
     - id: agent-team
       name: '@deepseek-ai/dsh-experimental-agent-team'
     - id: tool-agent-team

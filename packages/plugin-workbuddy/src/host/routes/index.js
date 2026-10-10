@@ -24,6 +24,7 @@ export function makeRoutes(settings, runtime, ns, sessions = null, credits = nul
   // `env` 用进程环境（目录读取器的 ①/② 源）；`sessions` 作为第 5 位置参数追加（向后兼容）。
   return [
     makeStatusRoute(settings, runtime, ns, process.env, sessions, credits, checkin),
-    makeDiagnosticsRoute(dispatch),
+    // ★ `runtime` 一并通过去：诊断端点要受同一个 `enabled` ① 硬闸门控（2026-10-10 补上）。
+    makeDiagnosticsRoute(dispatch, runtime),
   ];
 }

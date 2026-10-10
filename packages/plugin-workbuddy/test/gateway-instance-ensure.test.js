@@ -1,116 +1,182 @@
 // 目标实例保障（★ 2026-09-30）：下发链路的第 0 站「实例在不在 → 要不要起 → 起了没 → 等到了吗」。
 //
 // ★ 这组测试的第一职责**不是**证明"能起"，而是证明**别把四种处置不同的局面说成同一句话**：
-//   桌面端没开 / 枚举失败 / 拉起失败 / 起了没就绪 / 起了也不出 sidecar —— 五种都有各自的 code，
+//   桌面端没开 / 活性判不出 / 拉起失败 / 起了没就绪 / 起了也不出 sidecar —— 五种各有各自的 code，
 //   而旧代码全报 `no_sidecar` + 一句"请打开桌面端"。真机上桌面端开着 7 个进程时，
 //   那句话是**错的**，且会把用户送去重启一个正在好好运行的桌面端。
 //
-// ★ fixture 纪律：`TASKLIST_REAL` 是 2026-09-30 本机 `tasklist /FI "IMAGENAME eq WorkBuddy.exe" /NH /FO CSV`
-//   的逐字输出；`TASKLIST_NO_MATCH` 同命令换成不存在的镜像名的逐字输出。
-//   不编造 —— 负例那一行（`INFO:` 开头）是"误判为在跑"唯一可能的来源，必须用真文本证。
+// ★★ fixture 纪律（2026-10-10 起改写）：本文件原先钉的是 `tasklist` CSV 逐字输出
+//   （`TASKLIST_REAL` = 7 个 WorkBuddy.exe，`TASKLIST_NO_MATCH` = `INFO: No tasks…`）。
+//   `tasklist` 是**控制台进程**，Owner 硬约束（插件任何路径都不许拉起显/隐 Shell/控制台
+//   进程）下整体删除，`parseTasklistPids` 一并删除。判据换成 **broker 命名管道握手**
+//   （`isDesktopRunning`）：连 `endpoint.json` 里那个管道、完成 HMAC 双向证明。
+//   fixture 因此从"一段 CSV 文本"变成"一个假 `connect`"，见下面 `brokerStub()`。
+//   ★ 依旧不编造：假件按 `wbipc.js` 的协议真的算一遍 proof，而不是"连上就算活"。
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createHmac } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  DEFAULT_READY_TIMEOUT_MS, DESKTOP_IMAGE, findDesktopExe, isBrokerReady, isDesktopRunning,
-  launchDesktop, parseTasklistPids, waitForDesktop,
+  BROKER_PROBE_TIMEOUT_MS, DEFAULT_READY_TIMEOUT_MS, DESKTOP_IMAGE, findDesktopExe,
+  isBrokerReady, isDesktopRunning, launchDesktop, waitForDesktop,
 } from '../src/host/gateway/desktop.js';
 import { createEnsurer, ENSURE_CODE, ENSURE_STAGE, projectInstance } from '../src/host/gateway/ensure.js';
 import { createDispatcher } from '../src/host/gateway/dispatch.js';
 import { instanceLine, startGatewayRun } from '../src/host/tools/gateway-run.js';
 import { makeStatusTool } from '../src/host/tools/status.js';
 
-// 真机逐字（2026-09-30 20:40，7 个 WorkBuddy.exe）
-const TASKLIST_REAL = [
-  '"WorkBuddy.exe","23696","Console","1","211,248 K"',
-  '"WorkBuddy.exe","15192","Console","1","97,924 K"',
-  '"WorkBuddy.exe","30800","Console","1","55,832 K"',
-  '"WorkBuddy.exe","7364","Console","1","289,920 K"',
-  '"WorkBuddy.exe","27584","Console","1","226,700 K"',
-  '"WorkBuddy.exe","40344","Console","1","94,652 K"',
-  '"WorkBuddy.exe","38340","Console","1","83,992 K"',
-].join('\r\n');
-
-// 真机逐字：`tasklist /FI "IMAGENAME eq NotARealProcess.exe" /NH /FO CSV`
-// ⚠ 退出码是 **0** —— 判据必须落在**行形状**上，不能落在退出码上。
-const TASKLIST_NO_MATCH = 'INFO: No tasks are running which match the specified criteria.';
-
 // ══════════════════════════════════════════════════════════════════════════════
-// 1. parseTasklistPids
+// 0. broker 管道探针的假件（2026-10-10 起"桌面端在不在"的唯一判据）
 // ══════════════════════════════════════════════════════════════════════════════
 
-test('真机 CSV：七个 pid 全部解析出来、升序去重', () => {
-  const pids = parseTasklistPids(TASKLIST_REAL);
-  assert.deepEqual(pids, [7364, 15192, 23696, 27584, 30800, 38340, 40344]);
-});
+const EP_BYTES = JSON.stringify({ endpoint: '\\\\.\\pipe\\wbipc-fixture', ticket: 'fixture-ticket' });
 
-test('★ 真机负例：`INFO:` 那行必须落空（否则会判"桌面端在跑"而永远不拉起）', () => {
-  assert.deepEqual(parseTasklistPids(TASKLIST_NO_MATCH), []);
-  assert.deepEqual(parseTasklistPids(`${TASKLIST_NO_MATCH}\r\n`), []);
-  // 带 BOM / 前导空白的常见变体也必须落空
-  assert.deepEqual(parseTasklistPids(`  ${TASKLIST_NO_MATCH}  `), []);
-});
+/** 在 `tmp/` 里造一份端点文件（★ 绝不碰 `~/.workbuddy/`），`staleMs` = 把 mtime 往回拨多少毫秒。 */
+function endpointFixture({ staleMs = 0 } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'wb-ep-'));
+  const file = join(dir, 'endpoint.json');
+  writeFileSync(file, EP_BYTES);
+  const mtime = Date.now() - staleMs;
+  utimesSync(file, mtime / 1000, mtime / 1000);
+  return { file, mtime, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
 
-test('镜像名不匹配 ⇒ 空（问 NotAReal.exe 却喂 WorkBuddy 的行）', () => {
-  assert.deepEqual(parseTasklistPids(TASKLIST_REAL, 'NotAReal.exe'), []);
-});
+/**
+ * 假 `net.connect`：三种桌面端局面各有一个形状。
+ *
+ * <p>★ 为什么自己算一遍 proof，而不是"连上就判活"：
+ *   `isDesktopRunning` 的真契约是"broker 此刻应不应答"，而应答应由**服务端自证**
+ *   （`session_challenge` → `session_prove`）来证明。假件按协议真算，
+ *   于是它验的是"自证通过后判活"，而不是"只要 connect 回调了就判活"——
+ *   后者会把一个连上但回话的不是我们那个 broker 的管道也判成桌面端活着。
+ *
+ * <p>★ `gone` 必须在 **socket 上发 error**，不能同步 throw：
+ *   真实 `net.connect` 从不同步抛错，`wbipc.js` 的 `classifyConnectFailure` 挂在
+ *   socket 的 `error` 事件上。同步 throw 会把"管道不在了"变成"代码抛异常"，
+ *   `isDesktopRunning` 就只能判 `running:null`（判不出来）而不是 `false`。
+ */
+function brokerStub({ mode = 'up' } = {}) {
+  return (endpoint) => {
+    const sock = new EventEmitter();
+    let clientNonce = '';
+    sock.write = (line) => {
+      const f = JSON.parse(String(line));
+      if (f.type === 'session_hello') clientNonce = String(f.client_nonce ?? '');
+      if (f.type === 'session_prove') {
+        setImmediate(() => sock.emit('data', Buffer.from('{"type":"session_hello_ack","connection_epoch":1}\n')));
+      }
+      return true;
+    };
+    sock.destroy = () => {};
+    setImmediate(() => {
+      sock.emit('connect');
+      if (mode === 'gone') {
+        const e = new Error(`connect ENOENT ${endpoint}`);
+        e.code = 'ENOENT';
+        sock.emit('error', e);
+        return;
+      }
+      const serverNonce = 'srv-nonce';
+      const proof = mode === 'untrusted'
+        ? 'deliberately-wrong'
+        : createHmac('sha256', Buffer.from('fixture-ticket', 'utf8'))
+          .update(Buffer.concat(['wbipc-s', '1', endpoint, clientNonce, serverNonce]
+            .map((p) => {
+              const b = Buffer.from(p, 'utf8');
+              const len = Buffer.alloc(4);
+              len.writeUInt32BE(b.length);
+              return Buffer.concat([len, b]);
+            }))).digest('base64url');
+      sock.emit('data', Buffer.from(JSON.stringify({
+        type: 'session_challenge', protocol: 1, server_nonce: serverNonce, server_proof: proof,
+      }) + '\n'));
+    });
+    return sock;
+  };
+}
 
-test('pid 非法（空/非数字/0/负）的行被丢掉，其余照常收', () => {
-  const dirty = [
-    '"WorkBuddy.exe","","Console","1","10 K"',      // 空 pid
-    '"WorkBuddy.exe","N/A","Console","1","10 K"',    // 解析不出的 pid
-    '"WorkBuddy.exe","0","Console","1","10 K"',      // 0 不是有效 pid
-    '"WorkBuddy.exe","-5","Console","1","10 K"',     // 负数
-    '"WorkBuddy.exe","4242","Console","1","10 K"',    // 唯一好的那行
-  ].join('\n');
-  assert.deepEqual(parseTasklistPids(dirty), [4242]);
-});
-
-test('镜像名大小写不敏感（Windows 语义）', () => {
-  assert.deepEqual(parseTasklistPids('"workbuddy.exe","999","Console","1","1 K"'), [999]);
-});
-
-test('重复 pid 去重；空/非字符串输入不抛', () => {
-  assert.deepEqual(parseTasklistPids('"WorkBuddy.exe","7","Console","1","1 K"\n"WorkBuddy.exe","7","Console","1","1 K"'), [7]);
-  assert.deepEqual(parseTasklistPids(''), []);
-  assert.deepEqual(parseTasklistPids(null), []);
-  assert.deepEqual(parseTasklistPids(undefined), []);
-});
+/** 桌面端"活着"⇒ `running:true`。 */
+const BROKER_UP = { brokerConnect: brokerStub({ mode: 'up' }) };
+/** 管道 ENOENT ⇒ `running:false`（确定的否定答案，可以走拉起那一支）。 */
+const BROKER_GONE = { brokerConnect: brokerStub({ mode: 'gone' }) };
+/** 连上但服务端自证不过 ⇒ `running:null`（判不出来，**不许**去拉起）。 */
+const BROKER_UNTRUSTED = { brokerConnect: brokerStub({ mode: 'untrusted' }) };
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 2. isDesktopRunning —— ★ 先证明这个探测器**认得**已知失败
+// 1. isDesktopRunning —— broker 管道探针（2026-10-10 取代 tasklist 枚举）
+//
+//    ★ 先证明这个探测器**认得**已知失败。三态，对应三种处置：
+//      true  管道握手通过 ⇒ 桌面端活着
+//      false 管道 ENOENT / 端点文件读不到 ⇒ **确定的否定答案**，可以走拉起那一支
+//      null  协议不信赖 / 超时 ⇒ 判不出来 ⇒ 不许去拉起（多开实例抢凭据运行时）
 // ══════════════════════════════════════════════════════════════════════════════
 
-test('★ 探测器自检：真机 CSV ⇒ running；真机 INFO ⇒ 不 running', async () => {
-  const yes = await isDesktopRunning({ run: async () => TASKLIST_REAL });
+test('★ 探测器自检：管道握手通过 ⇒ running:true，且不带 error', async () => {
+  const fx = endpointFixture({ staleMs: 60_000 });
+  const yes = await isDesktopRunning({ endpointFile: fx.file, connect: brokerStub({ mode: 'up' }) });
+  fx.cleanup();
   assert.equal(yes.running, true);
   assert.equal(yes.error, null);
-  assert.equal(yes.pids.length, 7);
+});
 
-  // ★ 没有这一条，"能跑通"就只是一句自夸：一个把 `INFO:` 也当在跑的探测器，
-  //   永远返回 running:true，于是**永远不会**去拉起 —— 整段 ensure 逻辑静默失效。
-  const no = await isDesktopRunning({ run: async () => TASKLIST_NO_MATCH });
+test('★ 管道 ENOENT ⇒ running:false（确定的否定答案，**不是**"枚举失败"）', async () => {
+  // ★ 没有这一条，"能跑通"就只是一句自夸：一个把 ENOENT 也当"判不出来"的探测器
+  //   永远返回 null ⇒ 永远不去拉起 ⇒ autoStartDesktop 整个静默失效。
+  const fx = endpointFixture({ staleMs: 60_000 });
+  const no = await isDesktopRunning({ endpointFile: fx.file, connect: brokerStub({ mode: 'gone' }) });
+  fx.cleanup();
   assert.equal(no.running, false);
-  assert.equal(no.pids.length, 0);
-  assert.equal(no.error, null, '这条是"确实没在跑"，不是"枚举失败"');
+  assert.match(no.error, /no longer exists|open the WorkBuddy desktop/i,
+    '★ 文案必须由 classifyConnectFailure 翻成可执行的那句，而不是裸 ENOENT 路径');
 });
 
-test('★ 枚举失败必须与"没在跑"分开（分不清就会多开一个桌面端抢凭据运行时）', async () => {
-  const boom = await isDesktopRunning({
-    run: async () => { throw new Error('tasklist blocked by policy'); },
+test('★★ 活性判不出必须与"没在跑"分开（分不清就会多开一个桌面端抢凭据运行时）', async () => {
+  const fx = endpointFixture({ staleMs: 60_000 });
+  const boom = await isDesktopRunning({ endpointFile: fx.file, connect: brokerStub({ mode: 'untrusted' }) });
+  fx.cleanup();
+  assert.equal(boom.running, null, '★ 服务端自证不过 ⇒ 判不出来，不是"没在跑"');
+  assert.match(boom.error, /not trustworthy/);
+});
+
+test('★★ 端点文件整个读不到 ⇒ running:false（wbipc_desktop_closed）', async () => {
+  const no = await isDesktopRunning({
+    endpointFile: 'C:\\definitely-not-here\\endpoint.json',
+    connect: brokerStub({ mode: 'up' }),   // 连不连都无所谓：文件就没有
   });
-  assert.equal(boom.running, false);
-  assert.equal(boom.error, 'tasklist blocked by policy');
-  assert.deepEqual(boom.pids, []);
+  assert.equal(no.running, false);
+  assert.match(no.error, /endpoint not found/i);
 });
 
-test('isDesktopRunning 发的是 CSV + /NH（不是固定列：那在中文版上整条失配）', async () => {
-  let seen = null;
-  await isDesktopRunning({ run: async (spec) => { seen = spec.argv; return TASKLIST_REAL; } });
-  assert.deepEqual(seen, ['tasklist', '/FI', `IMAGENAME eq ${DESKTOP_IMAGE}`, '/NH', '/FO', 'CSV']);
+test('★★ 探针**一个进程都不起**：isDesktopRunning 的形参里没有 run/argv', async () => {
+  // 这不是装饰：`tasklist` 那条 argv 曾经就在这个形参里。把它加回来，
+  // 这条连同下面的 desktop.js 源码断言会一起转红。
+  const fx = endpointFixture({ staleMs: 60_000 });
+  const r = await isDesktopRunning({
+    endpointFile: fx.file,
+    // 观察点：给一个会抛的 `run`（旧签名）。新实现**不该**读它。
+    run: async () => { throw new Error('任何进程出口都不该被碰'); },
+    connect: brokerStub({ mode: 'up' }),
+  });
+  fx.cleanup();
+  assert.equal(r.running, true, '★ 只有 brokerConnect 参与判定');
+});
+
+test('★★ desktop.js 源码里不得再出现任何进程出口字样', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../src/host/gateway/desktop.js', import.meta.url), 'utf8')
+    .split('\n')
+    .filter((l) => !l.trimStart().startsWith('*') && !l.trimStart().startsWith('//'))
+    .join('\n');
+  for (const needle of ['tasklist', 'netstat', 'lsof', 'pwsh', 'powershell', 'spawn(']) {
+    assert.equal(src.includes(needle), false, `★ desktop.js 代码里不得再出现 ${needle}`);
+  }
+  assert.doesNotMatch(src, /parseTasklistPids/, '★ parseTasklistPids 必须已删除');
+  assert.match(src, /isDesktopRunning/, '★ 新的 broker 管道探针必须在位');
+  assert.match(src, /BROKER_PROBE_TIMEOUT_MS/, '★ 探针必须有界');
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -183,17 +249,7 @@ test('找不到任何已知安装位 ⇒ null（不是瞎猜一条路径去启�
 //   里同步写好一份，因此这套测试根本分辨不出"刚落的"和"3 小时前落的"，F1 才能全绿。
 //   唯一能免开眼的差别是 **mtime**：下面一律用 `utimesSync` 把同一份字节的 mtime 钉到指定时刻，
 //   于是"新不新鲜"成为判定的**唯一变量**。
-const EP_BYTES = JSON.stringify({ endpoint: '\\\\.\\pipe\\wbipc-fixture', ticket: 'fixture-ticket' });
-
-/** 在 `tmp/` 里造一份端点文件（★ 绝不碰 `~/.workbuddy/`），`staleMs` = 把 mtime 往回拨多少毫秒。 */
-function endpointFixture({ staleMs = 0 } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'wb-ep-'));
-  const file = join(dir, 'endpoint.json');
-  writeFileSync(file, EP_BYTES);
-  const mtime = Date.now() - staleMs;
-  utimesSync(file, mtime / 1000, mtime / 1000);
-  return { file, mtime, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
-}
+//   （夹具本体 `EP_BYTES` / `endpointFixture()` 已在文件头部定义，见第 0 节。）
 
 /** 每 100 走 100ms 的假时钟（供 `waitForDesktop` 用）。 */
 const tickingClock = () => (() => { let t = 0; return () => (t += 100); })();
@@ -201,14 +257,13 @@ const tickingClock = () => (() => { let t = 0; return () => (t += 100); })();
 test('★★ T1·正面：同一份端点字节，mtime 落在拉起**之后** ⇒ ready:true（这一支原先零覆盖）', async () => {
   const fx = endpointFixture({ staleMs: 3 * 3600_000 });   // 文件本身是"旧的"写法，但 stamp 更旧
   const r = await waitForDesktop(
-    { run: async () => TASKLIST_REAL, sleep: async () => {}, now: tickingClock() },
+    { sleep: async () => {}, now: tickingClock() },
     { timeoutMs: 1000, endpointFile: fx.file, notBeforeMs: fx.mtime - 10_000 },
   );
   fx.cleanup();
   assert.equal(r.ready, true, '★ mtime ≥ 拉起那一刻 ⇒ 本轮桌面端确实落过盘了');
   assert.equal(r.aborted, false);
   assert.equal(r.error, null);
-  assert.equal(r.pids.length, 7, 'pids 必须带出（它进 diagnostics）');
   assert.ok(r.waitedMs <= 100, `第一轮就该就绪，跑了 ${r.waitedMs}ms`);
 });
 
@@ -219,7 +274,7 @@ test('★★★ T1·反面：同一份端点字节，mtime 落在拉起**之前*
   //   墙钟与文件时间戳不同源），间隔小于容差的用例会只测到容差。
   const fx = endpointFixture({ staleMs: 3 * 3600_000 });
   const r = await waitForDesktop(
-    { run: async () => TASKLIST_REAL, sleep: async () => {}, now: tickingClock() },
+    { sleep: async () => {}, now: tickingClock() },
     { timeoutMs: 1000, endpointFile: fx.file, notBeforeMs: fx.mtime + 10_000 },
   );
   fx.cleanup();
@@ -250,32 +305,28 @@ test('★★ 残留端点 + 桌面端随后重写 ⇒ 从"陈旧"翻到"就绪"�
   const fx = endpointFixture({ staleMs: 3 * 3600_000 });
   let polls = 0;
   const r = await waitForDesktop({
-    run: async () => {
+    sleep: async () => {
       polls += 1;
-      // ★ 进程在第 2 轮才起来，端点在第 3 轮被**重写** —— 正是真机那 2s 的形状。
-      //   （上一稿这里只切了 tasklist、没动端点文件，于是"陈旧"永远翻不过去：测试自己没造出翻转。）
+      // ★ 桌面端在第 3 轮把端点**重写** —— 正是真机那 2s 的形状（`wbipc.js:58`：
+      //   "重启时滞后异步重写"）。没有这个翻转，这条用例永远翻不过去，也就什么都没测。
       if (polls >= 3) writeFileSync(fx.file, EP_BYTES);
-      return polls >= 2 ? TASKLIST_REAL : TASKLIST_NO_MATCH;
     },
-    sleep: async () => {},
     now: tickingClock(),
   }, { timeoutMs: 5000, endpointFile: fx.file, notBeforeMs: fx.mtime + 10_000, pollMs: 1 });
   fx.cleanup();
   assert.equal(r.ready, true, '★ 陈旧端点不得让整个窗口一票否决（真机 desktop 会重写它）');
 });
 
-test('waitForDesktop：进程在但端点**根本没有** ⇒ 不 ready（真机启动那 2 秒）', async () => {
+test('waitForDesktop：端点**根本没有** ⇒ 不 ready（真机启动那 2 秒）', async () => {
   const notReady = await waitForDesktop(
     {
-      run: async () => TASKLIST_REAL,
       sleep: async () => {},
       now: tickingClock(),
     },
     { timeoutMs: 250, endpointFile: 'C:\\definitely-not-here\\endpoint.json' },
   );
-  assert.equal(notReady.ready, false, '进程在但端点没落盘 ≠ 就绪');
+  assert.equal(notReady.ready, false, '端点没落盘 ≠ 就绪');
   assert.equal(notReady.stale, false, '★ 文件压根没有 ⇒ 不是"陈旧"，是"没有"（归因不同）');
-  assert.equal(notReady.pids.length, 7);
   assert.match(notReady.lastDetail ?? '', /endpoint\.json/);
 });
 
@@ -323,27 +374,24 @@ test('★★ 默认端点路径必须与 `wbipc.js` 同位（`desktop.js` 里那
 
 test('waitForDesktop：超时后带出最后一条 detail，不抛', async () => {
   const r = await waitForDesktop({
-    run: async () => TASKLIST_NO_MATCH,
     sleep: async () => {},
     now: tickingClock(),
   }, { timeoutMs: 300, endpointFile: 'C:\\definitely-not-here\\endpoint.json' });
   assert.equal(r.ready, false);
-  assert.deepEqual(r.pids, []);
 });
 
 test('★★ waitForDesktop：轮询途中取消 ⇒ 立刻返回 aborted（不跑满窗口）', async () => {
   const ac = new AbortController();
   let polls = 0;
   const r = await waitForDesktop({
-    run: async () => { polls += 1; if (polls === 2) ac.abort(); return TASKLIST_REAL; },
-    sleep: async () => {},
+    sleep: async () => { polls += 1; if (polls === 2) ac.abort(); },
     now: tickingClock(),
   }, {
     timeoutMs: 60_000, endpointFile: 'C:\\definitely-not-here\\endpoint.json', signal: ac.signal,
   });
   assert.equal(r.ready, false);
   assert.equal(r.aborted, true, '★ 取消必须被认出来，而不是伪装成"超时"');
-  assert.equal(polls, 2, `★ 第 2 轮取消 ⇒ 之后一次 tasklist 都不该再发（实际 ${polls} 次）`);
+  assert.equal(polls, 2, `★ 第 2 轮取消 ⇒ 之后一次端点轮询都不该再发（实际 ${polls} 次）`);
   assert.ok(r.waitedMs <= 300, `窗口是 60s，实际只跑了 ${r.waitedMs}ms`);
 });
 
@@ -360,11 +408,11 @@ function fakeClock(start = 0, step = 1000) {
   return { now: () => t, sleep: async () => { t += step; } };
 }
 
-test('★ stage=reused：一开始就有可用 sidecar ⇒ 全程零进程动作', async () => {
-  let ran = 0;
+test('★ stage=reused：一开始就有可用 sidecar ⇒ 全程零桌面端动作', async () => {
+  let probed = 0;
   const { ensure } = createEnsurer({
     probe: async () => ({ picked: PICKED, why: null, scanned: 5 }),
-    run: async () => { ran += 1; return TASKLIST_REAL; },
+    brokerProbe: async () => { probed += 1; return { running: true, error: null }; },
     launcher: () => { throw new Error('绝不该被调用'); },
   });
   const r = await ensure();
@@ -373,39 +421,55 @@ test('★ stage=reused：一开始就有可用 sidecar ⇒ 全程零进程动作
   assert.equal(r.report.code, 'ok');
   assert.deepEqual(r.report.desktop, null, '根本没走到桌面端那一步 ⇒ 不该有桌面端结论');
   assert.equal(r.sidecar.pid, 4242);
-  assert.equal(ran, 0, '连 tasklist 都不该发：已经有可用 sidecar 了');
+  assert.equal(probed, 0, '★ 已经有可用 sidecar 了，连 broker 管道都不该去连');
   assert.equal(r.report.hint, null);
 });
 
-test('★ 没有 run（裁剪装配）⇒ 如实报"挑不出 sidecar"，**不假装**去启动', async () => {
-  const { ensure } = createEnsurer({ probe: async () => NO_SIDECAR });
-  const r = await ensure();
-  assert.equal(r.ok, false);
-  assert.equal(r.report.stage, ENSURE_STAGE.FAILED);
-  assert.equal(r.report.code, ENSURE_CODE.NO_USABLE_SIDECAR);
-  assert.match(r.report.hint, /No usable WorkBuddy sidecar/);
-});
-
-test('★ 枚举失败 ⇒ desktop_probe_failed，且**不**去拉起（别多开一个抢凭据的实例）', async () => {
+test('★ 活性探针一句实话都递不出来（裁剪装配）⇒ desktop_probe_failed，且**不**去拉起', async () => {
+  // ★ 这是"装配被裁剪、连 broker 管道探针都没接"的那种现场。
+  //   注意它**不是**"桌面端没开"：两者处置不同，所以必须是两个 code。
+  //   ★ 刻意用 `brokerProbe` 注入"我什么都判不出来"，而不是"什么都不注入"——
+  //     后者会让测试去连**真机**的 `~/.workbuddy/wbipc/endpoint.json`（纪律禁止，
+  //     且结论随测试机上桌面端开没开而漂）。
   let launched = 0;
   const { ensure } = createEnsurer({
     probe: async () => NO_SIDECAR,
-    run: async () => { throw new Error('access denied'); },
+    brokerProbe: async () => ({ running: null, error: 'broker probe not wired (trimmed assembly)' }),
     launcher: () => { launched += 1; return { pid: 1 }; },
     findExe: () => ({ path: 'C:\\x\\WorkBuddy.exe', source: 't' }),
   });
   const r = await ensure();
   assert.equal(r.report.code, ENSURE_CODE.DESKTOP_PROBE_FAILED);
-  assert.equal(r.report.desktop.probeError, 'access denied');
+  assert.match(r.report.desktop.probeError, /broker probe not wired/);
   assert.equal(launched, 0, '这一条是本模块最容易写错的地方');
   assert.match(r.report.hint, /did not launch a second copy on purpose/);
 });
 
-test('★ 桌面端没开 + autoStart 关 ⇒ 不拉起，报 no_usable_sidecar', async () => {
+test('★ 活性判不出（管道连上但服务端自证不过）⇒ desktop_probe_failed，且**不**去拉起', async () => {
+  // ★ 枚举失败 ≠ 没在跑的纪律原样保留，只是判据从 tasklist 换成 broker 管道。
+  let launched = 0;
+  const fx = endpointFixture({ staleMs: 60_000 });
+  const { ensure } = createEnsurer({
+    probe: async () => NO_SIDECAR,
+    ...BROKER_UNTRUSTED,
+    endpointFile: fx.file,
+    launcher: () => { launched += 1; return { pid: 1 }; },
+    findExe: () => ({ path: 'C:\\x\\WorkBuddy.exe', source: 't' }),
+  });
+  const r = await ensure();
+  fx.cleanup();
+  assert.equal(r.report.code, ENSURE_CODE.DESKTOP_PROBE_FAILED);
+  assert.match(r.report.desktop.probeError, /not trustworthy/);
+  assert.equal(launched, 0, '★ 判不出来就不许去拉起（多开实例抢凭据运行时）');
+  assert.match(r.report.hint, /did not launch a second copy on purpose/);
+});
+
+test('★ 桌面端没开（管道 ENOENT）+ autoStart 关 ⇒ 不拉起，报 no_usable_sidecar', async () => {
   let launched = 0;
   const { ensure } = createEnsurer({
     probe: async () => NO_SIDECAR,
-    run: async () => TASKLIST_NO_MATCH,
+    ...BROKER_GONE,
+    endpointFile: 'C:\\definitely-not-here\\endpoint.json',
     autoStart: () => false,
     launcher: () => { launched += 1; return { pid: 1 }; },
   });
@@ -418,7 +482,8 @@ test('★ 桌面端没开 + autoStart 关 ⇒ 不拉起，报 no_usable_sidecar'
 test('★ 桌面端没开 + 找不到安装位 ⇒ desktop_not_installed', async () => {
   const { ensure } = createEnsurer({
     probe: async () => NO_SIDECAR,
-    run: async () => TASKLIST_NO_MATCH,
+    ...BROKER_GONE,
+    endpointFile: 'C:\\definitely-not-here\\endpoint.json',
     autoStart: () => true,
     findExe: () => null,
     launcher: () => ({ pid: 1 }),
@@ -431,7 +496,8 @@ test('★ 桌面端没开 + 找不到安装位 ⇒ desktop_not_installed', async
 test('★ 拉起失败 ⇒ desktop_launch_failed，且带出原因', async () => {
   const { ensure } = createEnsurer({
     probe: async () => NO_SIDECAR,
-    run: async () => TASKLIST_NO_MATCH,
+    ...BROKER_GONE,
+    endpointFile: 'C:\\definitely-not-here\\endpoint.json',
     autoStart: () => true,
     findExe: () => ({ path: 'C:\\x\\WorkBuddy.exe', source: 't' }),
     launcher: () => { throw new Error('access denied'); },
@@ -446,9 +512,11 @@ test('★ 拉起了但端点始终不落盘 ⇒ desktop_not_ready（**不是**"�
   let launched = 0;
   const { ensure } = createEnsurer({
     probe: async () => NO_SIDECAR,
-    // ★ 关键：拉起**之前**桌面端必须"没在跑"，否则 ensure 根本不会走拉起那条路，
-    //   这条测试就会退化成上一条（no_sidecar_appeared）——一个看起来通过、其实什么都没测的测试。
-    run: async () => (launched > 0 ? TASKLIST_REAL : TASKLIST_NO_MATCH),
+    // ★ 关键：拉起**之前**桌面端必须"没在跑"（管道 ENOENT），否则 ensure 根本不会走
+    //   拉起那条路，这条测试就会退化成 no_sidecar_appeared —— 一个看起来通过、
+    //   其实什么都没测的测试。
+    ...BROKER_GONE,
+    endpointFile: 'C:\\definitely-not-here\\endpoint.json',
     sleep: clk.sleep,
     now: clk.now,
     waitMs: 3000,
@@ -473,7 +541,7 @@ test('★ 桌面端在跑但不出 sidecar ⇒ no_sidecar_appeared（不是"去�
   const fx = endpointFixture({ staleMs: 60_000 });
   const { ensure } = createEnsurer({
     probe: async () => NO_SIDECAR,
-    run: async () => TASKLIST_REAL,
+    ...BROKER_UP,
     sleep: clk.sleep,
     now: clk.now,
     waitMs: 3000,
@@ -492,11 +560,16 @@ test('★ 桌面端在跑但不出 sidecar ⇒ no_sidecar_appeared（不是"去�
   assert.doesNotMatch(r.report.hint, /Start the WorkBuddy desktop and sign in/);
 });
 
-test('★★★ F2：进程在跑但 broker 端点**根本不存在** ⇒ ready 必须是 false（旧代码零校验写死 true）', async () => {
+test('★★★ F2：桌面端活着但 broker 端点**根本不存在** ⇒ ready 必须是 false（旧代码零校验写死 true）', async () => {
   const clk = fakeClock();
   const { ensure } = createEnsurer({
     probe: async () => NO_SIDECAR,
-    run: async () => TASKLIST_REAL,
+    // ★ 管道握手通过（⇒ `running:true`），但端点文件根本读不出来（⇒ `ready:false`）。
+    //   ★ 为什么必须用 `brokerProbe` 而不是 `brokerConnect`：`connectWbipc` 会先
+    //     `readEndpoint(endpointFile)`，文件不存在时它直接抛 DESKTOP_CLOSED ⇒
+    //     `running:false`，就走"没在跑"那一支了，这条用例根本到不了它要测的分支。
+    //     两件事必须能分开喂：管道活着、端点文件没有。
+    brokerProbe: async () => ({ running: true, error: null }),
     sleep: clk.sleep,
     now: clk.now,
     waitMs: 3000,
@@ -504,9 +577,9 @@ test('★★★ F2：进程在跑但 broker 端点**根本不存在** ⇒ ready 
     endpointFile: 'C:\\definitely-not-here\\endpoint.json',   // 永不存在
   });
   const r = await ensure();
-  assert.equal(r.report.desktop.running, true, '★ 进程确实在跑（这半句仍然为真）');
+  assert.equal(r.report.desktop.running, true, '★ 桌面端确实活着（这半句仍然为真）');
   assert.equal(r.report.desktop.ready, false,
-    '★ "进程在"与"broker 端点已就绪"是**两件事**，不能压进同一个布尔');
+    '★ "活着"与"broker 端点已就绪"是**两件事**，不能压进同一个布尔');
   assert.match(r.report.desktop.brokerDetail, /endpoint\.json/,
     '★ 归因要留下：不然 ready:false 和"桌面端刚起来还没写完"长得一模一样');
   // ★ 这条旧行为还会顺带污染投影：projectInstance 把它直接送到用户/模型眼前。
@@ -526,7 +599,7 @@ test('★★ F2·不制造假阴性：真机场景（桌面端在跑 + 端点在
       calls += 1;
       return calls < 3 ? NO_SIDECAR : { picked: PICKED, why: null, scanned: 1 };
     },
-    run: async () => TASKLIST_REAL,
+    ...BROKER_UP,
     sleep: clk.sleep,
     now: clk.now,
     waitMs: 10_000,
@@ -548,7 +621,7 @@ test('★ stage=waited：等的过程中 sidecar 出现 ⇒ ok，且记下等了
       calls += 1;
       return calls < 3 ? NO_SIDECAR : { picked: PICKED, why: null, scanned: 1 };
     },
-    run: async () => TASKLIST_REAL,
+    ...BROKER_UP,
     sleep: clk.sleep,
     now: clk.now,
     waitMs: 10_000,
@@ -573,7 +646,8 @@ test('★★★ F1·反面：残留端点 + 本轮桌面端**没重写** ⇒ des
   let launched = 0;
   const { ensure } = createEnsurer({
     probe: async () => NO_SIDECAR,
-    run: async () => (launched > 0 ? TASKLIST_REAL : TASKLIST_NO_MATCH),
+    ...BROKER_GONE,
+    endpointFile: 'C:\\definitely-not-here\\endpoint.json',
     sleep: clk.sleep,
     now: clk.now,
     waitMs: 30_000,
@@ -614,7 +688,8 @@ test('★★★ F1·回声：陈旧端点的那句 hint 不得说"桌面端没�
     let launched = 0;
     const { ensure } = createEnsurer({
       probe: async () => NO_SIDECAR,
-      run: async () => (launched > 0 ? TASKLIST_REAL : TASKLIST_NO_MATCH),
+      ...BROKER_GONE,
+    endpointFile: 'C:\\definitely-not-here\\endpoint.json',
       sleep: clk.sleep,
       now: clk.now,
       waitMs: 1000,
@@ -664,7 +739,8 @@ test('★★★ F1·正面：残留端点被本轮桌面端**重写** ⇒ ready:
   let launched = 0;
   const { ensure } = createEnsurer({
     probe: async () => (launched > 0 ? { picked: PICKED, why: null, scanned: 1 } : NO_SIDECAR),
-    run: async () => (launched > 0 ? TASKLIST_REAL : TASKLIST_NO_MATCH),
+    ...BROKER_GONE,
+    endpointFile: 'C:\\definitely-not-here\\endpoint.json',
     sleep: clk.sleep,
     now: clk.now,
     waitMs: 5000,
@@ -694,7 +770,8 @@ test('★ stage=started：桌面端没开 → 本轮拉起 → 端点落盘 → 
   let launched = 0;
   const { ensure } = createEnsurer({
     probe: async () => (launched > 0 ? { picked: PICKED, why: null, scanned: 1 } : NO_SIDECAR),
-    run: async () => (launched > 0 ? TASKLIST_REAL : TASKLIST_NO_MATCH),
+    ...BROKER_GONE,
+    endpointFile: 'C:\\definitely-not-here\\endpoint.json',
     sleep: clk.sleep,
     now: clk.now,
     waitMs: 5000,
@@ -732,11 +809,12 @@ test('★★ T2·就绪阶段被取消 ⇒ aborted，且**没有**跑满就绪�
   const ac = new AbortController();
   const clk = fakeClock(0, 1000);
   let launched = 0;
-  let tasklists = 0;
+  let endpointPolls = 0;
   const { ensure } = createEnsurer({
     probe: async () => NO_SIDECAR,
-    run: async () => { tasklists += 1; return launched > 0 ? TASKLIST_REAL : TASKLIST_NO_MATCH; },
-    sleep: clk.sleep,
+    ...BROKER_GONE,
+    endpointFile: 'C:\\definitely-not-here\\endpoint.json',
+    sleep: async (ms) => { endpointPolls += 1; await clk.sleep(ms); },
     now: clk.now,
     waitMs: 60_000,
     autoStart: () => true,
@@ -749,7 +827,7 @@ test('★★ T2·就绪阶段被取消 ⇒ aborted，且**没有**跑满就绪�
     '★ 用户自己取消的运行不得被报成"桌面端没起来"（两种处置完全不同）');
   assert.equal(r.report.desktop.launched, true, '取消那一刻桌面端确实已经被拉起了');
   assert.equal(r.report.desktop.ready, false);
-  assert.ok(tasklists <= 2, `取消后不该再发 tasklist（实际 ${tasklists} 次）`);
+  assert.ok(endpointPolls <= 1, `取消后不该再轮询端点（实际 ${endpointPolls} 次）`);
   assert.ok(r.report.waitedMs < 5000, `窗口是 60s，实际空转了 ${r.report.waitedMs}ms`);
   assert.doesNotMatch(r.report.hint, /did not finish starting/,
     '★ 提示也不能让他去看一个他刚亲手取消的桌面端窗口');
@@ -762,7 +840,6 @@ test('★★ 动手之前就取消 ⇒ 一个字节都不动（launcher 一次�
   let launches = 0;
   const { ensure } = createEnsurer({
     probe: async () => NO_SIDECAR,
-    run: async () => TASKLIST_NO_MATCH,
     sleep: clk.sleep,
     now: clk.now,
     waitMs: 60_000,
@@ -788,7 +865,7 @@ test('★ 取消落在等 sidecar 的窗口里 ⇒ aborted（这条本来就接�
       if (calls === 3) ac.abort();        // ★ 取消打在**等 sidecar**的那一段
       return NO_SIDECAR;
     },
-    run: async () => TASKLIST_REAL,
+    brokerProbe: async () => ({ running: true, error: null }),
     sleep: clk.sleep,
     now: clk.now,
     waitMs: 60_000,
@@ -802,7 +879,15 @@ test('★ 取消落在等 sidecar 的窗口里 ⇒ aborted（这条本来就接�
 });
 
 test('★ 每个失败码都必须有一句带处置动作的 hint（"再试一次"等于没写）', async () => {
-  const r = await createEnsurer({ probe: async () => NO_SIDECAR }).ensure();
+  const r = await createEnsurer({
+    probe: async () => NO_SIDECAR,
+    // ★ 用注入的探针，不让它去连真机 `~/.workbuddy/wbipc/endpoint.json`（纪律禁止）。
+    brokerProbe: async () => ({ running: false, error: null }),
+    sleep: async () => {},
+    now: (() => { let t = 0; return () => (t += 100); })(),
+    waitMs: 100,
+    endpointFile: 'C:\\definitely-not-here\\endpoint.json',
+  }).ensure();
   const hint = r.report.hint;
   assert.ok(typeof hint === 'string' && hint.length > 30, 'hint 必须是一句可执行的话');
   assert.doesNotMatch(hint, /再试一次|retry later|TODO/i);
@@ -813,7 +898,7 @@ test('attempts 时间线有界（会进作业输出，不能无限长）', async
   const fx = endpointFixture({ staleMs: 30_000 });
   const { ensure } = createEnsurer({
     probe: async () => NO_SIDECAR,
-    run: async () => TASKLIST_REAL,
+    brokerProbe: async () => ({ running: true, error: null }),
     sleep: clk.sleep,
     now: clk.now,
     waitMs: 600_000,          // 故意给一个巨大的窗口
@@ -836,12 +921,13 @@ test('★★★ F4：3 个并发 ensure() ⇒ 桌面端只被拉起 1 次', asyn
   // ★ 实测旧行为：launcher 被调 3 次。三个实例抢**同一个凭据运行时**（`desktop.js` 模块头
   //   记的头号禁忌），而 `autoStartDesktop` 默认为开 —— 模型连发两个任务、用户点重试
   //   都能让两个请求落在同一秒内，各自看到"没在跑"。
+  // ★ 2026-10-10：判据从"各自看到 tasklist 没有"换成"各自看到 broker 管道 ENOENT"。
   const fx = endpointFixture({ staleMs: 3 * 3600_000 });
   let launches = 0;
-  let tasklists = 0;
+  let probed = 0;
   const { ensure } = createEnsurer({
     probe: async () => NO_SIDECAR,
-    run: async () => { tasklists += 1; return launches > 0 ? TASKLIST_REAL : TASKLIST_NO_MATCH; },
+    brokerProbe: async () => { probed += 1; return { running: false, error: null }; },
     sleep: async () => {},
     now: (() => { let t = 0; return () => (t += 100); })(),
     waitMs: 1000,
@@ -857,7 +943,7 @@ test('★★★ F4：3 个并发 ensure() ⇒ 桌面端只被拉起 1 次', asyn
   const rs = await Promise.all([ensure(), ensure(), ensure()]);
   fx.cleanup();
   assert.equal(launches, 1, '★ 同一时刻只允许存在一次拉起（否则就是多开一个桌面端抢凭据运行时）');
-  assert.ok(tasklists <= 3, `★ 三次调用共用同一轮探测（探测 1 次 + 就绪轮询若干），实际 ${tasklists} 次`);
+  assert.ok(probed <= 3, `★ 三次调用共用同一轮探测，实际 ${probed} 次`);
   // ★ 三份结论必须一致 —— 后来者拿到的是同一轮的结论，不是"我什么都没查到"
   assert.equal(new Set(rs.map((r) => r.report.stage)).size, 1);
   assert.equal(new Set(rs.map((r) => r.report.code)).size, 1);
@@ -868,7 +954,7 @@ test('★★ F4·收尾：in-flight 结算后必须清空（否则第二轮请�
   let allowPicked = false;
   const { ensure } = createEnsurer({
     probe: async () => (allowPicked ? { picked: PICKED, why: null, scanned: 1 } : NO_SIDECAR),
-    run: async () => TASKLIST_REAL,
+    ...BROKER_UP,
     sleep: async () => {},
     now: (() => { let t = 0; return () => (t += 100); })(),
     waitMs: 1000,
@@ -891,56 +977,37 @@ test('★★ F4·收尾：in-flight 结算后必须清空（否则第二轮请�
 // 6.6 归因不许在半路丢（F6b / F5）
 // ══════════════════════════════════════════════════════════════════════════════
 
-test('★★★ F6(b)：就绪窗口全程枚举失败 ⇒ 归因落在 probeError（与"真的超时"分得开）', async () => {
-  // ★ `waitForDesktop` 的 `ready:false` 有**两个**原因：端点没出现，**或**整个窗口
-  //   tasklist 全程失败（`ready.error`）。后者桌面端可能好得很，坏的是枚举 ——
-  //   而旧代码从不把 `ready.error` 抄进 `desktop.probeError`，
-  //   于是回执里 `probeError:null, ready:false` 和超时**长得一模一样**。
+test('★★★ F6(b)：活性探针的错与就绪窗口的错必须分开落（不许互相顶替）', async () => {
+  // ★ 旧代码有两个来源：`isDesktopRunning()` 的 error（tasklist 枚举失败）与
+  //   `waitForDesktop()` 的 `ready.error`（整个就绪窗口 tasklist 全程失败）。
+  //   2026-10-10 之后，就绪窗口里**只剩**"端点文件读不读得出"一件事，而
+  //   `isBrokerReady` 自己把它收敛成 `{ready:false, detail}` 从不外抛
+  //   ⇒ `ready.error` 恒为 null。于是 **`probeError` 只有一个来源：活性探针**。
+  //   ★ 这条钉新不变量：两件事各自落在各自字段里，读回执的人不会把
+  //     "活性探针的原文"当成"就绪超时的原因"，反过来也一样。
   const clk = fakeClock(0, 1000);
-  let launched = 0;
   const { ensure } = createEnsurer({
     probe: async () => NO_SIDECAR,
-    run: async () => {
-      if (launched === 0) return TASKLIST_NO_MATCH;         // 拉起前：确实没在跑
-      throw new Error('tasklist blocked by policy');        // ★ 拉起后：枚举一直坏
-    },
+    ...BROKER_GONE,
     sleep: clk.sleep,
     now: clk.now,
     waitMs: 1000,
     autoStart: () => true,
     findExe: () => ({ path: 'C:\\x\\WorkBuddy.exe', source: 't' }),
-    launcher: () => { launched += 1; return { pid: 999 }; },
+    launcher: () => ({ pid: 999 }),
     endpointFile: 'C:\\definitely-not-here\\endpoint.json',
   });
   const r = await ensure();
   assert.equal(r.report.code, ENSURE_CODE.DESKTOP_NOT_READY);
-  assert.equal(r.report.desktop.probeError, 'tasklist blocked by policy',
-    '★ 归因必须一路带到回执（否则读的人会去查错的那台机器）');
-  assert.ok(
-    r.report.attempts.some((a) => a.stage === 'ready' && /enumeration kept failing/.test(a.detail)),
-    `时间线要留痕：${JSON.stringify(r.report.attempts)}`,
-  );
-});
-
-test('★ F6(b)·对照：真的是"等超时"时 probeError 仍是 null（两者必须分得开）', async () => {
-  const clk = fakeClock(0, 1000);
-  let launched = 0;
-  const { ensure } = createEnsurer({
-    probe: async () => NO_SIDECAR,
-    run: async () => (launched > 0 ? TASKLIST_REAL : TASKLIST_NO_MATCH),   // 枚举一直好，只是没端点
-    sleep: clk.sleep,
-    now: clk.now,
-    waitMs: 1000,
-    autoStart: () => true,
-    findExe: () => ({ path: 'C:\\x\\WorkBuddy.exe', source: 't' }),
-    launcher: () => { launched += 1; return { pid: 999 }; },
-    endpointFile: 'C:\\definitely-not-here\\endpoint.json',
-  });
-  const r = await ensure();
-  assert.equal(r.report.code, ENSURE_CODE.DESKTOP_NOT_READY);
-  assert.equal(r.report.desktop.probeError, null, '★ 超时不许背一个它没干过的归因');
-  assert.match(r.report.desktop.brokerDetail, /endpoint\.json/,
-    '★ 超时的归因落在"端点没有"上（而不是枚举坏了）');
+  // ① 活性探针那一侧：桌面端没开（端点文件读不到 / 管道 ENOENT）的归因。
+  assert.match(r.report.desktop.probeError ?? '', /endpoint not found|no longer exists/i,
+    '★ 活性探针的原文必须留在 probeError 上（它是"要不要拉起"的判据来源）');
+  // ② 就绪窗口那一侧：端点文件不存在的归因。
+  assert.match(r.report.desktop.brokerDetail ?? '', /endpoint\.json unreadable or incomplete/,
+    '★ 就绪窗口的归因必须落在 brokerDetail 上');
+  // ③ 两句不是同一句话 —— 合成一句就等于把两种局面压平。
+  assert.notEqual(r.report.desktop.probeError, r.report.desktop.brokerDetail,
+    '★ 活性探针与就绪窗口是两件事，归因不许互相顶替');
 });
 
 test('★★ F5：就绪窗口不得被"等 sidecar 的窗口"顶掉（DEFAULT_READY_TIMEOUT_MS 必须真的生效）', async () => {
@@ -950,7 +1017,8 @@ test('★★ F5：就绪窗口不得被"等 sidecar 的窗口"顶掉（DEFAULT_R
   let launched = 0;
   const { ensure } = createEnsurer({
     probe: async () => NO_SIDECAR,
-    run: async () => (launched > 0 ? TASKLIST_REAL : TASKLIST_NO_MATCH),
+    ...BROKER_GONE,
+    endpointFile: 'C:\\definitely-not-here\\endpoint.json',
     sleep: clk.sleep,
     now: clk.now,
     waitMs: 3000,                 // ← 故意比 90s 小得多
@@ -998,6 +1066,12 @@ const failingDispatcher = () => createDispatcher({
   sessionMode: () => '', workspace: () => '', createNewConversation: () => false,
   autoStartDesktop: () => false,
   instanceTimeoutMs: () => 1000,
+  // ★ 2026-10-10：显式注入 broker 探针与端点文件。不注入的话，ensurer 的默认判据走
+  //   `os.homedir()/.workbuddy/wbipc/endpoint.json` —— 本机 WorkBuddy 正在运行时会连上
+  //   **真** broker 管道并挂死在握手上（实测 >20s 不返回；CI 无桌面端时才"碰巧"快失败）。
+  //   注入 ⇒ 结论确定、零真机依赖，与"这类测试绝不能有副作用"的纪律一致。
+  brokerProbe: async () => ({ running: false, error: null }),
+  endpointFile: 'C:\\definitely-not-here\\endpoint.json',
 });
 
 test('★★ `instance` 必须活着穿过 startGatewayRun 的 gateway 白名单（与 sessionOrigin 同一个坑）', async () => {

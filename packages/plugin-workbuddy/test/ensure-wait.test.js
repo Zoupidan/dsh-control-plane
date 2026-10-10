@@ -15,12 +15,17 @@
 //   而不是靠人相信。真实墙钟只出现在第 ⑤ 条里，且那一条的唯一目的就是证明**注入真的生效**
 //   （若 `totalWaitMs` 被忽略，那条会转满 10 分钟而被判超时——那是一个真探测器）。
 //
-// ★ fixture 纪律：`TASKLIST_REAL` 是 2026-09-30 本机 `tasklist /FI "IMAGENAME eq WorkBuddy.exe" /NH /FO CSV`
-//   的逐字输出，与邻居 `gateway-instance-ensure.test.js` 同源同纪律：不编造。
+// ★ fixture 纪律：`BROKER_UP` / `BROKER_DOWN` 是 broker 管道探针（`isDesktopRunning`）的
+//   两个注入面。2026-10-10 起这个探针**不再起 tasklist 进程**：它连
+//   `~/.workbuddy/wbipc/endpoint.json` 里那个命名管道并完成一次 HMAC 握手
+//   （Owner 认可的唯一合法通道）。测试注入假 `connect`：管道"在" ⇒ running，
+//   "不在"（ENOENT）⇒ 没在跑。绝不碰真机桌面端。
 //   端点夹具一律落在 `tmp/`，**绝不碰** `~/.workbuddy/`（也绝不读 `mcp-config.json`）。
-//   这套测试没有任何一条会去碰真实桌面端：不注入 `launcher`，且 `run` 是纯函数。
+//   这套测试没有任何一条会去碰真实桌面端：不注入 `launcher`，且 `connect` 是纯函数。
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createHmac } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -30,22 +35,45 @@ import {
   ENSURE_CODE, ENSURE_PHASE, ENSURE_STAGE, projectInstance,
 } from '../src/host/gateway/ensure.js';
 
-// 真机逐字（2026-09-30 20:40，7 个 WorkBuddy.exe）
-const TASKLIST_REAL = [
-  '"WorkBuddy.exe","23696","Console","1","211,248 K"',
-  '"WorkBuddy.exe","15192","Console","1","97,924 K"',
-  '"WorkBuddy.exe","30800","Console","1","55,832 K"',
-  '"WorkBuddy.exe","7364","Console","1","289,920 K"',
-  '"WorkBuddy.exe","27584","Console","1","226,700 K"',
-  '"WorkBuddy.exe","40344","Console","1","94,652 K"',
-  '"WorkBuddy.exe","38340","Console","1","83,992 K"',
-].join('\r\n');
+const EP_BYTES = JSON.stringify({ endpoint: '\\\\.\\pipe\\wbipc-fixture', ticket: 'fixture-ticket' });
 
-const NO_SIDECAR = { picked: null, why: { code: 'all_busy', detail: 'n' }, scanned: 3 };
-const PICKED = { pid: 4242, url: 'http://127.0.0.1:1234', kind: 'interactive' };
+/**
+ * 假管道客户端：按 `alive` 决定这次 connect 成不成。
+ *
+ * ★★ `alive:false` 必须在 **socket 上发 error**，不能同步 throw ★★
+ * 真实的 `net.connect` 从不同步抛错 —— 它在 socket 上发 `error`，
+ * 而 `wbipc.js` 的 `classifyConnectFailure` 正是挂在那个事件上的。
+ * 同步 throw 会把"管道不在了"变成"代码抛异常"，`isDesktopRunning` 于是
+ * 只能判 `running:null`（判不出来）而不是 `running:false`（确定的否定答案）——
+ * 归因整个错，`autoStartDesktop` 也跟着失效。
+ */
+function fakeConnect({ alive = true } = {}) {
+  const impl = (endpoint) => {
+    const sock = new EventEmitter();
+    sock.write = () => true;
+    sock.destroy = () => {};
+    if (!alive) {
+      setImmediate(() => {
+        const e = new Error(`connect ENOENT ${endpoint}`);
+        e.code = 'ENOENT';
+        sock.emit('error', e);
+      });
+      return sock;
+    }
+    // 管道连上之后**不完成握手**：回一个 server_proof 对不上的 challenge，
+    // `connectWbipc` 据此判定"端点不可信赖"而拒绝 ⇒ `running:null`（判不出来）。
+    setImmediate(() => {
+      sock.emit('connect');
+      sock.emit('data', Buffer.from(JSON.stringify({
+        type: 'session_challenge', protocol: 1, server_nonce: 'n', server_proof: 'bad',
+      }) + '\n'));
+    });
+    return sock;
+  };
+  return impl;
+}
 
 /** 与邻居同款：broker 端点夹具（`ready === true` 只有在文件真在那儿时才是**真话**）。 */
-const EP_BYTES = JSON.stringify({ endpoint: '\\\\.\\pipe\\wbipc-fixture', ticket: 'fixture-ticket' });
 function endpointFixture({ staleMs = 0 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'wb-wait-'));
   const file = join(dir, 'endpoint.json');
@@ -54,6 +82,59 @@ function endpointFixture({ staleMs = 0 } = {}) {
   utimesSync(file, mtime / 1000, mtime / 1000);
   return { file, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
+
+/**
+ * 桌面端"活着"：完整跑完一次 HMAC 握手。
+ *
+ * ★ 为什么不"连上就算活"：`isDesktopRunning` 的真契约是"broker 此刻应不应答"，
+ *   而应答应由**服务端自证**（`session_challenge` → `session_prove`）来证明。
+ *   这个假件按协议真的算一遍 proof，于是它验的是"服务端自证通过后判活"——
+ *   而不是"只要 connect 回调了就判活"。后者会把一个连上但回话的不是我们那个
+ *   broker 的管道也判成桌面端活着（而那正是 HMAC 双向证明要防的事）。
+ *
+ * <p>★ 假件自己实现一遍 transcript/HMAC（12 行），不从被测模块里 import：
+ *   那会把"协议实现"和"协议假件"绑成同一份代码，协议一改两边同时改、
+ *   於是测试再也验不出协议漂移。
+ */
+/** broker 端点的 ticket（与 {@link EP_BYTES} 里那一份同源，假件要靠它算 proof）。 */
+const BROKER_TICKET = 'fixture-ticket';
+
+const NO_SIDECAR = { picked: null, why: { code: 'all_busy', detail: 'n' }, scanned: 3 };
+const PICKED = { pid: 4242, url: 'http://127.0.0.1:1234', kind: 'interactive' };
+
+const BROKER_UP = (endpointFile) => ({
+  brokerConnect: (endpoint) => {
+    const sock = new EventEmitter();
+    let clientNonce = '';
+    sock.write = (line) => {
+      const f = JSON.parse(String(line));
+      if (f.type === 'session_hello') clientNonce = String(f.client_nonce ?? '');
+      if (f.type === 'session_prove') {
+        setImmediate(() => sock.emit('data', Buffer.from('{"type":"session_hello_ack","connection_epoch":1}\n')));
+      }
+      return true;
+    };
+    sock.destroy = () => {};
+    setImmediate(() => {
+      sock.emit('connect');
+      const serverNonce = 'srv-nonce';
+      const parts = ['wbipc-s', '1', endpoint, clientNonce, serverNonce];
+      const chunks = [];
+      for (const p of parts) {
+        const b = Buffer.from(p, 'utf8');
+        const len = Buffer.alloc(4);
+        len.writeUInt32BE(b.length);
+        chunks.push(len, b);
+      }
+      const proof = createHmac('sha256', Buffer.from(BROKER_TICKET, 'utf8'))
+        .update(Buffer.concat(chunks)).digest('base64url');
+      sock.emit('data', Buffer.from(JSON.stringify({
+        type: 'session_challenge', protocol: 1, server_nonce: serverNonce, server_proof: proof,
+      }) + '\n'));
+    });
+    return sock;
+  },
+});
 
 /**
  * 假时钟：`sleep(ms)` 按**传进来的那个 ms**推进（不是一个写死的步长）。
@@ -84,7 +165,7 @@ test('★★ ① 第一窗口到点后 sidecar 才出现 ⇒ 成功（旧实现�
       // 第 6 次探测（第 5 轮结束时 t 恰好过 1000ms 的第一窗口）才出现 ⇒ 必须走过续等。
       return probes >= 7 ? { picked: PICKED, why: null, scanned: 3 } : NO_SIDECAR;
     },
-    run: async () => TASKLIST_REAL,
+    ...BROKER_UP(fx.file),
     sleep: clk.sleep,
     now: clk.now,
     endpointFile: fx.file,
@@ -121,7 +202,7 @@ test('★★ ② 一直不出现、耗尽总上限 ⇒ 失败（code 仍为 no_s
   const fx = endpointFixture({ staleMs: 60_000 });
   const { ensure } = createEnsurer({
     probe: async () => NO_SIDECAR,
-    run: async () => TASKLIST_REAL,
+    ...BROKER_UP(fx.file),
     sleep: clk.sleep,
     now: clk.now,
     endpointFile: fx.file,
@@ -170,7 +251,7 @@ test('★★ ③ 续等**期间**取消 ⇒ aborted（不许把用户自己的�
       if (probes === 6) ac.abort();
       return NO_SIDECAR;
     },
-    run: async () => TASKLIST_REAL,
+    ...BROKER_UP(fx.file),
     sleep: clk.sleep,
     now: clk.now,
     endpointFile: fx.file,
@@ -205,7 +286,7 @@ test('★★ ④ 续等期间 onPhase 被**再次**推进，且不得声称进�
       probes += 1;
       return probes >= 7 ? { picked: PICKED, why: null, scanned: 3 } : NO_SIDECAR;
     },
-    run: async () => TASKLIST_REAL,
+    ...BROKER_UP(fx.file),
     sleep: clk.sleep,
     now: clk.now,
     endpointFile: fx.file,
@@ -244,7 +325,7 @@ test('★★ ⑤ 总上限必须真的可注入（真实墙钟 60ms 的窗口：
   const fx = endpointFixture({ staleMs: 60_000 });
   const { ensure } = createEnsurer({
     probe: async () => NO_SIDECAR,
-    run: async () => TASKLIST_REAL,
+    ...BROKER_UP(fx.file),
     sleep: (ms) => new Promise((r) => { setTimeout(r, Math.min(Number(ms) || 1, 5)); }),
     now: Date.now,
     endpointFile: fx.file,

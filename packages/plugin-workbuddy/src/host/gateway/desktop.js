@@ -24,7 +24,7 @@
  *   1. **不**代替桌面端注入凭据：登录态在桌面进程内，凭据引导走父子 IPC，我们复现不了也不该复现；
  *   2. **不**把"我拉起了 WorkBuddy.exe"说成"任务可跑了"——拉起成功只推进到 `started`，
  *      真正的验收是 sidecar 出现并握手成功（`ensure.js` 负责）；
- *   3. **不**重启用户已开的桌面端：`isDesktopRunning` 为真时本模块一个字节都不写。
+ *   3. **不**重启用户已开的桌面端：本模块判定桌面端已经在跑时一个字节都不写。
  *
  * <p>就绪信号为什么用 broker 端点文件：真机 18:00:13 进程起来、18:00:15 `endpoint.json` 落盘
  *   （`connectWbipc` 顺带会认它，见 `wbipc.js`），这是**唯一**一个"桌面端已完成启动"的可读信号 ——
@@ -34,12 +34,24 @@
  * `wbipc.js:58` 记着一条真机事实：`endpoint.json` 在桌面退出时**不删**、重启时**滞后异步重写**。
  * 于是"用户昨天开过、今天关着跑任务"这个**最常见**的局面下：
  * <pre>
- *   tasklist 看不到进程 → autoStart 拉起 → 进程刚可见 → 上一轮残留的 endpoint.json 还在
- *     ⇒ 立刻 ready:true，冷启动窗口（DEFAULT_READY_TIMEOUT_MS）被跳到第一轮轮询
+ *   端点文件是上一轮残留的 → 立刻 ready:true，冷启动窗口（DEFAULT_READY_TIMEOUT_MS）被跳到第一轮轮询
  *     ⇒ 报告里落一句**假的** "broker endpoint present"
  * </pre>
  *  ⇒ 就绪判定必须带**新鲜度**：`notBeforeMs`（= 拉起那一刻）之前写的端点不算数。
  *     ★ 只**读**这个文件（`stat`），**一个字节都不写** —— 它归桌面端所有。
+ *
+ * <p>★★★ 2026-10-10 P0 进程出口清理：`tasklist` 枚举已删，换成 broker 管道探针 ★★★★
+ * 本模块原先靠 `tasklist /FI "IMAGENAME eq WorkBuddy.exe" /NH /FO CSV` 枚举进程来判断
+ * "桌面端在不在"。那是**控制台进程**，Owner 硬约束（插件任何路径都不许拉起显/隐 Shell
+ * 或控制台进程）下整体删除，连带 `parseTasklistPids` 一并删除。
+ * <pre>
+ *   删除前：tasklist 枚举 ⇒ running 三态（在跑 / 没跑 / 枚举失败）；枚举失败时**不**去拉起。
+ *   删除后：broker 命名管道握手 ⇒ running 二态（连上 / 连不上），连不上的原因进 `error`。
+ * </pre>
+ * 这不是降级而是换了一把更准的尺子：tasklist 答"有没有这个进程"，管道握手答
+ * "桌面端的 broker 此刻应不应答"—— 第 0 站要问的本来就是后者。而且 `endpoint.json`
+ * 退出时不删（`wbipc.js:58`），只看文件存在与否会把残留端点读成"桌面端开着"。
+ * 详见 {@link isDesktopRunning} 的注释。
  *
  * 约束：本文件属于 packages 下的 src（CI ② 扫描范围）—— 不得出现裸进程出口字面量。
  * @module host/gateway/desktop
@@ -48,9 +60,15 @@ import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { readEndpoint } from './wbipc.js';
+import { readEndpoint, connectWbipc } from './wbipc.js';
 
-/** 桌面端主程序镜像名（`tasklist /FI "IMAGENAME eq …"` 的判据）。 */
+/**
+ * 桌面端主程序镜像名。
+ *
+ * <p>★ 它**不再**是任何进程枚举的判据（`tasklist /FI "IMAGENAME eq …"` 已删）。
+ *   现在只用于**回执里的自述字段**与"这就是我们要拉起的那个程序"的常量声明；
+ *   "桌面端在不在"由 {@link isDesktopRunning} 的 broker 管道探针回答。
+ */
 export const DESKTOP_IMAGE = 'WorkBuddy.exe';
 
 /**
@@ -65,7 +83,7 @@ export const DESKTOP_KNOWN_PATHS = [
   { envs: ['LOCALAPPDATA'], rel: 'Programs/WorkBuddy/WorkBuddy.exe' },
 ];
 
-/** 拉起后等待"进程在 + broker 端点落盘"的上限。Electron 冷启动实测 2s 起，留足冷盘/杀软余量。 */
+/** 拉起后等待"broker 端点落盘"的上限。Electron 冷启动实测 2s 起，留足冷盘/杀软余量。 */
 export const DEFAULT_READY_TIMEOUT_MS = 90_000;
 
 /**
@@ -114,34 +132,6 @@ function isReadonlyFile(p) {
 }
 
 /**
- * 解析 `tasklist /NH /FO CSV` 的输出，取指定镜像名的 pid 列表。
- *
- * <p>★ 为什么用 CSV + `/NH` 而不是抓表头对齐的固定列：Windows 的 `tasklist` 列数/列名随
- *   "映像名称 / Image name" 语言不同而变，**固定列解析在中文版上整条失配**。CSV 行首固定带引号，
- *   字段数稳定（映像名, PID, 会话名, 会话号, 内存），且不匹配时输出是本地化的
- *   `INFO: No tasks are running which match the specified criteria.`（英文/中文都不含 `"` + 数字的形态）
- *   —— **正例可精确认、负例自然落空**，不需要识别任何一句提示文案。
- *
- * @param {string} text
- * @param {string} [image]
- * @returns {number[]} 升序、去重的 pid
- */
-export function parseTasklistPids(text, image = DESKTOP_IMAGE) {
-  const want = image.toLowerCase();
-  const out = [];
-  for (const line of String(text ?? '').split(/\r?\n/)) {
-    const s = line.trim();
-    if (!s.startsWith('"')) continue;           // 表头/INFO 行一律跳过（不猜本地化文案）
-    const cols = s.split('","').map((c) => c.replace(/^"|"$/g, '').trim());
-    if (cols.length < 2) continue;
-    if (cols[0].toLowerCase() !== want) continue;
-    const pid = Number(cols[1]);
-    if (Number.isInteger(pid) && pid > 0) out.push(pid);
-  }
-  return [...new Set(out)].sort((a, b) => a - b);
-}
-
-/**
  * 枚举桌面端可执行文件路径（纯读，不启动）。
  *
  * @param {Record<string, string | undefined>} [env]
@@ -166,24 +156,62 @@ export function findDesktopExe(env = process.env) {
 }
 
 /**
- * 桌面端在不在（只看进程，不改任何东西）。
+ * broker 管道连通性探测的超时（毫秒）。
  *
- * <p>★ 进程枚举失败（`tasklist` 不可用/被策略挡）与"确实没在跑"**必须分开**：
- *   两者都返回 `running:false` 会让上层去拉起一个已经开着的桌面端（多开实例 = 抢同一个
- *   凭据运行时，正是 `WorkBuddy__a85776a06….log:68` 那类失败的高发场景）。
- *
- * @param {{run: (spec: {argv: string[]}) => Promise<string>}} deps
- * @param {{image?: string, timeoutMs?: number}} [opts]
- * @returns {Promise<{running: boolean, pids: number[], error: string|null}>}
+ * <p>★ 本地命名管道 + 一次 HMAC 握手，正常是几毫秒。给到 1.5s 是为了冷盘 / 杀软
+ *   扫管道名的余量；再大就只会把 `ensure()` 的第 0 站拖长。
  */
-export async function isDesktopRunning({ run }, opts = {}) {
-  const image = opts.image ?? DESKTOP_IMAGE;
+export const BROKER_PROBE_TIMEOUT_MS = 1_500;
+
+/**
+ * 桌面端在不在 —— 只连 broker 命名管道，**不起任何进程**。
+ *
+ * <p>★★ 2026-10-10：判据从"列进程"换成"broker 管道连得上吗" ★★
+ * 原实现起 `tasklist /FI "IMAGENAME eq WorkBuddy.exe" /NH /FO CSV` 枚举进程。
+ * 那是控制台进程，Owner 硬约束（插件任何路径都不许拉起显/隐 Shell/控制台进程）下删除。
+ * 换成的这个探针走的是 Owner 认可的**唯一合法通信通道**：`~/.workbuddy/wbipc/endpoint.json`
+ * 里那个命名管道。连得上并完成 HMAC 握手 ⇒ 桌面端的 broker 此刻活着。
+ *
+ * <p>★ 为什么它比 tasklist 更好（不是仅仅"因为不能用进程"）：
+ * <ul>
+ *   <li>tasklist 答的是"有没有一个叫 WorkBuddy.exe 的进程"；管道握手答的是
+ *       "桌面端的 broker 现在应不应答"—— 后者才是第 0 站真正要问的那一句。</li>
+ *   <li>`endpoint.json` 在桌面退出时**不删**（`wbipc.js:58` 真机事实）。只看文件
+ *       存在与否，会把"昨天留下的残留"读成"桌面端正开着"，于是 `autoStartDesktop`
+ *       永远不触发；只看文件 + 管道连通性，残留端点会因管道 ENOENT 被正确判成"没在跑"。</li>
+ *   <li>多开实例是 `desktop.js` 模块头记的头号禁忌（抢同一个凭据运行时）。管道连不上
+ *       才去拉起 ⇒ 方向是安全的：宁可漏拉，也不多开。</li>
+ * </ul>
+ *
+ * <p>★ 三种"连不上"分两档，**处置不同**（沿用 tasklist 时代"枚举失败 ≠ 没在跑"的纪律）：
+ * <pre>
+ *   管道 ENOENT / 文件读不到（WBIPC_MISS.ENDPOINT_GONE、DESKTOP_CLOSED）
+ *       ⇒ `running: false` —— 确定的否定答案，可以走"要不要拉起"那一支。
+ *   协议不信赖 / 握手超时 / 其它
+ *       ⇒ `running: null` —— 判不出来。此时**不许**去拉起：多开一个实例
+ *          会和已开的那一个抢同一个凭据运行时（头号禁忌）。走 DESKTOP_PROBE_FAILED。
+ * </pre>
+ *
+ * @param {{endpointFile?: string, connect?: typeof import('node:net').connect}} [opts]
+ *   `connect` 只为可测而开（测试注入假管道客户端，绝不碰真机）。
+ * @returns {Promise<{running: boolean|null, error: string|null}>}
+ */
+export async function isDesktopRunning(opts = {}) {
   try {
-    const text = await run({ argv: ['tasklist', '/FI', `IMAGENAME eq ${image}`, '/NH', '/FO', 'CSV'] });
-    const pids = parseTasklistPids(text, image);
-    return { running: pids.length > 0, pids, error: null };
+    const s = await connectWbipc({
+      timeoutMs: BROKER_PROBE_TIMEOUT_MS,
+      ...(typeof opts.endpointFile === 'string' ? { endpointFile: opts.endpointFile } : {}),
+      ...(typeof opts.connect === 'function' ? { connectImpl: opts.connect } : {}),
+    });
+    s.close();   // 只做活性探测，不占着会话
+    return { running: true, error: null };
   } catch (e) {
-    return { running: false, pids: [], error: e instanceof Error ? e.message : String(e) };
+    const error = e instanceof Error ? e.message : String(e);
+    // `classifyConnectFailure` 已经把"管道不在了 / 桌面没开"翻成这两个码；
+    // 别的（协议不信赖、超时）保持原样 ⇒ 判不出来。
+    const KNOWN_DOWN = new Set(['wbipc_endpoint_gone', 'wbipc_desktop_closed']);
+    const code = e !== null && typeof e === 'object' ? e.code : undefined;
+    return { running: KNOWN_DOWN.has(code) ? false : null, error };
   }
 }
 
@@ -230,13 +258,16 @@ export async function isBrokerReady(opts = {}) {
 /**
  * 拉起桌面端（**一次性**，不等待退出）。
  *
- * <p>★ 为什么不复用 `makeSeamRunner`：那个 runner 的契约是"跑完拿 stdout"，
- *   而 `WorkBuddy.exe` 是常驻 GUI —— 等它退出等于永远等不到。Electron 冷启动还会 fork 出
- *   一串子进程，`graceMs`/drain 那套在"父进程一直活着"时毫无意义。
+ * <p>★ 为什么不复用"跑完拿 stdout"的 runner：`WorkBuddy.exe` 是常驻 GUI ——
+ *   等它退出等于永远等不到。Electron 冷启动还会 fork 出一串子进程，
+ *   `graceMs`/drain 那套在"父进程一直活着"时毫无意义。
  *
  * <p>★ 为什么不 `detached`：本地 seam 在 win32 上把 `detached` 写死为 false
  *   （`dsh-subprocess-local/lib/runner-launch-*.js:1037`），且该 seam 不建 Job Object ——
  *   实测无 `KILL_ON_JOB_CLOSE` 一类父死子亡机制 ⇒ dsh 退出后桌面端继续存活，符合"启动它"的语义。
+ *
+ * <p>★ 这条是 2026-10-10 清理后**仅剩**的进程出口，且它是合法的：目标是 WorkBuddy
+ *   桌面端 GUI 进程（Owner 认可的唯一通信通道宿主），不是 Shell、不是控制台、不是 CLI。
  *
  * @param {{launcher: (spec: {argv: string[]}) => {done?: Promise<any>}}} deps
  *   `launcher` 由 `apply.js` 接官方 seam（`ctx.subprocess.spawn`）构造后**作为依赖注入** ——
@@ -257,23 +288,25 @@ export async function launchDesktop({ launcher }, { exe, image = DESKTOP_IMAGE }
 }
 
 /**
- * 等待桌面端就绪（进程在 **且** broker 端点**本轮**落盘）。
+ * 等待桌面端就绪（broker 端点**本轮**落盘）。
  *
- * @param {object} deps `run`（进程枚举）+ 可注入的 `sleep`/`now`（测试不必真等）
- * @param {{timeoutMs?: number, pollMs?: number, image?: string, endpointFile?: string,
+ * <p>★ 2026-10-10 起这里**不再**枚举进程：`waitForDesktop` 只管 broker 端点是否**本轮**落盘，
+ *   "桌面端在不在"由 {@link isDesktopRunning} 的 broker 管道探针在 `ensure.js` 里先问一次。
+ *   两件事分开问：管道探针答"活不活"，本函数答"这一轮启动走完了没"。
+ *
+ * @param {object} deps 可注入的 `sleep`/`now`（测试不必真等）
+ * @param {{timeoutMs?: number, pollMs?: number, endpointFile?: string,
  *          notBeforeMs?: number, signal?: AbortSignal}} [opts]
  *   `notBeforeMs` = 本轮拉起那一刻（真实墙钟）；`signal` 让调用方的取消能**打断**这个轮询。
- * @returns {Promise<{ready: boolean, pids: number[], waitedMs: number, error: string|null,
+ * @returns {Promise<{ready: boolean, waitedMs: number, error: string|null,
  *                    lastDetail: string|null, aborted: boolean, stale: boolean}>}
  */
-export async function waitForDesktop({ run, sleep, now }, opts = {}) {
+export async function waitForDesktop({ sleep, now }, opts = {}) {
   const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : DEFAULT_READY_TIMEOUT_MS;
   const pollMs = Number.isFinite(opts.pollMs) && opts.pollMs > 0 ? opts.pollMs : DEFAULT_POLL_MS;
   const signal = opts.signal ?? null;
   const t0 = now();
   let lastDetail = null;
-  let lastError = null;
-  let lastPids = [];
   let sawStale = false;
   for (;;) {
     // ★ 取消必须在**每轮顶部**就认：等桌面端启动是这段里最长的一步（默认 90s），
@@ -281,27 +314,22 @@ export async function waitForDesktop({ run, sleep, now }, opts = {}) {
     //   写成环境故障**，然后让他去看一个他刚刚亲手关掉的窗口。
     if (signal?.aborted) {
       return {
-        ready: false, pids: lastPids, waitedMs: now() - t0, error: lastError,
+        ready: false, waitedMs: now() - t0, error: null,
         lastDetail, aborted: true, stale: sawStale,
       };
     }
-    const proc = await isDesktopRunning({ run }, opts);
-    if (proc.error !== null) lastError = proc.error;
-    if (proc.pids.length > 0) lastPids = proc.pids;
-    if (proc.running) {
-      const broker = await isBrokerReady(opts);
-      if (broker.ready) {
-        return {
-          ready: true, pids: proc.pids, waitedMs: now() - t0, error: null,
-          lastDetail: null, aborted: false, stale: false,
-        };
-      }
-      lastDetail = broker.detail;
-      if (broker.stale) sawStale = true;
+    const broker = await isBrokerReady(opts);
+    if (broker.ready) {
+      return {
+        ready: true, waitedMs: now() - t0, error: null,
+        lastDetail: null, aborted: false, stale: false,
+      };
     }
+    lastDetail = broker.detail;
+    if (broker.stale) sawStale = true;
     if (now() - t0 >= timeoutMs) {
       return {
-        ready: false, pids: proc.pids, waitedMs: now() - t0, error: lastError,
+        ready: false, waitedMs: now() - t0, error: null,
         lastDetail, aborted: false, stale: sawStale,
       };
     }
